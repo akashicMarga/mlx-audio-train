@@ -40,7 +40,9 @@ trainer:
   num_epochs: 15
   max_steps: null
 
-  # Reduced batch to cut Metal buffer pressure (swap was hitting 12+ GB)
+  # batch_size=2 keeps Metal buffer pressure low on M-series GPUs.
+  # Try batch_size=4 / grad_accumulation=8 if your chip has headroom —
+  # same effective batch (32) but half the mini-batch iterations per step.
   batch_size: 2
   grad_accumulation: 16       # effective batch = 32 (same as before)
 
@@ -53,18 +55,23 @@ trainer:
   warmup_steps: 50
   lr_schedule: "cosine"
 
-  # Checkpointing
-  save_every_n_steps: 100
+  # Checkpointing — less frequent = less disk I/O blocking the GPU
+  save_every_n_steps: 200
   save_every_n_epochs: 1
   keep_last_n: 3
 
-  # Validation
-  eval_every_n_steps: 50
+  # Validation — was 50, now 100 to halve validation overhead
+  eval_every_n_steps: 100
   val_batches: 10
 
-  # Logging
-  log_every_n_steps: 5
+  # Logging — was 5, now 10; high-frequency console I/O is surprisingly costly
+  log_every_n_steps: 10
   log_file: "./checkpoints/qwen3-hindi/train_log.jsonl"
+
+  # Data loading — sort batches by codec length to minimise padding waste;
+  # prefetch 2 batches in a background thread to overlap CPU I/O with GPU.
+  sort_by_length: true
+  prefetch: 2
 
   label_smoothing: 0.1    # helps with Hindi character diversity
 
