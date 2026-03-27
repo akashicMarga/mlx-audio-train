@@ -234,12 +234,15 @@ class Trainer:
                 # graph grows unboundedly and causes OOM (exit 137).
                 mx.eval(loss, grads)
 
-                # Gradient accumulation (grads is nested dict)
+                # Gradient accumulation (grads is nested dict).
+                # No extra mx.eval() needed here: grads are already fully
+                # materialized by the call above, so each _add_grads step only
+                # creates a single-depth (a+b) deferred op per tensor.  The
+                # accumulated graph is evaluated once, at the optimizer step.
                 if not accum_grads:
                     accum_grads = grads
                 else:
                     accum_grads = _add_grads(accum_grads, grads)
-                mx.eval(accum_grads)
 
                 accum_loss  += float(loss)
                 accum_count += 1
@@ -389,12 +392,21 @@ def _add_grads(a, b):
 
 
 def _clip_grads(grads: Dict, max_norm: float) -> Dict:
-    """Global gradient norm clipping."""
+    """Global gradient norm clipping.
+
+    Batches all squared-norm computations into a single MLX op so only
+    one GPU→CPU sync is needed instead of one per gradient tensor.
+    """
     if max_norm <= 0:
         return grads
 
-    total_sq = sum(float(mx.sum(g ** 2)) for g in grads.values())
-    norm = math.sqrt(total_sq)
+    # Stack all per-tensor squared norms and sum in one MLX operation.
+    # Previously used `sum(float(mx.sum(g**2)) for g in ...)` which forced
+    # a separate GPU→CPU sync for every LoRA tensor.
+    sq_norms = [mx.sum(g ** 2) for g in grads.values()]
+    total_sq = mx.sum(mx.stack(sq_norms))
+    mx.eval(total_sq)
+    norm = math.sqrt(float(total_sq))
 
     if norm > max_norm:
         scale = max_norm / (norm + 1e-8)

@@ -96,9 +96,11 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
 
     loader = BatchIterator(
         dataset,
-        batch_size = t_cfg["batch_size"],
-        drop_last  = (split == "train"),
-        collate_fn = collate_fn,
+        batch_size     = t_cfg["batch_size"],
+        drop_last      = (split == "train"),
+        collate_fn     = collate_fn,
+        sort_by_length = t_cfg.get("sort_by_length", False),
+        prefetch       = t_cfg.get("prefetch", 2),
     )
 
     return dataset, loader

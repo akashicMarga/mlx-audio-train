@@ -13,7 +13,9 @@ Each model's Processor (see processors/) converts these into model-specific tens
 
 import json
 import os
+import queue
 import random
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -250,8 +252,21 @@ class BatchIterator:
     """
     Yields processed batches from a TTSDataset.
 
+    Performance options
+    -------------------
+    sort_by_length : bool
+        Sort each epoch's samples by codec length before batching so that
+        sequences within a batch are similar length.  This cuts padding
+        waste and speeds up the forward pass, especially for variable-
+        length TTS data.  Shuffles bucket order to preserve randomness.
+    prefetch : int
+        Number of batches to prepare ahead of time in a background thread.
+        Overlaps CPU data-loading / numpy work with GPU compute.
+        0 disables prefetching (default).
+
     Example:
-        loader = BatchIterator(dataset, batch_size=4)
+        loader = BatchIterator(dataset, batch_size=4,
+                               sort_by_length=True, prefetch=2)
         for batch in loader:
             loss = train_step(model, batch)
     """
@@ -262,16 +277,49 @@ class BatchIterator:
         batch_size: int = 4,
         drop_last: bool = False,
         collate_fn: Optional[Callable] = None,
+        sort_by_length: bool = False,
+        prefetch: int = 2,
     ):
-        self.dataset    = dataset
-        self.batch_size = batch_size
-        self.drop_last  = drop_last
-        self.collate_fn = collate_fn or collate_samples
+        self.dataset        = dataset
+        self.batch_size     = batch_size
+        self.drop_last      = drop_last
+        self.collate_fn     = collate_fn or collate_samples
+        self.sort_by_length = sort_by_length
+        self.prefetch       = prefetch
 
-    def __iter__(self):
+    def _iter_batches(self):
+        """Core iteration logic (no prefetching)."""
         indices = list(range(len(self.dataset)))
-        batch   = []
 
+        if self.sort_by_length:
+            # Build a lightweight length index from the JSONL metadata.
+            # For Qwen3-TTS the codec .npy file length is the relevant
+            # sequence length; fall back to audio duration otherwise.
+            def _length_key(idx):
+                meta = self.dataset.samples[idx]
+                audio_path = meta.get("audio", "")
+                codec_npy  = os.path.splitext(audio_path)[0] + ".codec.npy"
+                if os.path.exists(codec_npy):
+                    # np.load mmap avoids reading the whole file
+                    arr = np.load(codec_npy, mmap_mode="r")
+                    return arr.shape[0]
+                # Fall back to audio file size as a proxy for duration
+                try:
+                    return os.path.getsize(audio_path)
+                except OSError:
+                    return 0
+
+            indices.sort(key=_length_key)
+
+            # Shuffle at the bucket level so training order isn't strictly
+            # monotone, while still keeping similar lengths together.
+            bucket_size = self.batch_size * 16
+            buckets = [indices[i:i + bucket_size]
+                       for i in range(0, len(indices), bucket_size)]
+            random.shuffle(buckets)
+            indices = [idx for bucket in buckets for idx in bucket]
+
+        batch = []
         for idx in indices:
             sample = self.dataset[idx]
             if sample is None:
@@ -283,6 +331,32 @@ class BatchIterator:
 
         if batch and not self.drop_last:
             yield self.collate_fn(batch)
+
+    def __iter__(self):
+        if self.prefetch <= 0:
+            yield from self._iter_batches()
+            return
+
+        # Prefetch batches in a background thread to overlap CPU data
+        # loading with GPU computation.
+        q        = queue.Queue(maxsize=self.prefetch)
+        sentinel = object()
+
+        def _producer():
+            try:
+                for batch in self._iter_batches():
+                    q.put(batch)
+            finally:
+                q.put(sentinel)
+
+        t = threading.Thread(target=_producer, daemon=True)
+        t.start()
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            yield item
+        t.join()
 
     def __len__(self) -> int:
         n = sum(1 for i in range(len(self.dataset)) if self.dataset.samples[i])
