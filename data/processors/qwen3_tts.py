@@ -43,6 +43,8 @@ class Qwen3TTSProcessorConfig:
     speaker_name:     str   = "speaker_0"
     # Pass the already-loaded model's speech_tokenizer directly (avoids re-loading)
     speech_tokenizer: Any   = None
+    # Set True for the speaker-cloning pipeline to include ref mel spectrograms
+    include_ref_mel:  bool  = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,11 +183,17 @@ class Qwen3TTSProcessor:
                 "audio_path":    sample.audio_path,
             }
 
-            # Ref audio for CustomVoice mode
+            # Ref audio: codec IDs (for inference) + mel spectrogram (speaker-cloning pipeline)
             if sample.ref_audio is not None:
-                ref_codec = self.encode_audio(sample.ref_audio)
+                ref_audio = sample.ref_audio
+                ref_codec = self.encode_audio(ref_audio)
                 result["ref_codec_ids"]    = ref_codec
                 result["ref_codec_length"] = len(ref_codec)
+
+                if self.config.include_ref_mel:
+                    from ..audio_utils import mel_spectrogram
+                    ref_mel = mel_spectrogram(ref_audio, sr=self.config.sample_rate)
+                    result["ref_mel"] = ref_mel  # [T_mel, 128]
 
             return result
 
@@ -238,7 +246,7 @@ def collate_qwen3(
     text_mask  = (np.arange(T_text)[None,  :] < text_lengths[:,  None])
     codec_mask = (np.arange(T_codec)[None, :] < codec_lengths[:, None])
 
-    return {
+    batch = {
         "text_ids":      mx.array(text_ids),
         "codec_ids":     mx.array(codec_ids),
         "text_lengths":  mx.array(text_lengths),
@@ -246,3 +254,17 @@ def collate_qwen3(
         "text_mask":     mx.array(text_mask),
         "codec_mask":    mx.array(codec_mask),
     }
+
+    # Speaker-cloning pipeline: include padded ref mel spectrograms
+    if any("ref_mel" in s for s in samples):
+        ref_mels = [s.get("ref_mel") for s in samples]
+        if all(r is not None for r in ref_mels):
+            T_mel = max(r.shape[0] for r in ref_mels)
+            mel_arr = np.zeros((B, T_mel, ref_mels[0].shape[1]), dtype=np.float32)
+            mel_lengths = np.array([r.shape[0] for r in ref_mels], dtype=np.int32)
+            for i, r in enumerate(ref_mels):
+                mel_arr[i, :r.shape[0]] = r
+            batch["ref_mel"]         = mx.array(mel_arr)
+            batch["ref_mel_lengths"] = mx.array(mel_lengths)
+
+    return batch
