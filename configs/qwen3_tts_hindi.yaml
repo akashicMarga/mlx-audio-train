@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3-TTS 0.6B — Hindi Finetuning Config
+# Target: Apple Silicon M5 Pro 64GB via MLX
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+  tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  model_type: "qwen3_tts"
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  # Layers to adapt — attention + MLP for best Hindi phoneme learning
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/hindi/train_codes.jsonl"
+  val_jsonl:   "./data/hindi/val_codes.jsonl"
+  target_sr: 24000
+  min_duration: 1.0     # seconds — skip very short clips
+  max_duration: 15.0    # seconds — skip very long clips
+  normalize: true
+  trim: true
+  max_samples: null     # set to e.g. 500 for quick test run
+
+trainer:
+  output_dir: "./checkpoints/qwen3-hindi"
+  run_name: "qwen3-0.6b-hindi-lora-r8"
+
+  # Training duration
+  num_epochs: 15
+  max_steps: null
+
+  # Reduced batch to cut Metal buffer pressure (swap was hitting 12+ GB)
+  batch_size: 2
+  grad_accumulation: 16       # effective batch = 32 (same as before)
+
+  # Optimizer
+  learning_rate: 2.0e-5   # official full-FT uses 2e-6; LoRA can use a bit higher
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+  # LR warmup + cosine decay
+  warmup_steps: 50
+  lr_schedule: "cosine"
+
+  # Checkpointing
+  save_every_n_steps: 100
+  save_every_n_epochs: 1
+  keep_last_n: 3
+
+  # Validation
+  eval_every_n_steps: 50
+  val_batches: 10
+
+  # Logging
+  log_every_n_steps: 5
+  log_file: "./checkpoints/qwen3-hindi/train_log.jsonl"
+
+  label_smoothing: 0.1    # helps with Hindi character diversity
+
+processor:
+  max_text_len: 256
+  max_codec_len: 1200     # ~100s at 12Hz, covers all Hindi training clips
+  speaker_name: "hindi_speaker"

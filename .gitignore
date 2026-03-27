@@ -1,0 +1,48 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Packaging / builds
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# IDE
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Generated outputs
+output/
+test_output/
+test_output_v2/
+test_output_v3/
+test_output*/
+
+# Logs
+*.log
+
+# checkpoints
+checkpoints/
