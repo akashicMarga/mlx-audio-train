@@ -68,7 +68,7 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
     )
 
     # Model-specific processor
-    if model_type == "qwen3_tts":
+    if model_type in ("qwen3_tts", "qwen3_tts_speaker"):
         # Pass model's pre-loaded speech_tokenizer if available
         speech_tok = getattr(model, "speech_tokenizer", None) if model is not None else None
         processor = Qwen3TTSProcessor(Qwen3TTSProcessorConfig(
@@ -78,6 +78,8 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
             max_codec_len     = proc_cfg.get("max_codec_len", 1500),
             speaker_name      = proc_cfg.get("speaker_name",  "speaker_0"),
             speech_tokenizer  = speech_tok,
+            # Speaker-cloning pipeline: extract ref mel for speaker_encoder
+            include_ref_mel   = proc_cfg.get("include_ref_mel", False),
         ))
         collate_fn = collate_qwen3
 
@@ -89,7 +91,7 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
         collate_fn = collate_csm
 
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, csm")
+        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, qwen3_tts_speaker, csm")
 
     dataset = TTSDataset(ds_config, processor=processor)
     t_cfg   = cfg["trainer"]
@@ -137,6 +139,14 @@ def build_loss_fn(cfg: dict):
 
         def loss_fn(model, batch):
             return qwen3_tts_loss(model, batch, label_smoothing=label_smoothing)
+        return loss_fn
+
+    elif model_type == "qwen3_tts_speaker":
+        from train.losses.codec_loss import qwen3_tts_speaker_loss
+        label_smoothing = cfg["trainer"].get("label_smoothing", 0.0)
+
+        def loss_fn(model, batch):
+            return qwen3_tts_speaker_loss(model, batch, label_smoothing=label_smoothing)
         return loss_fn
 
     elif model_type == "csm":
@@ -242,11 +252,24 @@ def main():
     # Apply LoRA
     n_lora = apply_lora(model, cfg)
 
-    # Freeze parts that must not be trained:
-    #   speech_tokenizer — contains a gc_func (compiled decoder) that breaks
-    #                      model.update() inside nn.value_and_grad
-    #   speaker_encoder  — speaker identity extractor, not needed for LoRA
-    for attr in ("speech_tokenizer", "speaker_encoder"):
+    model_type = cfg["model"]["model_type"]
+
+    # Freeze parts that must not be trained.
+    #
+    # speech_tokenizer — always frozen: contains a gc_func (compiled decoder)
+    #   that breaks model.update() inside nn.value_and_grad.
+    #
+    # speaker_encoder  — frozen for language-adaptation pipeline (not used).
+    #   For the speaker-cloning pipeline (qwen3_tts_speaker) we keep it
+    #   UNfrozen so it can run in the forward pass to extract speaker
+    #   embeddings. Its weights are still NOT updated by the optimizer because
+    #   get_trainable_params() returns only LoRA tensors.  mx.stop_gradient()
+    #   in the loss function prevents gradients from flowing into it.
+    always_freeze = ["speech_tokenizer"]
+    if model_type != "qwen3_tts_speaker":
+        always_freeze.append("speaker_encoder")
+
+    for attr in always_freeze:
         sub = getattr(model, attr, None)
         if sub is not None:
             sub.freeze()

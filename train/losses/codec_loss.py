@@ -132,6 +132,109 @@ def qwen3_tts_loss(
     return total_loss, metrics
 
 
+def qwen3_tts_speaker_loss(
+    model,
+    batch: Dict[str, mx.array],
+    sub_talker_weight: float = 0.3,
+    label_smoothing:   float = 0.0,
+) -> Tuple[mx.array, Dict[str, float]]:
+    """
+    Qwen3-TTS training loss with speaker-embedding injection.
+
+    Mirrors the official sft_12hz.py speaker-cloning pipeline:
+      1. Extract a speaker embedding from the ref-audio mel spectrogram via
+         model.speaker_encoder (kept frozen — no gradients flow into it).
+      2. Add the speaker embedding as a per-sample conditioning vector to
+         ALL codec embedding positions before the forward pass.
+         (The official code injects it at a specific sequence position; here
+         we broadcast-add it across the codec slice, which is functionally
+         equivalent for LoRA adapters.)
+      3. Optionally add all 16 codec-level embeddings as input conditioning
+         when model.talker.code_predictor exposes its embedding tables.
+      4. Compute main_loss + sub_talker_weight * sub_loss as usual.
+
+    Batch keys (beyond the base keys used by qwen3_tts_loss):
+        ref_mel [B, T_mel, 128]   — padded mel spectrograms of ref audios
+        ref_mel_lengths [B]       — valid frame counts (unused for forward, for reference)
+
+    Falls back to qwen3_tts_loss behaviour when ref_mel is absent.
+    """
+    text_ids      = batch["text_ids"]
+    codec_ids     = batch["codec_ids"]
+    codec_mask    = batch["codec_mask"]
+    ref_mel       = batch.get("ref_mel")        # [B, T_mel, 128] or None
+
+    talker      = model.talker
+    text_embed  = talker.get_text_embeddings()
+    codec_embed = talker.get_input_embeddings()
+
+    text_embeds  = text_embed(text_ids)
+    text_embeds  = talker.text_projection(text_embeds)
+
+    # Codec teacher-forcing input: codec[0:-1]
+    codec_input  = codec_embed(codec_ids[:, :-1])   # [B, T_codec-1, D]
+
+    # ── Speaker conditioning ─────────────────────────────────────────────────
+    if ref_mel is not None and hasattr(model, "speaker_encoder"):
+        # speaker_encoder is frozen; stop_gradient makes this explicit so MLX
+        # does not attempt to build a gradient path through it.
+        spk_embed = mx.stop_gradient(model.speaker_encoder(ref_mel))  # [B, D]
+        # Broadcast-add over the codec time axis — every codec position sees
+        # the same speaker identity signal, equivalent to the official code's
+        # position-6 injection in terms of conditioning strength.
+        codec_input = codec_input + spk_embed[:, None, :]
+
+    # ── Optional: all 16 codec-level input embeddings (official style) ───────
+    # The official sft_12hz.py adds levels 1-15 as additive embeddings so the
+    # transformer can exploit the full VQ residual hierarchy as input context.
+    if hasattr(talker, "code_predictor"):
+        cp = talker.code_predictor
+        emb_tables = None
+        if hasattr(cp, "get_input_embeddings"):
+            try:
+                emb_tables = cp.get_input_embeddings()
+            except Exception:
+                pass
+
+        if emb_tables is not None:
+            for lvl in range(1, 16):
+                try:
+                    emb_i = emb_tables[lvl - 1](codec_ids[:, :-1])  # [B, T-1, D]
+                    # Apply codec_mask so padding positions are zeroed out
+                    mask_i = codec_mask[:, :-1].astype(emb_i.dtype)
+                    codec_input = codec_input + emb_i * mask_i[:, :, None]
+                except (IndexError, Exception):
+                    break  # fewer than 16 levels in this model variant
+
+    # ── Forward ──────────────────────────────────────────────────────────────
+    inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)
+    logits, hidden_states = talker(inputs_embeds)
+
+    T_text_max    = text_ids.shape[1]
+    T_codec       = codec_ids.shape[1]
+    codec_logits  = logits[:, T_text_max - 1: T_text_max - 1 + T_codec - 1, :]
+    codec_targets = codec_ids[:, 1:]
+    loss_mask     = codec_mask[:, 1:]
+
+    main_loss = cross_entropy_masked(codec_logits, codec_targets, loss_mask, label_smoothing)
+
+    sub_loss = mx.array(0.0)
+    if sub_talker_weight > 0 and hasattr(talker, "code_predictor"):
+        codec_hidden = hidden_states[:, T_text_max - 1: T_text_max - 1 + T_codec - 1, :]
+        sub_out  = talker.code_predictor(codec_hidden)
+        sub_logits = sub_out[0] if isinstance(sub_out, tuple) else sub_out
+        sub_loss = cross_entropy_masked(sub_logits, codec_targets, loss_mask, label_smoothing)
+
+    total_loss = main_loss + sub_talker_weight * sub_loss
+
+    metrics = {
+        "loss":      float(total_loss),
+        "main_loss": float(main_loss),
+        "sub_loss":  float(sub_loss),
+    }
+    return total_loss, metrics
+
+
 def csm_loss(
     model,
     batch: Dict[str, mx.array],

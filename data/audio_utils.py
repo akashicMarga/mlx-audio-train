@@ -114,3 +114,85 @@ def validate_audio(
 def audio_duration(path: str) -> float:
     info = sf.info(path)
     return info.frames / info.samplerate
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mel spectrogram  (matches official Qwen3-TTS speaker encoder input)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def mel_spectrogram(
+    audio:      np.ndarray,
+    sr:         int   = 24000,
+    n_fft:      int   = 1024,
+    n_mels:     int   = 128,
+    hop_length: int   = 256,
+    win_length: int   = 1024,
+    fmin:       float = 0.0,
+    fmax:       float = 12000.0,
+) -> np.ndarray:
+    """
+    Compute a log-mel spectrogram compatible with the Qwen3-TTS speaker encoder.
+
+    Default parameters match the official sft_12hz.py / dataset.py:
+        n_fft=1024, num_mels=128, sampling_rate=24000,
+        hop_size=256, win_size=1024, fmin=0, fmax=12000
+
+    Args:
+        audio:      float32 mono waveform, already at `sr`
+        sr:         sample rate of `audio` (must be 24000 for Qwen3-TTS)
+
+    Returns:
+        float32 array of shape [T_frames, n_mels]
+    """
+    import scipy.signal as ss
+
+    # STFT — scipy stft uses half-open interval so boundary/padded don't
+    # matter as long as parameters match the reference implementation.
+    _, _, Zxx = ss.stft(
+        audio.astype(np.float32),
+        fs=sr,
+        window="hann",
+        nperseg=win_length,
+        noverlap=win_length - hop_length,
+        nfft=n_fft,
+        boundary=None,
+        padded=False,
+    )
+    power = np.abs(Zxx) ** 2  # [n_fft//2+1, T]
+
+    filters = _mel_filterbank(sr, n_fft, n_mels, fmin, fmax)  # [n_mels, n_fft//2+1]
+    mel = filters @ power                                       # [n_mels, T]
+
+    log_mel = np.log(np.maximum(mel, 1e-5))
+    return log_mel.T.astype(np.float32)   # [T, n_mels]
+
+
+def _mel_filterbank(
+    sr:     int,
+    n_fft:  int,
+    n_mels: int,
+    fmin:   float,
+    fmax:   float,
+) -> np.ndarray:
+    """Build HTK triangular mel filterbank [n_mels, n_fft//2+1]."""
+    def hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + np.asarray(hz) / 700.0)
+
+    def mel_to_hz(mel):
+        return 700.0 * (10.0 ** (np.asarray(mel) / 2595.0) - 1.0)
+
+    n_freqs = n_fft // 2 + 1
+    freqs   = np.linspace(0, sr / 2, n_freqs)   # [n_freqs]
+
+    mel_pts = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2)
+    hz_pts  = mel_to_hz(mel_pts)
+
+    # Vectorised triangular ramps — shape [n_mels, n_freqs]
+    l = hz_pts[:-2, None]   # left  edge
+    c = hz_pts[1:-1, None]  # centre
+    r = hz_pts[2:, None]    # right edge
+    f = freqs[None, :]      # bin frequencies
+
+    ramp_up   = (f - l) / np.where(c == l, 1.0, c - l)
+    ramp_down = (r - f) / np.where(r == c, 1.0, r - c)
+    return np.maximum(0.0, np.minimum(ramp_up, ramp_down)).astype(np.float32)

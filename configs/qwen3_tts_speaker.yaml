@@ -1,0 +1,101 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3-TTS 0.6B — Speaker Voice-Cloning Config
+# Pipeline: LoRA + speaker-embedding injection (mirrors official sft_12hz.py)
+#
+# When to use this config vs qwen3_tts_hindi.yaml
+# ─────────────────────────────────────────────────
+# • qwen3_tts_hindi.yaml  → language / accent adaptation (no ref_audio needed)
+#   Trains LoRA adapters to produce a new language. Voice identity comes
+#   from whatever ref_audio you supply at inference.
+#
+# • THIS config (qwen3_tts_speaker.yaml) → custom voice cloning
+#   Bakes a specific speaker's identity into codec_embedding[3000] so the
+#   model reliably reproduces that voice without a ref_audio at inference.
+#   Requires EVERY training sample to have a "ref_audio" field pointing to
+#   a clip of the target speaker.
+#
+# After training, run:
+#   python scripts/bake_speaker_embedding.py \
+#       --config configs/qwen3_tts_speaker.yaml \
+#       --checkpoint checkpoints/qwen3-speaker/checkpoint-final \
+#       --output checkpoints/qwen3-speaker/custom_voice_model
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+  tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  model_type: "qwen3_tts_speaker"     # ← speaker-cloning pipeline
+
+lora:
+  rank: 16           # higher rank captures more speaker-specific detail
+  alpha: 32.0
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  # JSONL format: each line must have "audio", "text", AND "ref_audio"
+  # ref_audio should always be a clip of the TARGET SPEAKER.
+  # Using the same ~5–10 s ref clip for every sample gives the most
+  # consistent speaker identity signal.
+  train_jsonl: "./data/speaker/train_codes.jsonl"
+  val_jsonl:   "./data/speaker/val_codes.jsonl"
+  target_sr: 24000
+  min_duration: 1.0
+  max_duration: 15.0
+  normalize: true
+  trim: true
+  max_samples: null
+
+trainer:
+  output_dir: "./checkpoints/qwen3-speaker"
+  run_name: "qwen3-0.6b-speaker-lora-r16"
+
+  # Official uses 3 epochs — more can overfit to a single voice
+  num_epochs: 3
+  max_steps: null
+
+  # Smaller effective batch than language adaptation: speaker signal is
+  # dense per sample so less accumulation is needed.
+  batch_size: 2
+  grad_accumulation: 8        # effective batch = 16
+
+  # Optimizer — match official lr
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+  # Official uses constant LR; cosine is fine for LoRA and slightly safer
+  warmup_steps: 20
+  lr_schedule: "cosine"
+
+  # Checkpointing
+  save_every_n_steps: 200
+  save_every_n_epochs: 1
+  keep_last_n: 3
+
+  # Validation
+  eval_every_n_steps: 100
+  val_batches: 5
+
+  # Logging
+  log_every_n_steps: 10
+  log_file: "./checkpoints/qwen3-speaker/train_log.jsonl"
+
+  # Data loading
+  sort_by_length: true
+  prefetch: 2
+
+  label_smoothing: 0.0     # no smoothing for voice identity (want sharp predictions)
+
+processor:
+  max_text_len: 256
+  max_codec_len: 1200
+  speaker_name: "custom_speaker"   # written into config.json by bake script
+  include_ref_mel: true            # enables ref_mel → speaker_encoder path

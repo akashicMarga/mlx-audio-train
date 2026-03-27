@@ -1,6 +1,126 @@
 # mlx-audio-train
 
-A general-purpose **LoRA / QLoRA finetuning pipeline** for MLX TTS models on Apple Silicon. Currently supports **Qwen3-TTS** and **CSM**, with Hindi finetuning as the primary use case.
+A **LoRA / QLoRA finetuning pipeline** for MLX TTS models on Apple Silicon.
+Supports **Qwen3-TTS** and **CSM**, with two distinct training strategies.
+
+---
+
+## Two Training Pipelines
+
+### Pipeline 1 — Language Adaptation (LoRA)
+
+**Use this when:** you want the model to speak a new language or accent (e.g. Hindi).
+Voice identity still comes from a reference audio clip at inference — you are teaching the *language*, not baking in a specific voice.
+
+```bash
+python scripts/train.py --config configs/qwen3_tts_hindi.yaml
+```
+
+**How it works:**
+- Applies LoRA adapters to all attention + MLP layers inside the `talker` transformer
+- Loss: `main_codec_loss + 0.3 × sub_talker_loss` (teacher-forced codec prediction)
+- Does **not** use `ref_audio` during training — speaker identity is irrelevant
+- After training: load the adapter at inference with any ref audio to clone any voice in the new language
+
+**Good for:** Hindi, regional languages, new accents, domain-specific speech styles
+
+---
+
+### Pipeline 2 — Speaker Voice Cloning (LoRA + Speaker Embedding)
+
+**Use this when:** you want to permanently bake a specific person's voice into the model so it speaks as that person without needing a reference clip at inference.
+
+```bash
+# Step 1 — train
+python scripts/train.py --config configs/qwen3_tts_speaker.yaml
+
+# Step 2 — bake the speaker identity into codec_embedding[3000]
+python scripts/bake_speaker_embedding.py \
+    --config     configs/qwen3_tts_speaker.yaml \
+    --checkpoint checkpoints/qwen3-speaker/checkpoint-final \
+    --output     checkpoints/qwen3-speaker/custom_voice_model
+```
+
+**How it works (mirrors official `sft_12hz.py`):**
+1. Every training sample must have a `ref_audio` field pointing to a clip of the **target speaker**
+2. During each forward pass, `model.speaker_encoder` extracts a speaker embedding from the ref audio mel spectrogram
+3. The speaker embedding is injected into the codec embedding sequence as additive conditioning — all 16 VQ codec levels feed back as input context
+4. LoRA adapters learn to generate codec tokens conditioned on that speaker identity
+5. After training, `bake_speaker_embedding.py` averages the speaker embeddings across the training set and writes the mean into `talker.model.codec_embedding.weight[3000]` — the reserved custom-voice slot — then patches `config.json` with `tts_model_type: custom_voice`
+
+**Good for:** cloning a single specific voice, podcast/audiobook voice replication, personal TTS
+
+---
+
+## Choosing Between the Two
+
+| | Language Adaptation | Speaker Voice Cloning |
+|---|---|---|
+| **Config** | `qwen3_tts_hindi.yaml` | `qwen3_tts_speaker.yaml` |
+| **model_type** | `qwen3_tts` | `qwen3_tts_speaker` |
+| **ref_audio in data** | Not required | Required for every sample |
+| **Epochs** | 10–15 | 3 (more risks overfitting) |
+| **LoRA rank** | 8 | 16 |
+| **Effective batch** | 32 | 16 |
+| **Post-training step** | None | `bake_speaker_embedding.py` |
+| **At inference** | Needs ref audio to pick a voice | Works without ref audio |
+
+You can **combine both**: train with the language config first, then run the speaker config on top using the language-adapted checkpoint as the starting point.
+
+---
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install mlx-audio soundfile scipy datasets transformers gradio pyyaml safetensors
+
+# Verify pipeline works (no data needed)
+python scripts/train.py --config configs/qwen3_tts_hindi.yaml --smoke-test
+```
+
+### Pipeline 1 — Hindi Language Adaptation
+
+```bash
+# 1. Download Hindi dataset
+python scripts/prepare_hindi_dataset.py --source hf --output data/hindi
+
+# 2. Pre-tokenize audio to codec IDs (run once — saves .codec.npy files)
+python scripts/preprocess_dataset.py --input data/hindi/train.jsonl data/hindi/val.jsonl
+
+# 3. Train
+python scripts/train.py --config configs/qwen3_tts_hindi.yaml
+
+# 4. Demo — compare before/after with a reference voice
+python scripts/demo.py --adapter checkpoints/qwen3-hindi/checkpoint-best
+```
+
+### Pipeline 2 — Speaker Voice Cloning
+
+Your JSONL must have `ref_audio` on every line, all pointing to the same target speaker:
+
+```json
+{"audio": "data/speaker/clip1.wav", "text": "Hello world", "ref_audio": "data/speaker/ref.wav"}
+{"audio": "data/speaker/clip2.wav", "text": "How are you", "ref_audio": "data/speaker/ref.wav"}
+```
+
+```bash
+# 1. Pre-tokenize audio
+python scripts/preprocess_dataset.py \
+    --input data/speaker/train.jsonl data/speaker/val.jsonl
+
+# 2. Train (3 epochs recommended)
+python scripts/train.py --config configs/qwen3_tts_speaker.yaml
+
+# 3. Bake speaker embedding into the model
+python scripts/bake_speaker_embedding.py \
+    --config     configs/qwen3_tts_speaker.yaml \
+    --checkpoint checkpoints/qwen3-speaker/checkpoint-final \
+    --output     checkpoints/qwen3-speaker/custom_voice_model
+
+# 4. Use the baked model at inference (no ref_audio needed)
+#    The output dir contains adapters.safetensors + speaker_embedding.npy
+```
 
 ---
 
@@ -9,233 +129,140 @@ A general-purpose **LoRA / QLoRA finetuning pipeline** for MLX TTS models on App
 ```
 mlx-audio-train/
 │
-├── scripts/                  # Entry-point scripts you actually run
-│   ├── train.py              # Main finetuning script
-│   ├── demo.py               # Gradio voice cloning demo
-│   └── prepare_hindi_dataset.py  # Dataset download & preparation
+├── scripts/
+│   ├── train.py                    # Main finetuning entry point
+│   ├── bake_speaker_embedding.py   # Post-training: write speaker → codec_embedding[3000]
+│   ├── preprocess_dataset.py       # Pre-tokenize audio → .codec.npy files
+│   ├── prepare_hindi_dataset.py    # Download & format Hindi TTS data
+│   └── demo.py                     # Gradio voice-cloning demo
 │
-├── configs/                  # YAML training configs
-│   └── qwen3_tts_hindi.yaml  # Qwen3-TTS 0.6B — Hindi LoRA config
+├── configs/
+│   ├── qwen3_tts_hindi.yaml        # Pipeline 1: language adaptation
+│   └── qwen3_tts_speaker.yaml      # Pipeline 2: speaker voice cloning
 │
-├── train/                    # Core training library
-│   ├── lora.py               # LoRA / QLoRA layer implementations
-│   ├── trainer.py            # Training loop (AdamW, grad accum, checkpointing)
+├── train/
+│   ├── lora.py                     # LoRA / QLoRA layer implementations
+│   ├── trainer.py                  # Training loop (AdamW, grad accum, checkpointing)
 │   └── losses/
-│       └── codec_loss.py     # Model-specific loss functions
+│       └── codec_loss.py           # qwen3_tts_loss, qwen3_tts_speaker_loss, csm_loss
 │
-├── data/                     # Data loading & processing
-│   ├── audio_utils.py        # Audio I/O, resampling, loudness, silence trimming
-│   ├── base_dataset.py       # Universal JSONL dataset + batch iterator
+├── data/
+│   ├── audio_utils.py              # Audio I/O, resampling, mel spectrogram
+│   ├── base_dataset.py             # JSONL dataset + BatchIterator (prefetch, length-sort)
 │   └── processors/
-│       ├── qwen3_tts.py      # Qwen3-TTS: audio→codec tokens, text→token IDs
-│       └── csm.py            # CSM: audio→Mimi RVQ codes, text→LLaMA token IDs
+│       ├── qwen3_tts.py            # audio→codec tokens, text→IDs, ref_mel extraction
+│       └── csm.py                  # CSM: Mimi RVQ codes + LLaMA tokenizer
 │
-└── checkpoints/              # Saved LoRA adapters (created during training)
-    └── qwen3-hindi/
-        ├── checkpoint-best/
-        ├── checkpoint-step_XXXXXXX/
-        └── train_log.jsonl
+└── checkpoints/                    # Saved LoRA adapters
 ```
 
 ---
 
-## Scripts
+## Training Scripts Reference
 
-### `scripts/train.py` — Finetuning entry point
-
-The main script. Reads a YAML config, loads the model, applies LoRA, then trains.
+### `scripts/train.py`
 
 ```bash
-# Full Hindi finetuning
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml
+python scripts/train.py --config CONFIG [OPTIONS]
 
-# Quick smoke test — 5 steps with dummy data, no dataset needed
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml --smoke-test
-
-# Resume from a checkpoint
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml \
-    --resume checkpoints/qwen3-hindi/checkpoint-step_0000200
-
-# Override config values from CLI
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml \
-    --lora-rank 16 --lr 1e-4 --epochs 5 --max-steps 500
+Options:
+  --smoke-test        Run 5 steps with dummy data (no dataset needed)
+  --resume PATH       Resume from a checkpoint directory
+  --lora-rank N       Override LoRA rank
+  --lr FLOAT          Override learning rate
+  --epochs N          Override num_epochs
+  --max-steps N       Stop after N optimizer steps
 ```
 
-**What it does:**
-1. Loads model via `mlx-audio` (`mlx_audio.tts.utils.load_model`)
-2. Patches matching layers with LoRA/QLoRA adapters (231 layers for Qwen3-TTS 8bit)
-3. Builds dataset from JSONL files using the model-specific processor
-4. Runs the training loop via `Trainer` — saves only adapter weights, not the full model
-
----
-
-### `scripts/demo.py` — Gradio Voice Cloning Demo
-
-Side-by-side comparison of Base (random voice) vs Cloned (your reference voice).
+### `scripts/bake_speaker_embedding.py`  *(Pipeline 2 only)*
 
 ```bash
-# Basic launch
-python scripts/demo.py
-
-# With a finetuned Hindi adapter
-python scripts/demo.py --adapter checkpoints/qwen3-hindi/checkpoint-best
-
-# Custom port
-python scripts/demo.py --port 7860 --share
+python scripts/bake_speaker_embedding.py \
+    --config     CONFIG_YAML        \
+    --checkpoint CKPT_DIR           \
+    --output     OUTPUT_DIR         \
+    [--slot N]                      \ # codec_embedding row to use (default 3000)
+    [--fuse-lora]                     # merge LoRA into base weights
 ```
 
-**Modes:**
-| Mode | When | Model used |
-|------|------|-----------|
-| Base | Always (left output) | `Qwen3-TTS-12Hz-0.6B-Base-8bit` |
-| Cloned | When ref audio uploaded (right output) | `Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit` |
+### `scripts/preprocess_dataset.py`
 
-**Inputs:**
-- **Text** — what to synthesise (Hindi, English, Hinglish)
-- **Reference audio** — 3–10 sec clip to clone the voice from (upload or record)
-- **Reference text** — transcript of ref audio (optional, auto-transcribed via Whisper if blank)
-- **Adapter path** — point to a finetuned checkpoint to compare quality before/after training
-- **Speed / Temperature** — generation controls
-
----
-
-### `scripts/prepare_hindi_dataset.py` — Dataset preparation
-
-Downloads and formats Hindi TTS data into JSONL files ready for training.
+Pre-tokenizes audio to `.codec.npy` files once, so training skips the speech tokenizer entirely (major speedup + avoids OOM).
 
 ```bash
-# From HuggingFace (easiest — cdactvm/indic-tts-hindi, IIT Madras corpus)
-python scripts/prepare_hindi_dataset.py --source hf --output data/hindi
-
-# Limit samples for a quick test run
-python scripts/prepare_hindi_dataset.py --source hf --output data/hindi --max-samples 500
-
-# From OpenSLR IndicTTS (manual download required)
-python scripts/prepare_hindi_dataset.py --source indictts --output data/hindi
-
-# From your own audio folder (WAV + TXT pairs)
-python scripts/prepare_hindi_dataset.py --source custom \
-    --audio-dir /path/to/wavs --output data/hindi
-```
-
-**Output:** `data/hindi/train.jsonl` and `data/hindi/val.jsonl` (95/5 split)
-
-Each line in the JSONL:
-```json
-{"audio": "data/hindi/audio/hi_00001.wav", "text": "नमस्ते दुनिया"}
+python scripts/preprocess_dataset.py --input data/hindi/train.jsonl [data/hindi/val.jsonl ...]
 ```
 
 ---
 
 ## Core Library
 
-### `train/lora.py` — LoRA / QLoRA
+### `train/lora.py`
 
-Patches any MLX model's Linear layers with low-rank adapters in-place.
+- **`LoRALinear`** — wraps `nn.Linear` (full-precision base)
+- **`QLoRALinear`** — wraps `nn.QuantizedLinear` (quantized base + bf16 LoRA delta)
+- **`apply_lora(model, config)`** — recursive in-place patching; scoped to `talker` for Qwen3-TTS
+- **`get_trainable_params(model)`** — returns only `lora_a`/`lora_b` tensors (avoids 40+ GB gradient memory)
+- **`save_adapters / load_adapters`** — tiny safetensors checkpoint (~46 MB for rank-8)
 
-- **`LoRALinear`** — wraps `nn.Linear` (full-precision base weights)
-- **`QLoRALinear`** — wraps `nn.QuantizedLinear` (quantized base, trainable A/B in bf16)
-- **`apply_lora(model, config)`** — recursively patches matching layer names; scopes to `talker` submodule for Qwen3-TTS to avoid touching the speech tokenizer
-- **`get_trainable_params(model)`** — returns only `lora_a`/`lora_b` tensors for the optimizer
-- **`save_adapters / load_adapters`** — saves/loads only the tiny adapter weights (not the full model)
+### `train/trainer.py`
 
-Key design choice: base weights are **not** frozen with `stop_gradient` (would block gradient flow to `lora_a`). Freezing is enforced by passing only LoRA params to the optimizer.
+- AdamW + gradient accumulation + gradient norm clipping
+- Cosine / linear / constant LR schedule with warmup
+- Per-step and per-epoch checkpointing (LoRA adapters only)
+- Batched gradient norm computation (single GPU sync per optimizer step)
 
-```python
-from train.lora import apply_lora, LoRAConfig
-apply_lora(model, LoRAConfig(rank=8, alpha=16, model_type="qwen3_tts"))
-```
+### `train/losses/codec_loss.py`
 
-### `train/trainer.py` — Training loop
+| Function | Pipeline | Description |
+|---|---|---|
+| `qwen3_tts_loss` | Language Adaptation | `main_loss + 0.3 × sub_talker_loss`; no speaker conditioning |
+| `qwen3_tts_speaker_loss` | Speaker Cloning | Same loss + speaker embedding injected from `ref_mel`; all 16 codec levels as input context |
+| `csm_loss` | CSM | Cross-entropy on first codebook head |
 
-Model-agnostic trainer. Plug in any model + loss function.
+### `data/audio_utils.py`
 
-- AdamW optimizer with linear warmup + cosine/linear/constant LR decay
-- Gradient accumulation (default: 4 steps → effective batch = `batch_size × grad_accum`)
-- Global gradient norm clipping
-- Per-step and per-epoch checkpointing (saves only LoRA adapters)
-- Best-model tracking based on validation loss
-- JSON log of all metrics
+No PyTorch dependency — uses `soundfile` + `scipy.signal`.
 
-```python
-from train.trainer import Trainer, TrainerConfig
-trainer = Trainer(TrainerConfig(output_dir="./checkpoints", num_epochs=10, ...))
-trainer.train(model, train_loader, loss_fn, val_loader)
-```
-
-### `train/losses/codec_loss.py` — Loss functions
-
-- **`qwen3_tts_loss`** — Teacher-forced dual loss matching the official Qwen3-TTS training:
-  ```
-  loss = main_talker_loss + 0.3 × sub_talker_loss
-  ```
-  Input sequence: `[text_embeds | codec_embeds[:-1]]` → predict `codec_ids[1:]`
-
-- **`csm_loss`** — Cross-entropy loss on the first codebook head for CSM
-
-### `data/base_dataset.py` — Universal dataset
-
-Reads JSONL, loads audio, applies the model-specific processor, and batches.
-
-```json
-{"audio": "path/to/clip.wav", "text": "transcript", "ref_audio": "optional/ref.wav"}
-```
-
-### `data/processors/qwen3_tts.py` — Qwen3-TTS processor
-
-Converts raw audio + text into the tensors the model expects:
-- Audio → codec token IDs via `Qwen3TTSSpeechTokenizer` (VQ-VAE at 12Hz)
-- Text → token IDs via `AutoTokenizer`
-- `collate_qwen3()` — pads to max length, returns `mx.array` batch dict
-
-### `data/audio_utils.py` — Audio utilities
-
-No PyTorch dependency. Uses `soundfile` + `scipy.signal`.
-- `load_audio(path, target_sr)` — load + resample
-- `normalize_loudness(audio)` — RMS normalization
+- `load_audio(path, target_sr)` — load + resample any audio file
+- `normalize_loudness(audio)` — RMS normalization to −23 dBFS
 - `trim_silence(audio)` — energy-based silence trimming
-- `validate_audio(audio, sr, min_dur, max_dur)` — duration + sanity checks
+- `mel_spectrogram(audio, sr)` — log-mel spectrogram matching Qwen3-TTS speaker encoder params (n_fft=1024, n_mels=128, hop=256)
+
+### `data/base_dataset.py — BatchIterator`
+
+- `sort_by_length=True` — groups similar-length sequences to minimise padding waste
+- `prefetch=2` — loads the next N batches in a background thread, overlapping CPU I/O with GPU compute
 
 ---
 
-## Quick Start
+## Config Reference
 
-```bash
-# 1. Install dependencies
-pip install mlx-audio soundfile scipy datasets transformers gradio pyyaml
+### Language Adaptation (`configs/qwen3_tts_hindi.yaml`)
 
-# 2. Smoke test — verify the pipeline works (no data needed)
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml --smoke-test
+| Key | Value | Notes |
+|-----|-------|-------|
+| `model.model_type` | `qwen3_tts` | |
+| `lora.rank` | `8` | |
+| `trainer.num_epochs` | `15` | |
+| `trainer.batch_size` | `2` | M-series Metal pressure |
+| `trainer.grad_accumulation` | `16` | effective batch = 32 |
+| `trainer.learning_rate` | `2e-5` | |
+| `trainer.label_smoothing` | `0.1` | helps with character diversity |
+| `processor.include_ref_mel` | `false` | not needed for language training |
 
-# 3. Download Hindi dataset
-python scripts/prepare_hindi_dataset.py --source hf --output data/hindi
+### Speaker Voice Cloning (`configs/qwen3_tts_speaker.yaml`)
 
-# 4. Start training
-python scripts/train.py --config configs/qwen3_tts_hindi.yaml
-
-# 5. Test the result in the demo
-python scripts/demo.py --adapter checkpoints/qwen3-hindi/checkpoint-best
-```
-
----
-
-## Config Reference (`configs/qwen3_tts_hindi.yaml`)
-
-| Section | Key | Default | Description |
-|---------|-----|---------|-------------|
-| `model` | `model_id` | `Qwen3-TTS-12Hz-0.6B-Base-8bit` | HuggingFace model ID |
-| `model` | `model_type` | `qwen3_tts` | Determines processor + loss fn |
-| `lora` | `rank` | `8` | LoRA rank (higher = more capacity) |
-| `lora` | `alpha` | `16.0` | LoRA scaling factor (`scale = alpha/rank`) |
-| `lora` | `dropout` | `0.05` | Dropout on LoRA input |
-| `data` | `train_jsonl` | `./data/hindi/train.jsonl` | Training data path |
-| `data` | `max_duration` | `15.0` | Skip clips longer than this (seconds) |
-| `trainer` | `batch_size` | `4` | Per-step batch size |
-| `trainer` | `grad_accumulation` | `8` | Steps before optimizer update (effective batch = 32) |
-| `trainer` | `learning_rate` | `2e-4` | Peak LR |
-| `trainer` | `warmup_steps` | `50` | Linear LR warmup steps |
-| `trainer` | `lr_schedule` | `cosine` | `cosine` / `linear` / `constant` |
-| `trainer` | `label_smoothing` | `0.1` | Helps with Hindi character diversity |
+| Key | Value | Notes |
+|-----|-------|-------|
+| `model.model_type` | `qwen3_tts_speaker` | enables speaker loss |
+| `lora.rank` | `16` | more capacity for speaker detail |
+| `trainer.num_epochs` | `3` | more epochs → overfitting risk |
+| `trainer.grad_accumulation` | `8` | effective batch = 16 |
+| `trainer.learning_rate` | `2e-5` | matches official |
+| `trainer.label_smoothing` | `0.0` | sharp speaker predictions |
+| `processor.include_ref_mel` | `true` | enables mel → speaker_encoder path |
+| `processor.speaker_name` | `custom_speaker` | written into config.json by bake script |
 
 ---
 
@@ -243,20 +270,27 @@ python scripts/demo.py --adapter checkpoints/qwen3-hindi/checkpoint-best
 
 | Model | `model_type` | Status |
 |-------|-------------|--------|
-| Qwen3-TTS 0.6B Base 8bit | `qwen3_tts` | ✅ Working (231 LoRA layers, 1.12% trainable) |
-| Qwen3-TTS 1.7B Base 8bit | `qwen3_tts` | ✅ Same pipeline, change `model_id` in config |
-| CSM (Sesame) | `csm` | ✅ Processor + loss implemented |
+| Qwen3-TTS 0.6B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Working |
+| Qwen3-TTS 1.7B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Same pipeline, change `model_id` |
+| CSM (Sesame) | `csm` | Processor + loss implemented |
 | Kokoro | — | Planned |
 | Chatterbox | — | Planned |
 
 ---
 
-## How Voice Cloning Works (Qwen3-TTS)
+## Comparison with Official Qwen3-TTS Finetuning
 
-Qwen3-TTS has three modes controlled by which model checkpoint is loaded:
+The [official sft_12hz.py](https://github.com/QwenLM/Qwen3-TTS/tree/main/finetuning) is full fine-tuning on CUDA with PyTorch + HuggingFace Accelerate.
+This repo is LoRA / QLoRA on Apple Silicon with MLX.
 
-1. **Base** — No speaker conditioning → random voice every generation
-2. **CustomVoice** — Takes a 3–10 sec reference audio clip → extracts a 256-dim speaker embedding via the built-in speaker encoder → injects it into the LM context → output speech matches the reference speaker's voice
-3. **VoiceDesign** — Describe the voice in text (e.g. "a young woman with a calm tone")
-
-The `demo.py` uses modes 1 and 2 side-by-side. After Hindi finetuning, the cloned voice should speak Hindi more naturally while still sounding like the reference speaker.
+| | Official | This repo |
+|---|---|---|
+| Framework | PyTorch + Accelerate | MLX |
+| Training mode | Full fine-tune (all weights) | LoRA (1–2% of weights) |
+| Precision | bfloat16 | 8-bit quantised base + bf16 LoRA delta |
+| Effective batch | 8 (bs=2 × accum=4) | 16–32 |
+| Epochs | 3 | 3 (speaker) / 10–15 (language) |
+| Speaker injection | Position 6 in dual-channel format | Broadcast over codec sequence |
+| All 16 codec levels | Yes (additive input embeddings) | Yes (via `code_predictor` when available) |
+| Post-training step | Bake speaker to `codec_embedding[3000]` | `bake_speaker_embedding.py` (same) |
+| Checkpoint size | Full model (~1.2 GB) | Adapters only (~46 MB) |
