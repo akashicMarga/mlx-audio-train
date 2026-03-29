@@ -42,28 +42,40 @@ def cross_entropy_masked(
     return masked.sum() / n_valid
 
 
-def _build_codec_prefix(talker, lang_codes) -> mx.array:
+def _build_codec_prefix(talker, lang_codes, spk_embeds=None):
     """
     Build per-sample codec prefix embeds that match Qwen3-TTS inference behaviour.
 
-    auto   → [nothink, think_bos, think_eos, pad, bos]           (5 tokens)
-    <lang> → [think,  think_bos, lang_id,   think_eos, pad, bos] (6 tokens)
+    Without speaker:
+        auto   → [nothink, think_bos, think_eos, pad, bos]           (5 tokens)
+        <lang> → [think,  think_bos, lang_id,   think_eos, pad, bos] (6 tokens)
 
-    lang_codes: list[str] of length B, or a single str (broadcast to all samples).
+    With speaker (matches official sft_12hz.py exactly):
+        auto   → [nothink, think_bos, think_eos, spk_embed, pad, bos]
+        <lang> → [think,  think_bos, lang_id,   think_eos, spk_embed, pad, bos]
+
+    The speaker embedding is inserted as a single token between the think/lang
+    section and the [pad, bos] suffix — identical to the official positional
+    injection approach.
+
+    Args:
+        lang_codes:  list[str] of length B, or a single str
+        spk_embeds:  [B, D] speaker embeddings, or None (Pipeline 1 / no speaker)
 
     Returns:
         prefix_embeds [B, T_prefix, D]
-        T_prefix       int  (uniform across samples; shorter auto-prefixes are
-                             left-padded with codec_pad_id to match lang prefixes)
+        T_prefix       int
     """
     cfg         = talker.config
     codec_embed = talker.get_input_embeddings()
 
-    # Accept a single string for backward compatibility
     if isinstance(lang_codes, str):
         lang_codes = [lang_codes]
 
-    per_sample_ids = []
+    B = len(lang_codes)
+
+    # Build the think/lang section (before [pad, bos]) as token IDs
+    pre_ids = []
     for lang_code in lang_codes:
         lang_id = None
         if lang_code != "auto" and cfg.codec_language_id:
@@ -71,22 +83,31 @@ def _build_codec_prefix(talker, lang_codes) -> mx.array:
 
         if lang_id is not None:
             ids = [cfg.codec_think_id, cfg.codec_think_bos_id,
-                   lang_id, cfg.codec_think_eos_id,
-                   cfg.codec_pad_id, cfg.codec_bos_id]
+                   lang_id, cfg.codec_think_eos_id]
         else:
             ids = [cfg.codec_nothink_id, cfg.codec_think_bos_id,
-                   cfg.codec_think_eos_id,
-                   cfg.codec_pad_id, cfg.codec_bos_id]
-        per_sample_ids.append(ids)
+                   cfg.codec_think_eos_id]
+        pre_ids.append(ids)
 
-    # Pad shorter prefixes (auto=5) to match longer ones (lang=6) with codec_pad_id
-    T_prefix = max(len(ids) for ids in per_sample_ids)
-    for i, ids in enumerate(per_sample_ids):
-        if len(ids) < T_prefix:
-            per_sample_ids[i] = [cfg.codec_pad_id] * (T_prefix - len(ids)) + ids
+    # Pad pre-section across samples (auto=3 tokens, lang=4 tokens)
+    T_pre = max(len(ids) for ids in pre_ids)
+    for i, ids in enumerate(pre_ids):
+        if len(ids) < T_pre:
+            pre_ids[i] = [cfg.codec_pad_id] * (T_pre - len(ids)) + ids
 
-    prefix = mx.array(per_sample_ids)       # [B, T_prefix]
-    return codec_embed(prefix), T_prefix    # [B, T_prefix, D], T_prefix
+    pre_embeds    = codec_embed(mx.array(pre_ids))                                # [B, T_pre, D]
+    suffix_embeds = codec_embed(mx.array([[cfg.codec_pad_id, cfg.codec_bos_id]] * B))  # [B, 2, D]
+
+    if spk_embeds is not None:
+        # Insert speaker embedding as a single token between think section and [pad, bos]
+        # spk_embeds: [B, D] → [B, 1, D]
+        spk = spk_embeds[:, None, :] if spk_embeds.ndim == 2 else spk_embeds
+        prefix = mx.concatenate([pre_embeds, spk, suffix_embeds], axis=1)
+    else:
+        prefix = mx.concatenate([pre_embeds, suffix_embeds], axis=1)
+
+    T_prefix = prefix.shape[1]
+    return prefix, T_prefix
 
 
 def qwen3_tts_loss(
@@ -230,44 +251,21 @@ def qwen3_tts_speaker_loss(
 
     B = text_ids.shape[0]
 
-    # ── Codec prefix (matches inference conditioning) ────────────────────────
+    # ── Speaker conditioning ─────────────────────────────────────────────────
+    # Extract speaker embedding first so it can be passed into the prefix.
+    # Matches the official sft_12hz.py approach: speaker embed is inserted as
+    # a single token between the think/lang section and [pad, bos] in the prefix,
+    # giving the transformer an explicit speaker identity anchor in its context.
+    spk_embeds = None
+    if ref_mel is not None and hasattr(model, "speaker_encoder"):
+        spk_embeds = mx.stop_gradient(model.speaker_encoder(ref_mel))  # [B, D]
+
+    # ── Codec prefix (with speaker token injected) ───────────────────────────
     lang_codes = batch.get("lang_codes") or [lang_code] * B
-    prefix_embeds, T_prefix = _build_codec_prefix(talker, lang_codes)  # [B, T_prefix, D]
+    prefix_embeds, T_prefix = _build_codec_prefix(talker, lang_codes, spk_embeds=spk_embeds)
 
     # Codec teacher-forcing input: [prefix | codec[0:-1]]
     codec_input  = codec_embed(codec_ids[:, :-1])                        # [B, T_codec-1, D]
-
-    # ── Speaker conditioning ─────────────────────────────────────────────────
-    if ref_mel is not None and hasattr(model, "speaker_encoder"):
-        # speaker_encoder is frozen; stop_gradient makes this explicit so MLX
-        # does not attempt to build a gradient path through it.
-        spk_embed = mx.stop_gradient(model.speaker_encoder(ref_mel))  # [B, D]
-        # Broadcast-add over the codec time axis — every codec position sees
-        # the same speaker identity signal, equivalent to the official code's
-        # position-6 injection in terms of conditioning strength.
-        codec_input = codec_input + spk_embed[:, None, :]
-
-    # ── Optional: all 16 codec-level input embeddings (official style) ───────
-    # The official sft_12hz.py adds levels 1-15 as additive embeddings so the
-    # transformer can exploit the full VQ residual hierarchy as input context.
-    if hasattr(talker, "code_predictor"):
-        cp = talker.code_predictor
-        emb_tables = None
-        if hasattr(cp, "get_input_embeddings"):
-            try:
-                emb_tables = cp.get_input_embeddings()
-            except Exception:
-                pass
-
-        if emb_tables is not None:
-            for lvl in range(1, 16):
-                try:
-                    emb_i = emb_tables[lvl - 1](codec_ids[:, :-1])  # [B, T-1, D]
-                    # Apply codec_mask so padding positions are zeroed out
-                    mask_i = codec_mask[:, :-1].astype(emb_i.dtype)
-                    codec_input = codec_input + emb_i * mask_i[:, :, None]
-                except (IndexError, Exception):
-                    break  # fewer than 16 levels in this model variant
 
     # ── Forward ──────────────────────────────────────────────────────────────
     codec_input   = mx.concatenate([prefix_embeds, codec_input], axis=1)  # [B, T_prefix+T_codec-1, D]
