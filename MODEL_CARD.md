@@ -8,8 +8,8 @@ Two training pipelines are released:
 
 | Pipeline | Purpose | Adapter size | Ref audio at inference? |
 |----------|---------|-------------|------------------------|
-| **Pipeline 1 — Language Adaptation** | Teaches the model a new language/accent | ~23 MB (rank-8) | Yes — any voice |
-| **Pipeline 2 — Speaker Voice Cloning** | Bakes a specific speaker's identity into the model | ~46 MB (rank-16) | No |
+| **Pipeline 1 — Language Adaptation** | Teaches the model a new language/accent | 23 MB (rank-8) | Yes — any voice |
+| **Pipeline 2 — Speaker Voice Cloning** | Bakes a specific speaker's identity into the model | 45 MB (rank-16) | No |
 
 ---
 
@@ -172,9 +172,8 @@ pip install mlx-audio soundfile scipy datasets transformers gradio pyyaml safete
 
 # Pre-tokenize dataset (run once)
 python scripts/preprocess_dataset.py \
-  --input data/hindi/train.jsonl \
-  --output data/hindi/train_codes.jsonl \
-  --model_id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
+  --input data/hindi/train.jsonl data/hindi/val.jsonl \
+  --model-id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
 
 # Stamp language code
 python scripts/add_lang_code.py --input data/hindi/train_codes.jsonl --lang hi

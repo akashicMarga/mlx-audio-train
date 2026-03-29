@@ -222,11 +222,9 @@ def qwen3_tts_speaker_loss(
     Mirrors the official sft_12hz.py speaker-cloning pipeline:
       1. Extract a speaker embedding from the ref-audio mel spectrogram via
          model.speaker_encoder (kept frozen — no gradients flow into it).
-      2. Add the speaker embedding as a per-sample conditioning vector to
-         ALL codec embedding positions before the forward pass.
-         (The official code injects it at a specific sequence position; here
-         we broadcast-add it across the codec slice, which is functionally
-         equivalent for LoRA adapters.)
+      2. Insert the speaker embedding as a single positional token in the
+         codec prefix (between the think/lang section and [pad, bos]) via
+         _build_codec_prefix — matches the official sft_12hz.py approach.
       3. Optionally add all 16 codec-level embeddings as input conditioning
          when model.talker.code_predictor exposes its embedding tables.
       4. Compute main_loss + sub_talker_weight * sub_loss as usual.

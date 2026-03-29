@@ -18,10 +18,10 @@ Supported models: Qwen3-TTS 0.6B/1.7B (working), CSM/Sesame (implemented), Kokor
 pip install mlx-audio soundfile scipy datasets transformers gradio pyyaml safetensors
 
 # Pre-tokenize dataset (run once before training — avoids OOM and speeds up training)
+# Output is auto-written to data/train_codes.jsonl (same dir, _codes suffix)
 python scripts/preprocess_dataset.py \
   --input data/train.jsonl \
-  --output data/train_codes.jsonl \
-  --model_id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
+  --model-id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
 
 # Train (Pipeline 1: language adaptation)
 python scripts/train.py --config configs/qwen3_tts_hindi.yaml
@@ -31,15 +31,15 @@ python scripts/train.py --config configs/qwen3_tts_speaker.yaml
 
 # Post-training: bake speaker embedding into model (Pipeline 2 only)
 python scripts/bake_speaker_embedding.py \
-  --adapter_path checkpoints/qwen3-speaker/step_XXX \
-  --ref_audio_dir data/ref_audios/ \
-  --output_path checkpoints/qwen3-speaker/custom_voice_model
+  --config   configs/qwen3_tts_speaker.yaml \
+  --checkpoint checkpoints/qwen3-speaker/checkpoint-final \
+  --output   checkpoints/qwen3-speaker/custom_voice_model
 
 # Monitor training
-python scripts/watch_training.py --log_file checkpoints/training.log
+python scripts/watch_training.py --log checkpoints/qwen3-hindi/train_log.jsonl
 
 # Demo UI
-python scripts/demo.py --model_path checkpoints/qwen3-speaker/custom_voice_model
+python scripts/demo.py --adapter checkpoints/qwen3-speaker/custom_voice_model
 ```
 
 ## Architecture

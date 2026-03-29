@@ -32,7 +32,7 @@ The codec prefix is:
 ```
 A dedicated token ID is inserted into the codec embedding table and used as an explicit language conditioning signal before generation starts. The transformer attends to this token throughout generation — much stronger signal than Mode A.
 
-The base Qwen3-TTS model has 10 pretrained language tokens (IDs 2050–2071). Adding Indian languages uses the unused slots immediately after:
+The base Qwen3-TTS model reserves ID 2050 for English (`en`). Indian language tokens use the unused slots starting at 2051:
 
 | Language | Code | Token ID |
 |----------|------|----------|
@@ -48,7 +48,7 @@ To register a new language, add it to `custom_lang_ids` in your config — no co
 
 - An adapter that makes the model speak your language
 - Voice identity at inference still comes from `ref_audio` (ICL mode)
-- Adapter size: ~24 MB (rank-8)
+- Adapter size: 23 MB (rank-8)
 
 ### Effect on inference
 
@@ -70,7 +70,7 @@ With ref_audio    → cloned voice from the clip, target language
 Same LoRA as Pipeline 1 (rank-16 instead of rank-8 for more capacity), **plus** a speaker conditioning path:
 
 1. Every training sample must have a `ref_audio` field pointing to a clip of the target speaker
-2. A frozen **ECAPA-TDNN speaker encoder** extracts a 1024-d embedding from the ref audio mel spectrogram
+2. A frozen **speaker encoder** (built into the mlx_audio Qwen3-TTS model) extracts a speaker embedding from the ref audio mel spectrogram
 3. This speaker embedding is inserted as a **single token** into the codec prefix — immediately after the think/lang section and before `[pad, bos]`:
 
 ```
@@ -92,7 +92,7 @@ After training, `bake_speaker_embedding.py` computes the mean speaker embedding 
 
 - An adapter tied to one specific speaker's voice
 - No ref_audio needed at inference
-- Adapter size: ~48 MB (rank-16)
+- Adapter size: 45 MB (rank-16)
 
 ### Effect on inference
 
@@ -143,12 +143,12 @@ lang_code="auto"           → falls back to base English behaviour
 |---|---|---|---|
 | Goal | New language/accent | Specific speaker voice | Multiple languages |
 | LoRA rank | 8 | 16 | 8 |
-| Speaker encoder | Not used | Used (ECAPA-TDNN, frozen) | Not used |
+| Speaker encoder | Not used | Used (frozen, from mlx_audio) | Not used |
 | `ref_audio` at training | No | Yes (required) | No |
 | `ref_audio` at inference | Optional (for voice cloning) | Not needed | Optional |
 | Language tokens | Yes (`custom_lang_ids`) | Yes | Yes (per-sample) |
-| label_smoothing | 0.0 | 0.0 | 0.1 |
-| Adapter size | ~24 MB | ~48 MB | ~24 MB |
+| label_smoothing | 0.1 | 0.0 | 0.1 |
+| Adapter size | 23 MB | 45 MB | 23 MB |
 
 ---
 

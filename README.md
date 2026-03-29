@@ -44,7 +44,7 @@ python scripts/bake_speaker_embedding.py \
 **How it works (mirrors official `sft_12hz.py`):**
 1. Every training sample must have a `ref_audio` field pointing to a clip of the **target speaker**
 2. During each forward pass, `model.speaker_encoder` extracts a speaker embedding from the ref audio mel spectrogram
-3. The speaker embedding is injected into the codec embedding sequence as additive conditioning — all 16 VQ codec levels feed back as input context
+3. The speaker embedding is injected as a single positional token into the codec prefix (between the think/lang section and `[pad, bos]`) — matches the official `sft_12hz.py` positional injection approach
 4. LoRA adapters learn to generate codec tokens conditioned on that speaker identity
 5. After training, `bake_speaker_embedding.py` averages the speaker embeddings across the training set and writes the mean into `talker.model.codec_embedding.weight[3000]` — the reserved custom-voice slot — then patches `config.json` with `tts_model_type: custom_voice`
 
@@ -138,7 +138,8 @@ mlx-audio-train/
 │
 ├── configs/
 │   ├── qwen3_tts_hindi.yaml        # Pipeline 1: language adaptation
-│   └── qwen3_tts_speaker.yaml      # Pipeline 2: speaker voice cloning
+│   ├── qwen3_tts_speaker.yaml      # Pipeline 2: speaker voice cloning
+│   └── qwen3_tts_multilingual.yaml # Pipeline 3: multilingual (hi/ta/te/kn/mr)
 │
 ├── train/
 │   ├── lora.py                     # LoRA / QLoRA layer implementations
@@ -203,7 +204,7 @@ python scripts/preprocess_dataset.py --input data/hindi/train.jsonl [data/hindi/
 - **`QLoRALinear`** — wraps `nn.QuantizedLinear` (quantized base + bf16 LoRA delta)
 - **`apply_lora(model, config)`** — recursive in-place patching; scoped to `talker` for Qwen3-TTS
 - **`get_trainable_params(model)`** — returns only `lora_a`/`lora_b` tensors (avoids 40+ GB gradient memory)
-- **`save_adapters / load_adapters`** — tiny safetensors checkpoint (~46 MB for rank-8)
+- **`save_adapters / load_adapters`** — tiny safetensors checkpoint (23 MB for rank-8, 45 MB for rank-16)
 
 ### `train/trainer.py`
 
@@ -290,7 +291,7 @@ This repo is LoRA / QLoRA on Apple Silicon with MLX.
 | Precision | bfloat16 | 8-bit quantised base + bf16 LoRA delta |
 | Effective batch | 8 (bs=2 × accum=4) | 16–32 |
 | Epochs | 3 | 3 (speaker) / 10–15 (language) |
-| Speaker injection | Position 6 in dual-channel format | Broadcast over codec sequence |
-| All 16 codec levels | Yes (additive input embeddings) | Yes (via `code_predictor` when available) |
+| Speaker injection | Position 6 in dual-channel format | Positional token in codec prefix (matches official) |
+| All 16 codec levels | Yes (additive input embeddings) | No (first codebook only as input; `code_predictor` is an auxiliary loss head) |
 | Post-training step | Bake speaker to `codec_embedding[3000]` | `bake_speaker_embedding.py` (same) |
 | Checkpoint size | Full model (~1.2 GB) | Adapters only (~46 MB) |
