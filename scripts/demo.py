@@ -93,8 +93,8 @@ def _resolve_adapter_file(adapter_path: str) -> Optional[str]:
     return None
 
 
-def _load_custom_lang_ids(adapter_path: str) -> dict:
-    """Read custom_lang_ids from model_config.yaml saved alongside the checkpoint."""
+def _load_model_config(adapter_path: str) -> dict:
+    """Read model_config.yaml saved alongside the checkpoint. Returns {} if not found."""
     import yaml
     search_dirs = [
         Path(adapter_path),
@@ -105,11 +105,7 @@ def _load_custom_lang_ids(adapter_path: str) -> dict:
         cfg_file = d / "model_config.yaml"
         if cfg_file.exists():
             with open(cfg_file) as f:
-                cfg = yaml.safe_load(f)
-            ids = cfg.get("model", {}).get("custom_lang_ids", {})
-            if ids:
-                print(f"[demo] Found custom_lang_ids in {cfg_file}: {ids}")
-            return ids
+                return yaml.safe_load(f)
     return {}
 
 
@@ -134,13 +130,17 @@ def get_model(mode: str, adapter_path: str = None):
             _weights = _mx.load(adapter_file)
             _lora_a  = next((v for k, v in _weights.items() if k.endswith("lora_a")), None)
             _rank    = int(_lora_a.shape[1]) if _lora_a is not None else 8
-            apply_lora(model, LoRAConfig(model_type="qwen3_tts", rank=_rank))
+            # Detect model_type from saved config (qwen3_tts vs qwen3_tts_speaker)
+            _saved_cfg  = _load_model_config(adapter_path)
+            _model_type = _saved_cfg.get("model", {}).get("model_type", "qwen3_tts")
+            apply_lora(model, LoRAConfig(model_type=_model_type, rank=_rank))
             load_adapters(model, adapter_file)
-            print(f"[demo] ✅ Loaded adapters (rank={_rank}): {adapter_file}")
+            print(f"[demo] ✅ Loaded adapters (model_type={_model_type}, rank={_rank}): {adapter_file}")
             # Patch custom language token IDs (e.g. hi→2051) so lang_code works at inference
-            custom_lang_ids = _load_custom_lang_ids(adapter_path)
+            custom_lang_ids = _saved_cfg.get("model", {}).get("custom_lang_ids", {})
             if custom_lang_ids:
                 model.talker.config.codec_language_id.update(custom_lang_ids)
+                print(f"[demo] Registered custom lang IDs: {custom_lang_ids}")
         # else: warning already printed inside _resolve_adapter_file
 
     _models[key] = model

@@ -119,11 +119,9 @@ def qwen3_tts_loss(
     Returns:
         (total_loss, metrics_dict)
     """
-    text_ids      = batch["text_ids"]       # [B, T_text]
-    codec_ids     = batch["codec_ids"]      # [B, T_codec]
-    text_lengths  = batch["text_lengths"]   # [B]
-    codec_lengths = batch["codec_lengths"]  # [B]
-    codec_mask    = batch["codec_mask"]     # [B, T_codec]
+    text_ids   = batch["text_ids"]       # [B, T_text]
+    codec_ids  = batch["codec_ids"]      # [B, T_codec]
+    codec_mask = batch["codec_mask"]     # [B, T_codec]
 
     B = text_ids.shape[0]
 

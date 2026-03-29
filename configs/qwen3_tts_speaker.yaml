@@ -48,8 +48,8 @@ data:
   # ref_audio should always be a clip of the TARGET SPEAKER.
   # Using the same ~5–10 s ref clip for every sample gives the most
   # consistent speaker identity signal.
-  train_jsonl: "/Users/akashsingh/Documents/exps/hindi/train_codes_speaker.jsonl"
-  val_jsonl:   "/Users/akashsingh/Documents/exps/hindi/val_codes_speaker.jsonl"
+  train_jsonl: "./data/speaker/train_codes.jsonl"
+  val_jsonl:   "./data/speaker/val_codes.jsonl"
   target_sr: 24000
   min_duration: 1.0
   max_duration: 15.0
