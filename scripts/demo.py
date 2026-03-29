@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -30,8 +31,87 @@ CUSTOM_VOICE_MODEL  = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
 
 _models = {}   # cache: {"base": model, "custom": model}
 
+CHECKPOINTS_ROOT = Path(__file__).parent.parent / "checkpoints"
+BASE_LABEL       = "── Base model (no adapter) ──"
+
+
+def scan_checkpoints() -> list:
+    """Return sorted list of (label, path) for all available checkpoints."""
+    choices = [BASE_LABEL]
+    if CHECKPOINTS_ROOT.exists():
+        for adapter_file in sorted(CHECKPOINTS_ROOT.rglob("adapters.safetensors")):
+            # e.g.  checkpoints/qwen3-hindi/checkpoint-best  →  "qwen3-hindi / checkpoint-best"
+            rel = adapter_file.parent.relative_to(CHECKPOINTS_ROOT)
+            label = str(rel).replace("/", " / ").replace("\\", " / ")
+            choices.append(label)
+    return choices
+
+
+def label_to_adapter_path(label: str) -> Optional[str]:
+    """Convert dropdown label back to the checkpoint directory path."""
+    if label == BASE_LABEL or not label:
+        return None
+    rel = label.replace(" / ", os.sep)
+    return str(CHECKPOINTS_ROOT / rel)
+
 
 # ── Model loading ─────────────────────────────────────────────────────────────
+
+def _resolve_adapter_file(adapter_path: str) -> Optional[str]:
+    """
+    Resolve adapter_path to the actual adapters.safetensors file path.
+
+    Accepts any of:
+      - /path/to/checkpoint-best/                (dir containing adapters.safetensors)
+      - /path/to/checkpoint-best/adapters.safetensors  (file directly)
+      - /path/to/checkpoints/qwen3-hindi/        (parent dir → picks latest checkpoint)
+    Returns the resolved file path, or None with a printed warning.
+    """
+    p = Path(adapter_path.strip())
+
+    # Direct file
+    if p.is_file() and p.suffix == ".safetensors":
+        return str(p)
+
+    # Directory containing adapters.safetensors
+    if p.is_dir():
+        direct = p / "adapters.safetensors"
+        if direct.exists():
+            return str(direct)
+
+        # Parent dir: look for checkpoint-* subdirs and pick the latest
+        checkpoints = sorted(p.glob("checkpoint-*/adapters.safetensors"))
+        if checkpoints:
+            chosen = checkpoints[-1]  # last = lexicographically latest
+            print(f"[demo] Found {len(checkpoints)} checkpoint(s), using: {chosen.parent.name}")
+            return str(chosen)
+
+    print(f"[demo] WARNING: no adapters.safetensors found at '{adapter_path}'")
+    print(f"[demo]   Expected one of:")
+    print(f"[demo]     {adapter_path}/adapters.safetensors")
+    print(f"[demo]     {adapter_path}/checkpoint-*/adapters.safetensors")
+    return None
+
+
+def _load_custom_lang_ids(adapter_path: str) -> dict:
+    """Read custom_lang_ids from model_config.yaml saved alongside the checkpoint."""
+    import yaml
+    search_dirs = [
+        Path(adapter_path),
+        Path(adapter_path).parent,
+        Path(adapter_path).parent.parent,
+    ]
+    for d in search_dirs:
+        cfg_file = d / "model_config.yaml"
+        if cfg_file.exists():
+            with open(cfg_file) as f:
+                cfg = yaml.safe_load(f)
+            ids = cfg.get("model", {}).get("custom_lang_ids", {})
+            if ids:
+                print(f"[demo] Found custom_lang_ids in {cfg_file}: {ids}")
+            return ids
+    return {}
+
 
 def get_model(mode: str, adapter_path: str = None):
     """Load and cache base or custom-voice model."""
@@ -44,11 +124,24 @@ def get_model(mode: str, adapter_path: str = None):
     print(f"[demo] Loading {mode} model: {model_id}")
     model = mlx_load(model_id)
 
-    if adapter_path and os.path.exists(os.path.join(adapter_path, "adapters.safetensors")):
-        from train.lora import load_adapters, apply_lora, LoRAConfig
-        apply_lora(model, LoRAConfig(model_type="qwen3_tts"))
-        load_adapters(model, os.path.join(adapter_path, "adapters.safetensors"))
-        print(f"[demo] Loaded adapters from {adapter_path}")
+    if adapter_path:
+        adapter_file = _resolve_adapter_file(adapter_path)
+        if adapter_file:
+            from train.lora import load_adapters, apply_lora, LoRAConfig
+            import mlx.core as _mx
+            # Infer rank from the saved adapter shapes so rank-16 (pipe2)
+            # and rank-8 (pipe1) adapters both load correctly.
+            _weights = _mx.load(adapter_file)
+            _lora_a  = next((v for k, v in _weights.items() if k.endswith("lora_a")), None)
+            _rank    = int(_lora_a.shape[1]) if _lora_a is not None else 8
+            apply_lora(model, LoRAConfig(model_type="qwen3_tts", rank=_rank))
+            load_adapters(model, adapter_file)
+            print(f"[demo] ✅ Loaded adapters (rank={_rank}): {adapter_file}")
+            # Patch custom language token IDs (e.g. hi→2051) so lang_code works at inference
+            custom_lang_ids = _load_custom_lang_ids(adapter_path)
+            if custom_lang_ids:
+                model.talker.config.codec_language_id.update(custom_lang_ids)
+        # else: warning already printed inside _resolve_adapter_file
 
     _models[key] = model
     return model
@@ -61,6 +154,7 @@ def synthesise(
     ref_audio,          # numpy array from gr.Audio or None
     ref_text:     str,
     adapter_dir:  str,
+    lang_code:    str,
     speed:        float,
     temperature:  float,
 ):
@@ -77,6 +171,18 @@ def synthesise(
     run_cloned = ref_audio is not None
 
     adapter = adapter_dir.strip() or None
+
+    # Show adapter status in the UI
+    if adapter:
+        resolved = _resolve_adapter_file(adapter)
+        if resolved:
+            adapter_label = f"adapter: {Path(resolved).parent.name}"
+        else:
+            status_log.append(f"⚠️ Adapter path set but adapters.safetensors not found: {adapter}")
+            adapter = None
+            adapter_label = "base weights (adapter not found)"
+    else:
+        adapter_label = "base weights"
 
     # ── Save ref audio to temp file if provided ───────────────────────────────
     ref_path = None
@@ -98,6 +204,8 @@ def synthesise(
                 file_prefix = "base",
                 speed       = speed,
                 temperature = temperature,
+                voice       = None,
+                lang_code   = lang_code,
                 verbose     = False,
                 stt_model   = None,
             )
@@ -128,6 +236,8 @@ def synthesise(
                 speed       = speed,
                 temperature = temperature,
                 ref_audio   = ref_path,
+                voice       = None,
+                lang_code   = lang_code,
                 verbose     = False,
             )
             if ref_text.strip():
@@ -149,7 +259,7 @@ def synthesise(
 
     base_out   = results.get("base")
     cloned_out = results.get("cloned")
-    status     = "  |  ".join(status_log)
+    status     = f"[{adapter_label}]  " + "  |  ".join(status_log)
 
     return base_out, cloned_out, status
 
@@ -190,9 +300,19 @@ Upload any 3–10 second audio clip as reference → the model speaks in that vo
                     placeholder = "e.g. Hello, I want to test voice cloning with this recording.",
                     lines       = 2,
                 )
-                adapter_input = gr.Textbox(
-                    label       = "Finetuned adapter path (blank = base weights)",
-                    placeholder = "./checkpoints/qwen3-hindi/checkpoint-best",
+                with gr.Row():
+                    adapter_input = gr.Dropdown(
+                        label   = "Finetuned checkpoint",
+                        choices = scan_checkpoints(),
+                        value   = BASE_LABEL,
+                        scale   = 4,
+                    )
+                    refresh_btn = gr.Button("🔄", size="sm", scale=1, min_width=40)
+                lang_input = gr.Dropdown(
+                    label   = "Language",
+                    choices = ["auto", "hi", "kn", "mr", "ta", "te", "en"],
+                    value   = "auto",
+                    info    = "auto = base English. Select a language when using a multilingual adapter.",
                 )
 
         gen_btn = gr.Button("🔊 Generate", variant="primary", size="lg")
@@ -212,13 +332,14 @@ Upload any 3–10 second audio clip as reference → the model speaks in that vo
         gr.Markdown("### 📝 Example texts")
         gr.Examples(
             examples=[
-                ["नमस्ते! मेरा नाम राज है और मैं दिल्ली से हूँ।",             None, "", "", 1.0, 0.7],
-                ["आज बाज़ार में बहुत भीड़ थी, लेकिन मैंने सब ख़रीद लिया।",    None, "", "", 1.0, 0.7],
-                ["Hello, मैं ठीक हूँ। आप कैसे हैं? Thank you for asking.",    None, "", "", 1.0, 0.7],
-                ["भारत एक विविधताओं से भरा देश है।",                          None, "", "", 0.9, 0.7],
-                ["The quick brown fox jumps over the lazy dog.",              None, "", "", 1.0, 0.8],
+                ["नमस्ते! मेरा नाम राज है और मैं दिल्ली से हूँ।",                    None, "", BASE_LABEL, "hi", 1.0, 0.7],
+                ["ಕನ್ನಡ ನಾಡಿನ ಸಂಸ್ಕೃತಿ ಬಹಳ ಶ್ರೀಮಂತವಾಗಿದೆ.",                          None, "", BASE_LABEL, "kn", 1.0, 0.7],
+                ["मराठी भाषा महाराष्ट्राची अभिमानाची भाषा आहे.",                      None, "", BASE_LABEL, "mr", 1.0, 0.7],
+                ["தமிழ் மொழி உலகின் தொன்மையான மொழிகளில் ஒன்றாகும்.",               None, "", BASE_LABEL, "ta", 1.0, 0.7],
+                ["తెలుగు భాష చాలా మధురమైనది.",                                        None, "", BASE_LABEL, "te", 1.0, 0.7],
+                ["The quick brown fox jumps over the lazy dog.",                      None, "", BASE_LABEL, "auto", 1.0, 0.8],
             ],
-            inputs=[text_input, ref_audio_input, ref_text_input, adapter_input, speed_slider, temp_slider],
+            inputs=[text_input, ref_audio_input, ref_text_input, adapter_input, lang_input, speed_slider, temp_slider],
         )
 
         # ── How to use ───────────────────────────────────────────────────────
@@ -241,15 +362,26 @@ Upload any 3–10 second audio clip as reference → the model speaks in that vo
 - Reference text must match what is actually said in the clip (used as codec prefix)
 - After Hindi finetuning, the cloned voice should speak Hindi more naturally
 
-**Adapter path:**
-- Leave blank to use base weights
-- Point to a finetuned checkpoint to compare quality before/after training
+**Checkpoint dropdown:**
+- Select a finetuned checkpoint from the dropdown to compare before/after training
+- Click 🔄 to rescan if you just finished training
 """)
 
+        # ── Refresh dropdown ─────────────────────────────────────────────────
+        refresh_btn.click(
+            fn      = lambda: gr.update(choices=scan_checkpoints()),
+            inputs  = [],
+            outputs = [adapter_input],
+        )
+
         # ── Wire up ──────────────────────────────────────────────────────────
+        def synthesise_ui(text, ref_audio, ref_text, adapter_label, lang_code, speed, temperature):
+            adapter_path = label_to_adapter_path(adapter_label)
+            return synthesise(text, ref_audio, ref_text, adapter_path or "", lang_code, speed, temperature)
+
         gen_btn.click(
-            fn      = synthesise,
-            inputs  = [text_input, ref_audio_input, ref_text_input, adapter_input, speed_slider, temp_slider],
+            fn      = synthesise_ui,
+            inputs  = [text_input, ref_audio_input, ref_text_input, adapter_input, lang_input, speed_slider, temp_slider],
             outputs = [base_out, cloned_out, status_box],
         )
 

@@ -42,11 +42,59 @@ def cross_entropy_masked(
     return masked.sum() / n_valid
 
 
+def _build_codec_prefix(talker, lang_codes) -> mx.array:
+    """
+    Build per-sample codec prefix embeds that match Qwen3-TTS inference behaviour.
+
+    auto   → [nothink, think_bos, think_eos, pad, bos]           (5 tokens)
+    <lang> → [think,  think_bos, lang_id,   think_eos, pad, bos] (6 tokens)
+
+    lang_codes: list[str] of length B, or a single str (broadcast to all samples).
+
+    Returns:
+        prefix_embeds [B, T_prefix, D]
+        T_prefix       int  (uniform across samples; shorter auto-prefixes are
+                             left-padded with codec_pad_id to match lang prefixes)
+    """
+    cfg         = talker.config
+    codec_embed = talker.get_input_embeddings()
+
+    # Accept a single string for backward compatibility
+    if isinstance(lang_codes, str):
+        lang_codes = [lang_codes]
+
+    per_sample_ids = []
+    for lang_code in lang_codes:
+        lang_id = None
+        if lang_code != "auto" and cfg.codec_language_id:
+            lang_id = cfg.codec_language_id.get(lang_code.lower())
+
+        if lang_id is not None:
+            ids = [cfg.codec_think_id, cfg.codec_think_bos_id,
+                   lang_id, cfg.codec_think_eos_id,
+                   cfg.codec_pad_id, cfg.codec_bos_id]
+        else:
+            ids = [cfg.codec_nothink_id, cfg.codec_think_bos_id,
+                   cfg.codec_think_eos_id,
+                   cfg.codec_pad_id, cfg.codec_bos_id]
+        per_sample_ids.append(ids)
+
+    # Pad shorter prefixes (auto=5) to match longer ones (lang=6) with codec_pad_id
+    T_prefix = max(len(ids) for ids in per_sample_ids)
+    for i, ids in enumerate(per_sample_ids):
+        if len(ids) < T_prefix:
+            per_sample_ids[i] = [cfg.codec_pad_id] * (T_prefix - len(ids)) + ids
+
+    prefix = mx.array(per_sample_ids)       # [B, T_prefix]
+    return codec_embed(prefix), T_prefix    # [B, T_prefix, D], T_prefix
+
+
 def qwen3_tts_loss(
     model,
     batch: Dict[str, mx.array],
     sub_talker_weight: float = 0.3,
     label_smoothing:   float = 0.0,
+    lang_code:         str   = "auto",
 ) -> Tuple[mx.array, Dict[str, float]]:
     """
     Compute Qwen3-TTS training loss.
@@ -55,14 +103,18 @@ def qwen3_tts_loss(
     predicts codec tokens autoregressively.
 
     Sequence layout (teacher-forced):
-        input:   [text_embeds | codec_embeds[0:-1]]
-        labels:  [IGNORE      | codec_ids[1:]     ]
+        input:   [text_embeds | codec_prefix | codec_embeds[0:-1]]
+        labels:  [IGNORE      | IGNORE       | codec_ids[1:]     ]
+
+    The codec_prefix matches the inference-time prefix (nothink/think + language
+    token) so training and inference see the same conditioning context.
 
     Args:
         model:   Qwen3-TTS Model instance (mlx_audio)
         batch:   dict with keys: text_ids, codec_ids, text_lengths, codec_lengths, text_mask, codec_mask
         sub_talker_weight: weight for the code predictor auxiliary loss (default 0.3)
         label_smoothing:   optional label smoothing
+        lang_code:         language code to inject ("auto" = nothink prefix, no language token)
 
     Returns:
         (total_loss, metrics_dict)
@@ -77,17 +129,22 @@ def qwen3_tts_loss(
 
     # ── Embeddings ──────────────────────────────────────────────────────────
 
-    talker     = model.talker
-    text_embed = talker.get_text_embeddings()    # text token embedding table
-    codec_embed = talker.get_input_embeddings()  # codec token embedding table
+    talker      = model.talker
+    text_embed  = talker.get_text_embeddings()    # text token embedding table
+    codec_embed = talker.get_input_embeddings()   # codec token embedding table
 
-    text_embeds  = text_embed(text_ids)          # [B, T_text, D_text]
-    text_embeds  = talker.text_projection(text_embeds)  # [B, T_text, D_model]
+    text_embeds  = text_embed(text_ids)                    # [B, T_text, D_text]
+    text_embeds  = talker.text_projection(text_embeds)     # [B, T_text, D_model]
 
-    # Teacher-forced: feed codec[0:-1], predict codec[1:]
-    # We feed: [text_embeds, codec_embeds[0:-1]]
-    codec_input  = codec_embeds_shifted = codec_embed(codec_ids[:, :-1])  # [B, T_codec-1, D]
-    inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)    # [B, T_text + T_codec-1, D]
+    # ── Codec prefix (matches inference conditioning) ────────────────────────
+    # Per-sample lang_codes from batch override the config-level lang_code fallback.
+    lang_codes = batch.get("lang_codes") or [lang_code] * B
+    prefix_embeds, T_prefix = _build_codec_prefix(talker, lang_codes)  # [B, T_prefix, D]
+
+    # Teacher-forced: feed [prefix | codec[0:-1]], predict codec[1:]
+    codec_input   = codec_embed(codec_ids[:, :-1])                       # [B, T_codec-1, D]
+    codec_input   = mx.concatenate([prefix_embeds, codec_input], axis=1) # [B, T_prefix+T_codec-1, D]
+    inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)   # [B, T_text+T_prefix+T_codec-1, D]
 
     # ── Forward pass ────────────────────────────────────────────────────────
 
@@ -95,8 +152,9 @@ def qwen3_tts_loss(
 
     T_text_max = text_ids.shape[1]
 
-    # Take only the codec portion of logits (after text prefix)
-    codec_logits = logits[:, T_text_max - 1: T_text_max - 1 + codec_ids.shape[1] - 1, :]
+    # Take only the codec portion of logits (after text + prefix)
+    codec_offset = T_text_max - 1 + T_prefix
+    codec_logits = logits[:, codec_offset: codec_offset + codec_ids.shape[1] - 1, :]
     # [B, T_codec-1, vocab]
 
     # Labels = codec_ids[1:]
@@ -137,6 +195,7 @@ def qwen3_tts_speaker_loss(
     batch: Dict[str, mx.array],
     sub_talker_weight: float = 0.3,
     label_smoothing:   float = 0.0,
+    lang_code:         str   = "auto",
 ) -> Tuple[mx.array, Dict[str, float]]:
     """
     Qwen3-TTS training loss with speaker-embedding injection.
@@ -171,8 +230,14 @@ def qwen3_tts_speaker_loss(
     text_embeds  = text_embed(text_ids)
     text_embeds  = talker.text_projection(text_embeds)
 
-    # Codec teacher-forcing input: codec[0:-1]
-    codec_input  = codec_embed(codec_ids[:, :-1])   # [B, T_codec-1, D]
+    B = text_ids.shape[0]
+
+    # ── Codec prefix (matches inference conditioning) ────────────────────────
+    lang_codes = batch.get("lang_codes") or [lang_code] * B
+    prefix_embeds, T_prefix = _build_codec_prefix(talker, lang_codes)  # [B, T_prefix, D]
+
+    # Codec teacher-forcing input: [prefix | codec[0:-1]]
+    codec_input  = codec_embed(codec_ids[:, :-1])                        # [B, T_codec-1, D]
 
     # ── Speaker conditioning ─────────────────────────────────────────────────
     if ref_mel is not None and hasattr(model, "speaker_encoder"):
@@ -207,12 +272,14 @@ def qwen3_tts_speaker_loss(
                     break  # fewer than 16 levels in this model variant
 
     # ── Forward ──────────────────────────────────────────────────────────────
+    codec_input   = mx.concatenate([prefix_embeds, codec_input], axis=1)  # [B, T_prefix+T_codec-1, D]
     inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)
     logits, hidden_states = talker(inputs_embeds)
 
     T_text_max    = text_ids.shape[1]
     T_codec       = codec_ids.shape[1]
-    codec_logits  = logits[:, T_text_max - 1: T_text_max - 1 + T_codec - 1, :]
+    codec_offset  = T_text_max - 1 + T_prefix
+    codec_logits  = logits[:, codec_offset: codec_offset + T_codec - 1, :]
     codec_targets = codec_ids[:, 1:]
     loss_mask     = codec_mask[:, 1:]
 
@@ -220,7 +287,7 @@ def qwen3_tts_speaker_loss(
 
     sub_loss = mx.array(0.0)
     if sub_talker_weight > 0 and hasattr(talker, "code_predictor"):
-        codec_hidden = hidden_states[:, T_text_max - 1: T_text_max - 1 + T_codec - 1, :]
+        codec_hidden = hidden_states[:, codec_offset: codec_offset + T_codec - 1, :]
         sub_out  = talker.code_predictor(codec_hidden)
         sub_logits = sub_out[0] if isinstance(sub_out, tuple) else sub_out
         sub_loss = cross_entropy_masked(sub_logits, codec_targets, loss_mask, label_smoothing)

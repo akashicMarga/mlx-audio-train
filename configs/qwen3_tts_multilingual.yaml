@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3-TTS 0.6B — Indian Multilingual Config
+# Languages: Hindi, Indian English, Kannada, Marathi, Tamil, Telugu
+#
+# Preparation steps before training:
+#
+#   1. Download data (one-time):
+#      python scripts/download_indicvoices.py --lang kn mr ta te --samples 2000
+#
+#   2. Pre-tokenize each language (run once per language, speeds up training):
+#      for lang in kn mr ta te; do
+#        python scripts/preprocess_dataset.py \
+#          --input  data/$lang/train.jsonl \
+#          --output data/$lang/train_codes.jsonl \
+#          --model_id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
+#        python scripts/preprocess_dataset.py \
+#          --input  data/$lang/val.jsonl \
+#          --output data/$lang/val_codes.jsonl \
+#          --model_id mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
+#      done
+#
+#   3. Combine all languages:
+#      python scripts/prepare_multilingual.py \
+#        --langs hi kn mr ta te \
+#        --output data/multilingual
+#
+#   4. Train:
+#      python scripts/train.py --config configs/qwen3_tts_multilingual.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+  tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  model_type: "qwen3_tts"
+  # New Indian language token IDs (unused slots in pretrained vocab 2051–2147).
+  # "en" (2050) is already in the pretrained model — no need to add it here.
+  custom_lang_ids:
+    hi: 2051   # Hindi
+    ta: 2052   # Tamil
+    te: 2056   # Telugu
+    kn: 2059   # Kannada
+    mr: 2062   # Marathi
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/multilingual/train_codes.jsonl"
+  val_jsonl:   "./data/multilingual/val_codes.jsonl"
+  target_sr: 24000
+  min_duration: 1.0
+  max_duration: 14.0
+  normalize: true
+  trim: true
+  max_samples: null
+
+trainer:
+  output_dir: "./checkpoints/qwen3-indian-multilingual"
+  run_name: "qwen3-0.6b-indian-multilingual-lora-r8"
+
+  num_epochs: 10
+  max_steps: null
+
+  batch_size: 2
+  grad_accumulation: 16     # effective batch = 32
+
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+  warmup_steps: 100         # longer warmup for multilingual stability
+  lr_schedule: "cosine"
+
+  save_every_n_steps: 500
+  save_every_n_epochs: 1
+  keep_last_n: 3
+
+  eval_every_n_steps: 200
+  val_batches: 10
+
+  log_every_n_steps: 10
+  log_file: "./checkpoints/qwen3-indian-multilingual/train_log.jsonl"
+
+  sort_by_length: true
+  prefetch: 2
+
+  label_smoothing: 0.1      # diversity across 6 languages
+  lang_code: "auto"         # fallback — per-sample lang_code in JSONL takes precedence
+
+processor:
+  max_text_len: 256
+  max_codec_len: 1200
+  include_ref_mel: false

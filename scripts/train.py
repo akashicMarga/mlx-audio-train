@@ -80,6 +80,8 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
             speech_tokenizer  = speech_tok,
             # Speaker-cloning pipeline: extract ref mel for speaker_encoder
             include_ref_mel   = proc_cfg.get("include_ref_mel", False),
+            # Fallback lang_code for samples that don't have one in the JSONL
+            lang_code         = cfg["trainer"].get("lang_code", "auto"),
         ))
         collate_fn = collate_qwen3
 
@@ -115,9 +117,16 @@ def load_model(cfg: dict):
 
     print(f"[train] Loading model: {model_id}")
 
-    if model_type == "qwen3_tts":
+    if model_type in ("qwen3_tts", "qwen3_tts_speaker"):
         from mlx_audio.tts.utils import load_model as mlx_load
         model = mlx_load(model_id)
+        # Register any custom language token IDs defined in the config.
+        # Use unused slots in the codec embedding table (IDs 2051–2147 are free).
+        # See MODEL_CARD.md for the full list of reserved IDs.
+        custom_lang_ids = cfg["model"].get("custom_lang_ids", {})
+        if custom_lang_ids:
+            model.talker.config.codec_language_id.update(custom_lang_ids)
+            print(f"[train] Registered custom lang IDs: {custom_lang_ids}")
         return model
 
     elif model_type == "csm":
@@ -136,17 +145,19 @@ def build_loss_fn(cfg: dict):
     if model_type == "qwen3_tts":
         from train.losses.codec_loss import qwen3_tts_loss
         label_smoothing = cfg["trainer"].get("label_smoothing", 0.0)
+        lang_code       = cfg["trainer"].get("lang_code", "auto")
 
         def loss_fn(model, batch):
-            return qwen3_tts_loss(model, batch, label_smoothing=label_smoothing)
+            return qwen3_tts_loss(model, batch, label_smoothing=label_smoothing, lang_code=lang_code)
         return loss_fn
 
     elif model_type == "qwen3_tts_speaker":
         from train.losses.codec_loss import qwen3_tts_speaker_loss
         label_smoothing = cfg["trainer"].get("label_smoothing", 0.0)
+        lang_code       = cfg["trainer"].get("lang_code", "auto")
 
         def loss_fn(model, batch):
-            return qwen3_tts_speaker_loss(model, batch, label_smoothing=label_smoothing)
+            return qwen3_tts_speaker_loss(model, batch, label_smoothing=label_smoothing, lang_code=lang_code)
         return loss_fn
 
     elif model_type == "csm":
@@ -327,6 +338,10 @@ def main():
         log_file            = t.get("log_file",             None),
         label_smoothing     = t.get("label_smoothing",      0.0),
     )
+
+    # Save the full config alongside checkpoints so demo.py can read custom_lang_ids etc.
+    import shutil
+    shutil.copy(args.config, Path(trainer_config.output_dir) / "model_config.yaml")
 
     trainer = Trainer(trainer_config)
     trainer.train(model, train_loader, loss_fn, val_loader)

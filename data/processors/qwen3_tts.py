@@ -45,6 +45,8 @@ class Qwen3TTSProcessorConfig:
     speech_tokenizer: Any   = None
     # Set True for the speaker-cloning pipeline to include ref mel spectrograms
     include_ref_mel:  bool  = False
+    # Fallback lang_code for samples that don't have one in the JSONL
+    lang_code:        str   = "auto"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,6 +183,7 @@ class Qwen3TTSProcessor:
                 "codec_length":  len(codec_ids),
                 "text":          sample.text,
                 "audio_path":    sample.audio_path,
+                "lang_code":     getattr(sample, "lang_code", self.config.lang_code),
             }
 
             # Ref audio: codec IDs (for inference) + mel spectrogram (speaker-cloning pipeline)
@@ -253,6 +256,7 @@ def collate_qwen3(
         "codec_lengths": mx.array(codec_lengths),
         "text_mask":     mx.array(text_mask),
         "codec_mask":    mx.array(codec_mask),
+        "lang_codes":    [s.get("lang_code", "auto") for s in samples],
     }
 
     # Speaker-cloning pipeline: include padded ref mel spectrograms

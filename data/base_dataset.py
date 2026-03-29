@@ -39,6 +39,7 @@ class TTSSample:
     speaker_id: Optional[int]       = None    # integer speaker ID
     audio_path: str                 = ""      # original path (for debugging)
     duration:   float               = 0.0
+    lang_code:  str                 = "auto"  # per-sample language code (e.g. "hi", "ta")
 
 
 @dataclass
@@ -170,6 +171,7 @@ class TTSDataset:
             speaker_id  = meta.get("speaker_id"),
             audio_path  = meta["audio"],
             duration    = len(audio) / sr,
+            lang_code   = meta.get("lang_code", "auto"),
         )
 
         # Apply processor if provided (returns model-specific tensors)

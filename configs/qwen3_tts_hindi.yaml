@@ -7,6 +7,10 @@ model:
   model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
   tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
   model_type: "qwen3_tts"
+  # Register new language token IDs into unused codec embedding slots (2051–2147).
+  # Add your language here and set lang_code (under trainer:) to the same key.
+  custom_lang_ids:
+    hi: 2051   # Hindi
 
 lora:
   rank: 8
@@ -74,6 +78,11 @@ trainer:
   prefetch: 2
 
   label_smoothing: 0.1    # helps with Hindi character diversity
+
+  # Language token injected into the codec prefix during training (matches inference).
+  # Hindi is not in codec_language_id, so "auto" uses the nothink path (no language token).
+  # This aligns training with inference so the model sees the same prefix conditioning.
+  lang_code: "hi"
 
 processor:
   max_text_len: 256

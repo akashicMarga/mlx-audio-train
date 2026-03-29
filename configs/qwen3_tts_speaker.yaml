@@ -25,6 +25,10 @@ model:
   model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
   tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
   model_type: "qwen3_tts_speaker"     # ← speaker-cloning pipeline
+  # Register new language token IDs into unused codec embedding slots (2051–2147).
+  # Add your language here and set lang_code (under trainer:) to the same key.
+  custom_lang_ids:
+    hi: 2051   # Hindi
 
 lora:
   rank: 16           # higher rank captures more speaker-specific detail
@@ -44,8 +48,8 @@ data:
   # ref_audio should always be a clip of the TARGET SPEAKER.
   # Using the same ~5–10 s ref clip for every sample gives the most
   # consistent speaker identity signal.
-  train_jsonl: "./data/speaker/train_codes.jsonl"
-  val_jsonl:   "./data/speaker/val_codes.jsonl"
+  train_jsonl: "/Users/akashsingh/Documents/exps/hindi/train_codes_speaker.jsonl"
+  val_jsonl:   "/Users/akashsingh/Documents/exps/hindi/val_codes_speaker.jsonl"
   target_sr: 24000
   min_duration: 1.0
   max_duration: 15.0
@@ -54,8 +58,8 @@ data:
   max_samples: null
 
 trainer:
-  output_dir: "./checkpoints/qwen3-speaker"
-  run_name: "qwen3-0.6b-speaker-lora-r16"
+  output_dir: "./checkpoints/qwen3-speaker-pipe2"
+  run_name: "qwen3-0.6b-speaker-lora-r16-pipe2"
 
   # Official uses 3 epochs — more can overfit to a single voice
   num_epochs: 3
@@ -86,13 +90,14 @@ trainer:
 
   # Logging
   log_every_n_steps: 10
-  log_file: "./checkpoints/qwen3-speaker/train_log.jsonl"
+  log_file: "./checkpoints/qwen3-speaker-pipe2/train_log.jsonl"
 
   # Data loading
   sort_by_length: true
-  prefetch: 2
+  prefetch: 0   # ref_mel mx.array conversion in bg thread crashes Metal
 
   label_smoothing: 0.0     # no smoothing for voice identity (want sharp predictions)
+  lang_code: "hi"          # Hindi language token (ID 2051) injected into codec prefix
 
 processor:
   max_text_len: 256

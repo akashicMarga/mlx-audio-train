@@ -138,8 +138,9 @@ DEFAULT_TARGETS = {
 
 # Submodule scope per model type: limit LoRA to this submodule only
 DEFAULT_SCOPE = {
-    "qwen3_tts":  "talker",          # avoid patching speech_tokenizer
-    "csm":        "model",
+    "qwen3_tts":         "talker",   # avoid patching speech_tokenizer
+    "qwen3_tts_speaker": "talker",   # same — gc_func in speech_tokenizer
+    "csm":               "model",
     "kokoro":     None,              # patch all
     "chatterbox": None,
     "default":    None,
