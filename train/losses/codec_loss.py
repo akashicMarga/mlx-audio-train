@@ -116,6 +116,7 @@ def qwen3_tts_loss(
     sub_talker_weight: float = 0.3,
     label_smoothing:   float = 0.0,
     lang_code:         str   = "auto",
+    use_bf16:          bool  = False,
 ) -> Tuple[mx.array, Dict[str, float]]:
     """
     Compute Qwen3-TTS training loss.
@@ -136,6 +137,9 @@ def qwen3_tts_loss(
         sub_talker_weight: weight for the code predictor auxiliary loss (default 0.3)
         label_smoothing:   optional label smoothing
         lang_code:         language code to inject ("auto" = nothink prefix, no language token)
+        use_bf16:          cast inputs_embeds to bfloat16 before the transformer forward pass.
+                           Halves attention-matrix and hidden-state memory (O(T²) savings).
+                           Combine with lora_dtype=mx.bfloat16 in LoRAConfig for full bf16 training.
 
     Returns:
         (total_loss, metrics_dict)
@@ -165,9 +169,20 @@ def qwen3_tts_loss(
     codec_input   = mx.concatenate([prefix_embeds, codec_input], axis=1) # [B, T_prefix+T_codec-1, D]
     inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)   # [B, T_text+T_prefix+T_codec-1, D]
 
+    # ── Optional bf16 cast before the expensive transformer forward ──────────
+    # The transformer is O(T²) in attention memory. Casting to bf16 here halves
+    # attention scores, hidden states, and MLP activations for all 28+ layers.
+    # QuantizedLinear outputs match the input dtype, so bf16 propagates through.
+    if use_bf16:
+        inputs_embeds = inputs_embeds.astype(mx.bfloat16)
+
     # ── Forward pass ────────────────────────────────────────────────────────
 
     logits, hidden_states = talker(inputs_embeds)  # [B, T_total, vocab], [B, T_total, D]
+    # Cast logits back to float32 for cross-entropy numerical stability
+    if use_bf16:
+        logits = logits.astype(mx.float32)
+        hidden_states = hidden_states.astype(mx.float32)
 
     T_text_max = text_ids.shape[1]
 
@@ -215,6 +230,7 @@ def qwen3_tts_speaker_loss(
     sub_talker_weight: float = 0.3,
     label_smoothing:   float = 0.0,
     lang_code:         str   = "auto",
+    use_bf16:          bool  = False,
 ) -> Tuple[mx.array, Dict[str, float]]:
     """
     Qwen3-TTS training loss with speaker-embedding injection.
@@ -268,7 +284,16 @@ def qwen3_tts_speaker_loss(
     # ── Forward ──────────────────────────────────────────────────────────────
     codec_input   = mx.concatenate([prefix_embeds, codec_input], axis=1)  # [B, T_prefix+T_codec-1, D]
     inputs_embeds = mx.concatenate([text_embeds, codec_input], axis=1)
+
+    # Cast to bf16 before the expensive O(T²) transformer forward
+    if use_bf16:
+        inputs_embeds = inputs_embeds.astype(mx.bfloat16)
+
     logits, hidden_states = talker(inputs_embeds)
+    # Cast back to float32 for loss computation
+    if use_bf16:
+        logits = logits.astype(mx.float32)
+        hidden_states = hidden_states.astype(mx.float32)
 
     T_text_max    = text_ids.shape[1]
     T_codec       = codec_ids.shape[1]

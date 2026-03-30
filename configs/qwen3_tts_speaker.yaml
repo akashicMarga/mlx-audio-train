@@ -42,6 +42,7 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+  # lora_dtype: "bfloat16"   # halves adapter + optimizer moment memory
 
 data:
   # JSONL format: each line must have "audio", "text", AND "ref_audio"
@@ -67,8 +68,9 @@ trainer:
 
   # Smaller effective batch than language adaptation: speaker signal is
   # dense per sample so less accumulation is needed.
-  batch_size: 2
-  grad_accumulation: 8        # effective batch = 16
+  # batch_size=1 halves attention (O(T²)) memory vs batch_size=2.
+  batch_size: 1
+  grad_accumulation: 16       # effective batch = 16 (same as batch_size=2/accum=8)
 
   # Optimizer — match official lr
   learning_rate: 2.0e-5
@@ -99,8 +101,13 @@ trainer:
   label_smoothing: 0.0     # no smoothing for voice identity (want sharp predictions)
   lang_code: "hi"          # Hindi language token (ID 2051) injected into codec prefix
 
+  # ── Memory optimizations ──────────────────────────────────────────────────
+  use_bf16: false          # set true to halve attention/hidden-state memory
+  clear_cache_steps: 0     # e.g. 50 to free Metal buffer pool periodically
+
 processor:
   max_text_len: 256
-  max_codec_len: 1200
+  # 800 tokens ≈ 67s at 12Hz. Cuts ~55% of per-layer attention memory vs 1200.
+  max_codec_len: 800
   speaker_name: "custom_speaker"   # written into config.json by bake script
   include_ref_mel: true            # enables ref_mel → speaker_encoder path

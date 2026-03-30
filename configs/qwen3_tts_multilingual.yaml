@@ -53,6 +53,7 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+  # lora_dtype: "bfloat16"   # halves adapter + optimizer moment memory
 
 data:
   train_jsonl: "./data/multilingual/train_codes.jsonl"
@@ -71,8 +72,9 @@ trainer:
   num_epochs: 10
   max_steps: null
 
-  batch_size: 2
-  grad_accumulation: 16     # effective batch = 32
+  # batch_size=1 halves attention (O(T²)) memory. Same effective batch via accumulation.
+  batch_size: 1
+  grad_accumulation: 32     # effective batch = 32
 
   learning_rate: 2.0e-5
   weight_decay: 0.01
@@ -97,7 +99,12 @@ trainer:
   label_smoothing: 0.1      # diversity across 6 languages
   lang_code: "auto"         # fallback — per-sample lang_code in JSONL takes precedence
 
+  # ── Memory optimizations ──────────────────────────────────────────────────
+  use_bf16: false          # set true to halve attention/hidden-state memory
+  clear_cache_steps: 0     # e.g. 50 to free Metal buffer pool periodically
+
 processor:
   max_text_len: 256
-  max_codec_len: 1200
+  # 800 tokens ≈ 67s at 12Hz. Cuts ~55% of per-layer attention memory vs 1200.
+  max_codec_len: 800
   include_ref_mel: false

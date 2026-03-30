@@ -70,6 +70,21 @@ class TrainerConfig:
     # Label smoothing
     label_smoothing:     float = 0.0
 
+    # ── Memory optimizations ──────────────────────────────────────────────────
+    # Cast inputs_embeds to bfloat16 before the transformer forward pass.
+    # Halves attention-matrix (O(T²)) and hidden-state memory across all layers.
+    # Requires lora_dtype: "bfloat16" in the lora config for full bf16 training.
+    # Default: false (float32, more stable). Enable for 64 GB machines with long seqs.
+    use_bf16:            bool  = False
+
+    # Clear the Metal GPU buffer pool every N optimizer steps (0 = disabled).
+    # Metal caches allocated buffers for reuse; over time this pool can grow to
+    # several GB. Clearing it frees unused Metal memory at the cost of
+    # re-allocating buffers on the next step. Useful when running OOM near the
+    # end of a long training run.
+    # Suggested: clear_cache_steps=50 if you see memory creeping up over time.
+    clear_cache_steps:   int   = 0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LR schedule
@@ -162,6 +177,10 @@ class Trainer:
         from .lora import get_trainable_params
         lora_params = get_trainable_params(model)
         print(f"[trainer] {len(lora_params)} LoRA adapter tensors will be optimized")
+        if cfg.use_bf16:
+            print("[trainer] bf16 activations ENABLED — inputs_embeds cast to bfloat16 before transformer")
+        if cfg.clear_cache_steps > 0:
+            print(f"[trainer] Metal cache cleared every {cfg.clear_cache_steps} optimizer steps")
 
         optimizer = optim.AdamW(
             learning_rate=cfg.learning_rate,
@@ -263,6 +282,15 @@ class Trainer:
 
                 optimizer.update(model, nested_grads)
                 mx.eval(state)
+
+                # Optional: free the Metal GPU buffer pool to reclaim cached
+                # allocations that are no longer in use. Trades re-allocation
+                # overhead for lower peak memory on long runs.
+                if cfg.clear_cache_steps > 0 and self._step % cfg.clear_cache_steps == 0:
+                    try:
+                        mx.metal.clear_cache()
+                    except AttributeError:
+                        pass  # Not on Metal (non-Apple platform); silently skip
 
                 step_loss = accum_loss / accum_count
                 epoch_loss += step_loss

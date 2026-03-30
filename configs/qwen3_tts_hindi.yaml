@@ -25,6 +25,9 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+  # Memory: set lora_dtype to "bfloat16" to halve adapter + AdamW moment memory.
+  # Negligible accuracy loss for LoRA on already-quantized models.
+  # lora_dtype: "bfloat16"
 
 data:
   train_jsonl: "./data/hindi/train_codes.jsonl"
@@ -44,11 +47,11 @@ trainer:
   num_epochs: 15
   max_steps: null
 
-  # batch_size=2 keeps Metal buffer pressure low on M-series GPUs.
-  # Try batch_size=4 / grad_accumulation=8 if your chip has headroom —
-  # same effective batch (32) but half the mini-batch iterations per step.
-  batch_size: 2
-  grad_accumulation: 16       # effective batch = 32 (same as before)
+  # Memory: batch_size=1 halves attention (O(T²)) and activation memory.
+  # Increase grad_accumulation to keep effective batch = 32.
+  # If you have headroom, try batch_size=2 / grad_accumulation=16 (same effective batch).
+  batch_size: 1
+  grad_accumulation: 32       # effective batch = 32 (same as batch_size=2/accum=16)
 
   # Optimizer
   learning_rate: 2.0e-5   # official full-FT uses 2e-6; LoRA can use a bit higher
@@ -84,7 +87,22 @@ trainer:
   # This aligns training with inference so the model sees the same prefix conditioning.
   lang_code: "hi"
 
+  # ── Memory optimizations ──────────────────────────────────────────────────
+  # use_bf16: cast inputs_embeds to bfloat16 before the O(T²) transformer forward.
+  # Halves attention and hidden-state memory across all 28 layers.
+  # Combine with lora_dtype: "bfloat16" above for full bf16 training.
+  # On Apple Silicon, bf16 compute is natively fast. Enable if running OOM.
+  use_bf16: false
+
+  # clear Metal GPU buffer pool every N optimizer steps (0 = disabled).
+  # Frees cached Metal allocations that accumulated during training.
+  # Enable (e.g. 50) if memory creeps up over a long run.
+  clear_cache_steps: 0
+
 processor:
   max_text_len: 256
-  max_codec_len: 1200     # ~100s at 12Hz, covers all Hindi training clips
+  # max_codec_len: attention memory scales as O(T²). Reducing from 1200 to 800
+  # cuts ~55% of attention memory (800² vs 1200² tokens per layer).
+  # At 12Hz: 800 tokens ≈ 67s, 1200 tokens ≈ 100s. Clips over 67s are truncated.
+  max_codec_len: 800
   speaker_name: "hindi_speaker"

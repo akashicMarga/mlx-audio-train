@@ -39,7 +39,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def build_dataset(cfg: dict, split: str = "train", model=None):
+def build_dataset(cfg: dict, split: str = "train", model=None, max_seq_len: int = None):
     """Build TTSDataset + processor for the configured model type."""
     from data.base_dataset import TTSDataset, DatasetConfig, BatchIterator
     from data.processors.qwen3_tts import Qwen3TTSProcessor, Qwen3TTSProcessorConfig, collate_qwen3
@@ -71,11 +71,13 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
     if model_type in ("qwen3_tts", "qwen3_tts_speaker"):
         # Pass model's pre-loaded speech_tokenizer if available
         speech_tok = getattr(model, "speech_tokenizer", None) if model is not None else None
+        # max_seq_len CLI arg overrides the config value
+        codec_len = max_seq_len or proc_cfg.get("max_codec_len", 1500)
         processor = Qwen3TTSProcessor(Qwen3TTSProcessorConfig(
             model_id          = cfg["model"]["model_id"],
             tokenizer_id      = cfg["model"]["tokenizer_id"],
             max_text_len      = proc_cfg.get("max_text_len",  256),
-            max_codec_len     = proc_cfg.get("max_codec_len", 1500),
+            max_codec_len     = codec_len,
             speaker_name      = proc_cfg.get("speaker_name",  "speaker_0"),
             speech_tokenizer  = speech_tok,
             # Speaker-cloning pipeline: extract ref mel for speaker_encoder
@@ -141,6 +143,7 @@ def load_model(cfg: dict):
 def build_loss_fn(cfg: dict):
     """Return the appropriate loss function for the model type."""
     model_type = cfg["model"]["model_type"]
+    use_bf16   = cfg["trainer"].get("use_bf16", False)
 
     if model_type == "qwen3_tts":
         from train.losses.codec_loss import qwen3_tts_loss
@@ -148,7 +151,12 @@ def build_loss_fn(cfg: dict):
         lang_code       = cfg["trainer"].get("lang_code", "auto")
 
         def loss_fn(model, batch):
-            return qwen3_tts_loss(model, batch, label_smoothing=label_smoothing, lang_code=lang_code)
+            return qwen3_tts_loss(
+                model, batch,
+                label_smoothing=label_smoothing,
+                lang_code=lang_code,
+                use_bf16=use_bf16,
+            )
         return loss_fn
 
     elif model_type == "qwen3_tts_speaker":
@@ -157,7 +165,12 @@ def build_loss_fn(cfg: dict):
         lang_code       = cfg["trainer"].get("lang_code", "auto")
 
         def loss_fn(model, batch):
-            return qwen3_tts_speaker_loss(model, batch, label_smoothing=label_smoothing, lang_code=lang_code)
+            return qwen3_tts_speaker_loss(
+                model, batch,
+                label_smoothing=label_smoothing,
+                lang_code=lang_code,
+                use_bf16=use_bf16,
+            )
         return loss_fn
 
     elif model_type == "csm":
@@ -171,14 +184,26 @@ def build_loss_fn(cfg: dict):
 
 
 def apply_lora(model, cfg: dict) -> int:
+    import mlx.core as mx
     from train.lora import apply_lora as _apply, LoRAConfig
+
     lora_cfg_raw = cfg.get("lora", {})
-    lora_config  = LoRAConfig(
+
+    # Parse optional lora_dtype (e.g. "bfloat16" → mx.bfloat16)
+    lora_dtype_str = lora_cfg_raw.get("lora_dtype", None)
+    lora_dtype = None
+    if lora_dtype_str == "bfloat16":
+        lora_dtype = mx.bfloat16
+    elif lora_dtype_str == "float16":
+        lora_dtype = mx.float16
+
+    lora_config = LoRAConfig(
         rank           = lora_cfg_raw.get("rank",    8),
         alpha          = lora_cfg_raw.get("alpha",   16.0),
         dropout        = lora_cfg_raw.get("dropout", 0.05),
         target_modules = lora_cfg_raw.get("target_modules", None),
         model_type     = cfg["model"]["model_type"],
+        lora_dtype     = lora_dtype,
     )
     n = _apply(model, lora_config)
     return n
@@ -232,23 +257,29 @@ def run_smoke_test(model, loss_fn, cfg: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="MLX Audio Finetuning")
-    parser.add_argument("--config",     required=True,        help="Path to YAML config")
-    parser.add_argument("--smoke-test", action="store_true",  help="Run 5 steps with dummy data")
-    parser.add_argument("--resume",     default=None,         help="Path to checkpoint dir to resume from")
-    parser.add_argument("--lora-rank",  type=int, default=None, help="Override LoRA rank from config")
-    parser.add_argument("--lr",         type=float, default=None, help="Override learning rate")
-    parser.add_argument("--epochs",     type=int,   default=None, help="Override num_epochs")
-    parser.add_argument("--max-steps",  type=int,   default=None, help="Max training steps")
+    parser.add_argument("--config",      required=True,        help="Path to YAML config")
+    parser.add_argument("--smoke-test",  action="store_true",  help="Run 5 steps with dummy data")
+    parser.add_argument("--resume",      default=None,         help="Path to checkpoint dir to resume from")
+    parser.add_argument("--lora-rank",   type=int, default=None, help="Override LoRA rank from config")
+    parser.add_argument("--lr",          type=float, default=None, help="Override learning rate")
+    parser.add_argument("--epochs",      type=int,   default=None, help="Override num_epochs")
+    parser.add_argument("--max-steps",   type=int,   default=None, help="Max training steps")
+    parser.add_argument("--max-seq-len", type=int,   default=None,
+                        help="Override max_codec_len (tokens). Reducing from 1200 to 800 saves ~50%% attention memory.")
+    parser.add_argument("--bf16",        action="store_true",
+                        help="Enable bfloat16 activations (halves attention/hidden-state memory). "
+                             "Equivalent to use_bf16: true in trainer config.")
     args = parser.parse_args()
 
     # Load config
     cfg = load_config(args.config)
 
     # CLI overrides
-    if args.lora_rank:  cfg["lora"]["rank"] = args.lora_rank
-    if args.lr:         cfg["trainer"]["learning_rate"] = args.lr
-    if args.epochs:     cfg["trainer"]["num_epochs"] = args.epochs
-    if args.max_steps:  cfg["trainer"]["max_steps"] = args.max_steps
+    if args.lora_rank:   cfg["lora"]["rank"] = args.lora_rank
+    if args.lr:          cfg["trainer"]["learning_rate"] = args.lr
+    if args.epochs:      cfg["trainer"]["num_epochs"] = args.epochs
+    if args.max_steps:   cfg["trainer"]["max_steps"] = args.max_steps
+    if args.bf16:        cfg["trainer"]["use_bf16"] = True
 
     print(f"\n{'='*60}")
     print(f"  MLX Audio Finetuning")
@@ -307,8 +338,8 @@ def main():
         return
 
     # Build data loaders (pass model so processor reuses its speech_tokenizer)
-    _, train_loader = build_dataset(cfg, "train", model=model)
-    _, val_loader   = build_dataset(cfg, "val",   model=model)
+    _, train_loader = build_dataset(cfg, "train", model=model, max_seq_len=args.max_seq_len)
+    _, val_loader   = build_dataset(cfg, "val",   model=model, max_seq_len=args.max_seq_len)
 
     if train_loader is None:
         print("[train] ERROR: No training data found. Check your config.")
@@ -337,6 +368,8 @@ def main():
         log_every_n_steps   = t.get("log_every_n_steps",    10),
         log_file            = t.get("log_file",             None),
         label_smoothing     = t.get("label_smoothing",      0.0),
+        use_bf16            = t.get("use_bf16",             False),
+        clear_cache_steps   = t.get("clear_cache_steps",    0),
     )
 
     # Save the full config alongside checkpoints so demo.py can read custom_lang_ids etc.

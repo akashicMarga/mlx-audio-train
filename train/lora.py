@@ -14,6 +14,13 @@ Usage:
     trainable = get_trainable_params(model)       # LoRA A/B matrices only
     save_adapters(model, "adapters.safetensors")
     load_adapters(model, "adapters.safetensors")
+
+Memory tips:
+    - Use lora_dtype=mx.bfloat16 to halve LoRA adapter and optimizer-state memory.
+      Safe for LoRA finetuning; base model is already quantized so precision loss
+      is negligible in practice.
+    - Combine with use_bf16=True in trainer config to cast activations to bf16
+      before the transformer forward, halving attention and hidden-state memory.
 """
 
 import math
@@ -33,15 +40,31 @@ class LoRALinear(nn.Module):
     """Low-rank adapter on top of a frozen nn.Linear."""
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, rank: int, alpha: float, dropout: float) -> "LoRALinear":
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        lora_dtype: Optional[mx.Dtype] = None,
+    ) -> "LoRALinear":
         out_f, in_f = linear.weight.shape
-        lora = cls(in_f, out_f, rank, alpha, dropout, bias="bias" in linear)
+        lora = cls(in_f, out_f, rank, alpha, dropout, bias="bias" in linear, lora_dtype=lora_dtype)
         lora.weight = linear.weight
         if "bias" in linear:
             lora.bias = linear.bias
         return lora
 
-    def __init__(self, in_f: int, out_f: int, rank: int, alpha: float, dropout: float, bias: bool):
+    def __init__(
+        self,
+        in_f: int,
+        out_f: int,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        bias: bool,
+        lora_dtype: Optional[mx.Dtype] = None,
+    ):
         super().__init__()
         self.rank   = rank
         self.scale  = alpha / rank
@@ -51,16 +74,26 @@ class LoRALinear(nn.Module):
         if bias:
             self.bias = mx.zeros((out_f,))
 
+        dtype = lora_dtype if lora_dtype is not None else mx.float32
         limit = 1.0 / math.sqrt(in_f)
-        self.lora_a = mx.random.uniform(-limit, limit, (rank, in_f))
-        self.lora_b = mx.zeros((out_f, rank))
+        self.lora_a = mx.random.uniform(-limit, limit, (rank, in_f)).astype(dtype)
+        self.lora_b = mx.zeros((out_f, rank)).astype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x_d = self.dropout(x) if self.dropout else x
-        y = x @ self.weight.T
+        # stop_gradient on base weight: gradients to lora_a/b flow through x,
+        # not through weight. This tells the MLX compiler not to build a
+        # gradient path through weight, reducing backward-pass graph size.
+        w = mx.stop_gradient(self.weight)
+        y = x @ w.T
         if "bias" in self:
             y = y + self.bias
-        return y + (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
+        x_d = self.dropout(x) if self.dropout else x
+        # Cast x_d to lora dtype so the delta computation is in the right dtype
+        lora_dtype = self.lora_a.dtype
+        if x_d.dtype != lora_dtype:
+            x_d = x_d.astype(lora_dtype)
+        lora_delta = (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
+        return y + lora_delta.astype(y.dtype)
 
     def fuse(self) -> nn.Linear:
         merged = self.weight + (self.lora_b @ self.lora_a) * self.scale
@@ -81,26 +114,38 @@ class QLoRALinear(nn.Module):
 
     Keeps the original QuantizedLinear intact (frozen) and adds trainable LoRA delta:
         y = QuantizedLinear(x) + x @ A^T @ B^T * scale
+
+    Memory note: set lora_dtype=mx.bfloat16 to halve adapter + optimizer-state
+    memory. QuantizedLinear outputs match the input dtype, so passing bf16 inputs
+    (via use_bf16 in trainer config) keeps the entire forward pass in bf16.
     """
 
     @classmethod
-    def from_quantized(cls, qlinear: nn.QuantizedLinear, rank: int, alpha: float, dropout: float) -> "QLoRALinear":
+    def from_quantized(
+        cls,
+        qlinear: nn.QuantizedLinear,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        lora_dtype: Optional[mx.Dtype] = None,
+    ) -> "QLoRALinear":
         # Derive input/output dims from the scales tensor
         # scales shape: [out_features, in_features // group_size]
         out_f = qlinear.scales.shape[0]
         in_f  = qlinear.weight.shape[-1] * (32 // qlinear.bits)
 
-        ql = cls(qlinear, in_f, out_f, rank, alpha, dropout)
+        ql = cls(qlinear, in_f, out_f, rank, alpha, dropout, lora_dtype=lora_dtype)
         return ql
 
     def __init__(
         self,
-        base:     nn.QuantizedLinear,
-        in_f:     int,
-        out_f:    int,
-        rank:     int,
-        alpha:    float,
-        dropout:  float,
+        base:       nn.QuantizedLinear,
+        in_f:       int,
+        out_f:      int,
+        rank:       int,
+        alpha:      float,
+        dropout:    float,
+        lora_dtype: Optional[mx.Dtype] = None,
     ):
         super().__init__()
         self.rank    = rank
@@ -112,16 +157,23 @@ class QLoRALinear(nn.Module):
         base.freeze()
         self.base    = base
 
+        dtype = lora_dtype if lora_dtype is not None else mx.float32
         limit = 1.0 / math.sqrt(in_f)
-        self.lora_a = mx.random.uniform(-limit, limit, (rank, in_f))
-        self.lora_b = mx.zeros((out_f, rank))
+        self.lora_a = mx.random.uniform(-limit, limit, (rank, in_f)).astype(dtype)
+        self.lora_b = mx.zeros((out_f, rank)).astype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Frozen quantized forward (handles affine/symmetric correctly)
+        # Frozen quantized forward — output dtype matches input dtype.
+        # With use_bf16=True (bf16 inputs), this produces bf16 outputs,
+        # propagating bf16 throughout the transformer forward pass.
         y = self.base(x)
-        # Trainable LoRA delta
         x_d = self.dropout(x) if self.dropout else x
-        return y + (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
+        # Cast x_d to lora dtype (float32 or bf16) for the delta computation
+        lora_dtype = self.lora_a.dtype
+        if x_d.dtype != lora_dtype:
+            x_d = x_d.astype(lora_dtype)
+        lora_delta = (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
+        return y + lora_delta.astype(y.dtype)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -156,6 +208,11 @@ class LoRAConfig:
     model_type:     str        = "default"
     scope:          str        = None    # override scope (submodule name)
     freeze_base:    bool       = True
+    # lora_dtype: dtype for lora_a/lora_b matrices (and thus optimizer states).
+    # None = float32 (default, most stable).
+    # mx.bfloat16 halves adapter + optimizer-state memory with negligible
+    # accuracy loss for LoRA finetuning of already-quantized models.
+    lora_dtype:     Optional[mx.Dtype] = None
 
     def __post_init__(self):
         if self.target_modules is None:
@@ -184,21 +241,22 @@ def apply_lora(model: nn.Module, config: LoRAConfig) -> int:
         else:
             print(f"[lora] Warning: scope '{config.scope}' not found, patching full model")
 
-    patched = _recursive_patch(root, targets, config.rank, config.alpha, config.dropout)
+    patched = _recursive_patch(
+        root, targets, config.rank, config.alpha, config.dropout, config.lora_dtype
+    )
 
-    print(f"[lora] Patched {patched} layers  |  targets: {sorted(targets)}")
-    # Note: we do NOT freeze base weights with stop_gradient.
-    # Gradients must flow through base weights to reach lora_a.
-    # Freezing is enforced by only passing lora_a/lora_b to the optimizer.
+    dtype_str = "float32" if config.lora_dtype is None else str(config.lora_dtype)
+    print(f"[lora] Patched {patched} layers  |  targets: {sorted(targets)}  |  lora_dtype: {dtype_str}")
     return patched
 
 
 def _recursive_patch(
-    module:   nn.Module,
-    targets:  Set[str],
-    rank:     int,
-    alpha:    float,
-    dropout:  float,
+    module:     nn.Module,
+    targets:    Set[str],
+    rank:       int,
+    alpha:      float,
+    dropout:    float,
+    lora_dtype: Optional[mx.Dtype] = None,
 ) -> int:
     """
     Walk the MLX module tree via module.children() and replace matching
@@ -216,23 +274,23 @@ def _recursive_patch(
         if key in targets:
             if isinstance(val, nn.QuantizedLinear):
                 try:
-                    setattr(module, key, QLoRALinear.from_quantized(val, rank, alpha, dropout))
+                    setattr(module, key, QLoRALinear.from_quantized(val, rank, alpha, dropout, lora_dtype=lora_dtype))
                     patched += 1
                 except Exception as e:
                     print(f"[lora] Warning: could not patch QuantizedLinear '{key}': {e}")
             elif isinstance(val, nn.Linear):
-                setattr(module, key, LoRALinear.from_linear(val, rank, alpha, dropout))
+                setattr(module, key, LoRALinear.from_linear(val, rank, alpha, dropout, lora_dtype=lora_dtype))
                 patched += 1
 
         # Recurse into sub-modules
         elif isinstance(val, nn.Module):
-            patched += _recursive_patch(val, targets, rank, alpha, dropout)
+            patched += _recursive_patch(val, targets, rank, alpha, dropout, lora_dtype)
 
         # Recurse into lists of modules
         elif isinstance(val, list):
             for item in val:
                 if isinstance(item, nn.Module):
-                    patched += _recursive_patch(item, targets, rank, alpha, dropout)
+                    patched += _recursive_patch(item, targets, rank, alpha, dropout, lora_dtype)
 
     return patched
 
