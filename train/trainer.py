@@ -85,6 +85,19 @@ class TrainerConfig:
     # Suggested: clear_cache_steps=50 if you see memory creeping up over time.
     clear_cache_steps:   int   = 0
 
+    # Path to a checkpoint directory to resume from
+    # (e.g. "checkpoints/run/checkpoint-step_0000200").
+    # When set, the trainer will:
+    #   1. Restore self._step and self._epoch from the checkpoint's info.json
+    #      so LR schedule and epoch counting continue correctly.
+    #   2. Load AdamW moment tensors (m, v, per-param step) from
+    #      optimizer_state.safetensors — eliminates the optimizer warm-up
+    #      spike that occurs when only adapter weights are restored.
+    # NOTE: adapter weights must still be loaded separately via --resume in
+    # scripts/train.py before Trainer.train() is called (they are model weights,
+    # not optimizer state).
+    resume_from:         Optional[str] = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LR schedule
@@ -130,6 +143,7 @@ class Trainer:
         self._best_val     = float("inf")
         self._log_history: List[Dict] = []
         self._saved_ckpts: List[str]  = []
+        self._optimizer    = None   # set during train(), used by _save_checkpoint
 
         # JSON log
         self._log_fh = None
@@ -186,7 +200,13 @@ class Trainer:
             learning_rate=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )
+        self._optimizer = optimizer   # expose to _save_checkpoint
         state = [model.state, optimizer.state]
+
+        # Resume: restore step/epoch counters + AdamW moments before the
+        # first update so the optimizer continues from where it left off.
+        if cfg.resume_from:
+            self._load_optimizer_state(model, optimizer, cfg.resume_from)
 
         # Custom value_and_grad that strips empty-dict subtrees before
         # model.update(). The Qwen3-TTS speech_tokenizer contains a gc_func
@@ -236,7 +256,13 @@ class Trainer:
 
         t0 = time.time()
 
-        for epoch in range(cfg.num_epochs):
+        # When resuming, self._epoch was restored from info.json.
+        # Skip already-completed epochs so we don't redo them.
+        start_epoch = self._epoch
+        if cfg.resume_from and start_epoch > 0:
+            print(f"[trainer] Skipping epochs 0–{start_epoch - 1} (already completed)")
+
+        for epoch in range(start_epoch, cfg.num_epochs):
             self._epoch = epoch
             epoch_loss  = 0.0
             epoch_steps = 0
@@ -353,6 +379,89 @@ class Trainer:
             losses.append(float(loss))
         return float(np.mean(losses)) if losses else 0.0
 
+    # ── Optimizer state ───────────────────────────────────────────────────
+
+    def _save_optimizer_state(self, model, optimizer, ckpt_dir: Path) -> None:
+        """
+        Save per-parameter AdamW moments (m, v, step) alongside the checkpoint.
+
+        MLX's AdamW stores state in optimizer.state keyed by id(param).
+        We map each LoRA parameter to its path string so the state can be
+        restored after a reload (when parameter object IDs change).
+
+        File: <ckpt_dir>/optimizer_state.safetensors
+        Key format: "<param_path>:<moment>"  e.g. "talker.layers.0.q_proj.lora_a:m"
+        """
+        from .lora import get_trainable_params
+
+        flat_lora = get_trainable_params(model)
+        tensors: Dict[str, mx.array] = {}
+
+        for path, param in flat_lora.items():
+            pstate = optimizer.state.get(id(param), {})
+            for moment in ("m", "v", "step"):
+                val = pstate.get(moment)
+                if isinstance(val, mx.array):
+                    tensors[f"{path}:{moment}"] = val
+
+        if not tensors:
+            # Optimizer state is empty — happens on the very first checkpoint
+            # before any update step (shouldn't occur in normal training).
+            return
+
+        mx.eval(tensors)
+        path = str(ckpt_dir / "optimizer_state.safetensors")
+        mx.save_safetensors(path, tensors)
+
+    def _load_optimizer_state(self, model, optimizer, resume_from: str) -> None:
+        """
+        Restore AdamW moments + training counters from a checkpoint directory.
+
+        Must be called AFTER:
+          - load_adapters(model, ...) — so model.lora_a/b have their loaded IDs
+          - optim.AdamW(...) is constructed — so optimizer.state exists
+
+        Must be called BEFORE the first optimizer.update() — so the moments
+        are in place when MLX looks them up by id(param).
+        """
+        from .lora import get_trainable_params
+
+        ckpt_dir = Path(resume_from)
+
+        # ── Restore step / epoch counters ─────────────────────────────────
+        info_path = ckpt_dir / "info.json"
+        if info_path.exists():
+            with open(info_path) as f:
+                info = json.load(f)
+            self._step  = info.get("step",  0)
+            self._epoch = info.get("epoch", 0)
+            print(f"[trainer] Resumed from step={self._step}, epoch={self._epoch}")
+        else:
+            print(f"[trainer] Warning: no info.json in {ckpt_dir}, step/epoch start from 0")
+
+        # ── Restore optimizer moments ─────────────────────────────────────
+        opt_path = ckpt_dir / "optimizer_state.safetensors"
+        if not opt_path.exists():
+            print(f"[trainer] No optimizer_state.safetensors found — optimizer starts fresh "
+                  f"(expect a brief loss spike for ~{self.cfg.warmup_steps} steps)")
+            return
+
+        saved = dict(mx.load(str(opt_path)))
+        flat_lora   = get_trainable_params(model)
+        n_restored  = 0
+
+        for path, param in flat_lora.items():
+            pstate = {}
+            for moment in ("m", "v", "step"):
+                key = f"{path}:{moment}"
+                if key in saved:
+                    pstate[moment] = saved[key]
+            if pstate:
+                optimizer.state[id(param)] = pstate
+                n_restored += 1
+
+        print(f"[trainer] Restored optimizer state for {n_restored}/{len(flat_lora)} LoRA params")
+
     # ── Checkpoint ────────────────────────────────────────────────────────
 
     def _save_checkpoint(self, model, tag: str):
@@ -363,6 +472,10 @@ class Trainer:
         adapter_path = str(ckpt_dir / "adapters.safetensors")
 
         save_adapters(model, adapter_path)
+
+        # Save optimizer state (moments + counters) alongside adapters
+        if self._optimizer is not None:
+            self._save_optimizer_state(model, self._optimizer, ckpt_dir)
 
         # Save step info
         with open(ckpt_dir / "info.json", "w") as f:

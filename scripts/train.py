@@ -370,6 +370,10 @@ def main():
         label_smoothing     = t.get("label_smoothing",      0.0),
         use_bf16            = t.get("use_bf16",             False),
         clear_cache_steps   = t.get("clear_cache_steps",    0),
+        # Pass resume path so trainer can load optimizer state + counters.
+        # Adapter weights are loaded above (before trainer is constructed),
+        # optimizer state is loaded inside trainer.train() after AdamW is created.
+        resume_from         = args.resume,
     )
 
     # Save the full config alongside checkpoints so demo.py can read custom_lang_ids etc.
