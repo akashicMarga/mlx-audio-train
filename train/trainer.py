@@ -70,6 +70,9 @@ class TrainerConfig:
     # Label smoothing
     label_smoothing:     float = 0.0
 
+    # TensorBoard (optional — requires tensorboardX)
+    tensorboard_dir:     Optional[str] = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LR schedule
@@ -105,7 +108,13 @@ def get_lr(
 
 class Trainer:
 
-    def __init__(self, config: TrainerConfig):
+    def __init__(
+        self,
+        config: TrainerConfig,
+        trainable_params_fn: Optional[Callable] = None,
+        save_fn: Optional[Callable] = None,
+        audio_eval_fn: Optional[Callable] = None,
+    ):
         self.cfg = config
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -116,10 +125,29 @@ class Trainer:
         self._log_history: List[Dict] = []
         self._saved_ckpts: List[str]  = []
 
+        # Pluggable hooks for non-standard models (e.g. PersonaPlex mixed trainability)
+        self._get_params   = trainable_params_fn  # None → default get_trainable_params
+        self._save_fn      = save_fn              # None → default save_adapters (.safetensors)
+        self._audio_eval_fn = audio_eval_fn       # None → no audio logging
+
         # JSON log
         self._log_fh = None
         if config.log_file:
+            Path(config.log_file).parent.mkdir(parents=True, exist_ok=True)
             self._log_fh = open(config.log_file, "w")
+
+        # TensorBoard (soft import — won't crash if tensorboardX not installed)
+        self._tb_writer = None
+        if config.tensorboard_dir:
+            try:
+                from tensorboardX import SummaryWriter
+                tb_dir = str(Path(config.tensorboard_dir).resolve())
+                Path(tb_dir).mkdir(parents=True, exist_ok=True)
+                self._tb_writer = SummaryWriter(logdir=tb_dir)
+                print(f"[trainer] TensorBoard → {config.tensorboard_dir}")
+                print(f"[trainer] Run: tensorboard --logdir {config.tensorboard_dir}")
+            except ImportError:
+                print("[trainer] tensorboardX not installed — TensorBoard disabled")
 
         # Save config
         with open(self.output_dir / "trainer_config.json", "w") as f:
@@ -158,10 +186,23 @@ class Trainer:
         print(f"  Output: {self.output_dir}")
         print(f"{'='*60}\n")
 
-        # Identify LoRA params — only these will be updated by optimizer
-        from .lora import get_trainable_params
-        lora_params = get_trainable_params(model)
-        print(f"[trainer] {len(lora_params)} LoRA adapter tensors will be optimized")
+        # Identify trainable params — use custom extractor if provided (e.g. PersonaPlex),
+        # otherwise fall back to LoRA-only extractor.
+        from .lora import get_trainable_params as _default_get_params
+        _get_params = self._get_params if self._get_params is not None else _default_get_params
+        sample_params = _get_params(model)
+        print(f"[trainer] {len(sample_params)} trainable tensors will be optimized")
+
+        if self._audio_eval_fn and self._tb_writer:
+            try:
+                self._audio_eval_fn(model, 0, self._tb_writer, reference_only=True)
+                self._tb_writer.flush()
+                print("[trainer] Logged initial reference audio (GT + base model) to TensorBoard")
+            except TypeError:
+                # Older audio_eval_fns may not support the optional keyword.
+                pass
+            except Exception as e:
+                print(f"[trainer] initial audio_eval_fn failed: {e}")
 
         optimizer = optim.AdamW(
             learning_rate=cfg.learning_rate,
@@ -203,17 +244,18 @@ class Trainer:
         _raw_vg = mx.value_and_grad(_inner_fn)
 
         def value_and_grad_fn(model, batch):
-            # BUG FIX: use get_trainable_params (lora_a/lora_b only = 5.9M params)
-            # NOT model.trainable_parameters() which returns 351.8M params and causes
-            # MLX to store intermediate activations for ALL base weights → 40+ GB RAM.
-            flat_lora = get_trainable_params(model)          # flat {path: tensor}
-            params    = mxu.tree_unflatten(list(flat_lora.items()))  # nested for model.update
+            # Use _get_params (LoRA-only by default, or full trainable set for PersonaPlex).
+            # Critically: we pass ONLY trainable params to value_and_grad so MLX only
+            # stores activations for those tensors — not the frozen backbone weights.
+            flat_params = _get_params(model)                          # flat {path: tensor}
+            params      = mxu.tree_unflatten(list(flat_params.items()))  # nested for model.update
             (loss, metrics), grads = _raw_vg(params, batch)
             return (loss, metrics), _strip_empty(grads)
 
-        accum_grads:  Dict = {}
-        accum_loss   = 0.0
-        accum_count  = 0
+        accum_grads:   Dict = {}
+        accum_loss    = 0.0
+        accum_metrics: Dict[str, float] = {}
+        accum_count   = 0
 
         t0 = time.time()
 
@@ -229,10 +271,10 @@ class Trainer:
 
                 # ── Forward + backward ─────────────────────────────────────
                 (loss, metrics), grads = value_and_grad_fn(model, batch)
-                # Evaluate BOTH loss and grads immediately — if grads are left as
-                # deferred MLX arrays across grad_accumulation steps, the computation
-                # graph grows unboundedly and causes OOM (exit 137).
-                mx.eval(loss, grads)
+                # Evaluate loss, grads, AND any MLX metric arrays together so
+                # float() below sees fully materialized values (not lazy 0s).
+                metric_arrays = [v for v in metrics.values() if isinstance(v, mx.array)]
+                mx.eval(loss, grads, *metric_arrays)
 
                 # Gradient accumulation (grads is nested dict).
                 # No extra mx.eval() needed here: grads are already fully
@@ -244,7 +286,9 @@ class Trainer:
                 else:
                     accum_grads = _add_grads(accum_grads, grads)
 
-                accum_loss  += float(loss)
+                accum_loss += float(loss)
+                for k, v in metrics.items():
+                    accum_metrics[k] = accum_metrics.get(k, 0.0) + float(v)
                 accum_count += 1
 
                 if accum_count < cfg.grad_accumulation:
@@ -264,35 +308,55 @@ class Trainer:
                 optimizer.update(model, nested_grads)
                 mx.eval(state)
 
-                step_loss = accum_loss / accum_count
-                epoch_loss += step_loss
+                step_loss    = accum_loss / accum_count
+                step_metrics = {k: v / accum_count for k, v in accum_metrics.items()}
+                epoch_loss  += step_loss
                 epoch_steps += 1
-                self._step += 1
+                self._step  += 1
 
-                accum_grads  = {}
-                accum_loss   = 0.0
-                accum_count  = 0
+                accum_grads   = {}
+                accum_loss    = 0.0
+                accum_metrics = {}
+                accum_count   = 0
 
                 # ── Logging ────────────────────────────────────────────────
                 if self._step % cfg.log_every_n_steps == 0:
                     elapsed = time.time() - t0
                     log = {
+
                         "step":    self._step,
                         "epoch":   epoch,
                         "loss":    round(step_loss, 5),
                         "lr":      round(lr, 8),
                         "elapsed": round(elapsed, 1),
                     }
-                    log.update({k: round(v, 5) for k, v in metrics.items() if k != "loss"})
+                    log.update({k: round(v, 5) for k, v in step_metrics.items() if k != "loss"})
                     self._log(log)
+                    if self._tb_writer:
+                        self._tb_writer.add_scalar("train/loss", step_loss, self._step)
+                        self._tb_writer.add_scalar("train/lr",   lr,        self._step)
+                        for k, v in step_metrics.items():
+                            if k != "loss":
+                                self._tb_writer.add_scalar(f"train/{k}", v, self._step)
+                        self._tb_writer.flush()
 
                 # ── Eval ───────────────────────────────────────────────────
                 if val_loader and self._step % cfg.eval_every_n_steps == 0:
                     val_loss = self._evaluate(model, val_loader, loss_fn)
                     self._log({"step": self._step, "val_loss": round(val_loss, 5)})
+                    if self._tb_writer:
+                        self._tb_writer.add_scalar("val/loss", val_loss, self._step)
+                        self._tb_writer.flush()
                     if val_loss < self._best_val:
                         self._best_val = val_loss
                         self._save_checkpoint(model, tag="best")
+                    # Audio eval: generate + log sample audio to TensorBoard
+                    if self._audio_eval_fn and self._tb_writer:
+                        try:
+                            self._audio_eval_fn(model, self._step, self._tb_writer)
+                            self._tb_writer.flush()
+                        except Exception as e:
+                            print(f"[trainer] audio_eval_fn failed at step {self._step}: {e}")
 
                 # ── Checkpoint ─────────────────────────────────────────────
                 if self._step % cfg.save_every_n_steps == 0:
@@ -302,6 +366,9 @@ class Trainer:
             if epoch_steps > 0:
                 avg = epoch_loss / epoch_steps
                 print(f"\n  Epoch {epoch+1}/{cfg.num_epochs}  avg_loss={avg:.5f}\n")
+                if self._tb_writer:
+                    self._tb_writer.add_scalar("epoch/avg_loss", avg, epoch + 1)
+                    self._tb_writer.flush()
 
             if (epoch + 1) % cfg.save_every_n_epochs == 0:
                 self._save_checkpoint(model, tag=f"epoch_{epoch+1:04d}")
@@ -310,6 +377,8 @@ class Trainer:
         self._save_checkpoint(model, tag="final")
         print(f"\n✅ Training complete. Checkpoints at: {self.output_dir}")
 
+        if self._tb_writer:
+            self._tb_writer.close()
         if self._log_fh:
             self._log_fh.close()
 
@@ -328,13 +397,16 @@ class Trainer:
     # ── Checkpoint ────────────────────────────────────────────────────────
 
     def _save_checkpoint(self, model, tag: str):
-        from .lora import save_adapters
-
-        ckpt_dir  = self.output_dir / f"checkpoint-{tag}"
+        ckpt_dir = self.output_dir / f"checkpoint-{tag}"
         ckpt_dir.mkdir(exist_ok=True)
-        adapter_path = str(ckpt_dir / "adapters.safetensors")
 
-        save_adapters(model, adapter_path)
+        if self._save_fn is not None:
+            adapter_path = str(ckpt_dir / "adapters.npz")
+            self._save_fn(model, adapter_path)
+        else:
+            from .lora import save_adapters
+            adapter_path = str(ckpt_dir / "adapters.safetensors")
+            save_adapters(model, adapter_path)
 
         # Save step info
         with open(ckpt_dir / "info.json", "w") as f:

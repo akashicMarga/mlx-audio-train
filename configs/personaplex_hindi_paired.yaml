@@ -1,0 +1,54 @@
+model:
+  model_type:      "personaplex"
+  hf_repo:         "nvidia/personaplex-7b-v1"
+  grad_checkpoint: false
+
+lora:
+  rank:    16
+  alpha:   16.0
+  dropout: 0.0
+
+data:
+  train_data_dir:      "/Users/akashsingh/Documents/mlx-audio-artifacts/datasets/personaplex_hindi_paired_train"
+  val_data_dir:        "/Users/akashsingh/Documents/mlx-audio-artifacts/datasets/personaplex_hindi_paired_val"
+  max_seq_len:         256
+  audio_codebooks:     16
+  assistant_codebooks: 8
+  audio_pad_token:     2048
+  text_pad_token:      3
+  max_samples:         null
+
+eval_audio:
+  enabled:             true
+  max_samples:         2
+  max_decode_frames:   128
+  audio_pad_token:     2048
+  sample_rate:         24000
+  log_user_gt:         true
+  log_assistant_gt:    true
+  log_assistant_pred:  true
+  log_base_assistant_pred: true
+  log_reference_once:  true
+
+trainer:
+  output_dir:          "/Users/akashsingh/Documents/mlx-audio-artifacts/checkpoints/personaplex-hindi-paired"
+  run_name:            "personaplex-7b-hindi-paired-lora-r16"
+  num_epochs:          10
+  batch_size:          1
+  grad_accumulation:   4
+  learning_rate:       5.0e-5
+  weight_decay:        0.01
+  grad_clip:           1.0
+  warmup_steps:        100
+  lr_schedule:         "cosine"
+  save_every_n_steps:  200
+  save_every_n_epochs: 1
+  keep_last_n:         3
+  eval_every_n_steps:  200
+  val_batches:         10
+  log_every_n_steps:   10
+  log_file:            "/Users/akashsingh/Documents/mlx-audio-artifacts/checkpoints/personaplex-hindi-paired/train_log.jsonl"
+  sort_by_length:      true
+  prefetch:            2
+  audio_loss_weight:   1.0
+  tensorboard_dir:     "/Users/akashsingh/Documents/mlx-audio-artifacts/checkpoints/personaplex-hindi-paired/tensorboard"

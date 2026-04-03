@@ -275,12 +275,13 @@ class BatchIterator:
 
     def __init__(
         self,
-        dataset: TTSDataset,
+        dataset,
         batch_size: int = 4,
         drop_last: bool = False,
         collate_fn: Optional[Callable] = None,
         sort_by_length: bool = False,
         prefetch: int = 2,
+        length_key_fn: Optional[Callable] = None,
     ):
         self.dataset        = dataset
         self.batch_size     = batch_size
@@ -288,6 +289,10 @@ class BatchIterator:
         self.collate_fn     = collate_fn or collate_samples
         self.sort_by_length = sort_by_length
         self.prefetch       = prefetch
+        # Optional custom length key: fn(meta_dict) -> int.
+        # Default: reads codec .npy file length (Qwen3-TTS style).
+        # PersonaPlex: lambda meta: meta.get("num_frames", 0) (in-memory, no disk I/O).
+        self.length_key_fn  = length_key_fn
 
     def _iter_batches(self):
         """Core iteration logic (no prefetching)."""
@@ -299,6 +304,8 @@ class BatchIterator:
             # sequence length; fall back to audio duration otherwise.
             def _length_key(idx):
                 meta = self.dataset.samples[idx]
+                if self.length_key_fn is not None:
+                    return self.length_key_fn(meta)
                 audio_path = meta.get("audio", "")
                 codec_npy  = os.path.splitext(audio_path)[0] + ".codec.npy"
                 if os.path.exists(codec_npy):

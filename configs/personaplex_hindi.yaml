@@ -1,0 +1,53 @@
+model:
+  model_type:      "personaplex"
+  hf_repo:         "nvidia/personaplex-7b-v1"
+  # model_file:    null        # set to local path to skip HF download
+  # lm_config:     null        # set to custom LmConfig name
+  grad_checkpoint: false       # set true to trade speed for memory
+
+lora:
+  rank:          16
+  alpha:         16.0
+  dropout:       0.0
+  train_depformer: false   # freeze depformer to prevent autoregressive instability on small datasets
+
+data:
+  train_data_dir:      "/Users/akashsingh/Documents/personaplex-mlx/hindi_data_paired"
+  val_data_dir:        "/Users/akashsingh/Documents/personaplex-mlx/hindi_data_paired"
+  val_fraction:        0.05    # 5% held out as validation (~91 samples)
+  max_seq_len:         256
+  audio_codebooks:     16
+  assistant_codebooks: 8
+  audio_pad_token:     2048
+  text_pad_token:      3
+  max_samples:         null    # set integer to cap dataset size
+
+eval_audio:
+  enabled:             true
+  max_samples:         2          # number of val samples to compare per eval step
+  max_decode_frames:   128        # max MIMI frames to decode (~10s at 12.5Hz)
+  audio_pad_token:     2048
+  sample_rate:         24000
+
+trainer:
+  output_dir:          "./checkpoints/personaplex-hindi"
+  run_name:            "personaplex-7b-hindi-lora-r16"
+  num_epochs:          10
+  batch_size:          1
+  grad_accumulation:   4
+  learning_rate:       5.0e-5
+  weight_decay:        0.01
+  grad_clip:           1.0
+  warmup_steps:        100
+  lr_schedule:         "cosine"
+  save_every_n_steps:  200
+  save_every_n_epochs: 1
+  keep_last_n:         3
+  eval_every_n_steps:  50      # val loss + audio every 50 steps (~4 min)
+  val_batches:         10
+  log_every_n_steps:   10
+  log_file:            "./checkpoints/personaplex-hindi/train_log.jsonl"
+  sort_by_length:      true
+  prefetch:            2
+  audio_loss_weight:   1.0
+  tensorboard_dir:     "./checkpoints/personaplex-hindi/tensorboard"

@@ -133,6 +133,8 @@ DEFAULT_TARGETS = {
     "csm":        ["q_proj", "k_proj", "v_proj", "o_proj"],
     "kokoro":     ["to_q", "to_k", "to_v", "to_out"],
     "chatterbox": ["q_proj", "k_proj", "v_proj", "out_proj"],
+    # PersonaPlex: LoRA on attention projections only; depformer is fully trainable
+    "personaplex": ["in_proj", "out_proj"],
     "default":    ["q_proj", "k_proj", "v_proj", "o_proj"],
 }
 
@@ -143,6 +145,7 @@ DEFAULT_SCOPE = {
     "csm":               "model",
     "kokoro":     None,              # patch all
     "chatterbox": None,
+    "personaplex": "transformer",    # main transformer only, not depformer
     "default":    None,
 }
 
@@ -335,3 +338,43 @@ def load_adapters(model: nn.Module, path: str) -> None:
             setattr(obj, parts[-1], val)
             loaded += 1
     print(f"[lora] Loaded {loaded}/{len(adapters)} adapter tensors from {path}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PersonaPlex-specific helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_personaplex_trainable_params(model: nn.Module) -> Dict[str, mx.array]:
+    """Return flat dict of ALL trainable params for a PersonaPlex Lm model.
+
+    Requires that models.personaplex.training.freeze_non_trainable(model) has
+    already been called. After that, model.trainable_parameters() returns ~100M
+    params (LoRA A/B + depformer + audio_embs + text_linear + out_norm) — not
+    the full 4B+ of the frozen backbone.
+
+    This replaces get_trainable_params (LoRA-only) for personaplex in the Trainer.
+    """
+    flat = dict(mxu.tree_flatten(model.trainable_parameters()))
+    return flat
+
+
+def save_personaplex_adapters(model: nn.Module, path: str) -> None:
+    """Save PersonaPlex trainable params (~100M) as .npz.
+
+    Uses .npz instead of .safetensors because parameter paths contain dots
+    (e.g. depformer.slices.0.linear_in.weight) which are valid in npz keys.
+    """
+    params = get_personaplex_trainable_params(model)
+    if not params:
+        print("[lora] Warning: no PersonaPlex trainable params found to save")
+        return
+    npz_path = path.replace(".safetensors", ".npz") if path.endswith(".safetensors") else path
+    mx.savez(npz_path, **params)
+    print(f"[lora] Saved {len(params)} PersonaPlex tensors → {npz_path}")
+
+
+def load_personaplex_adapters(model: nn.Module, path: str) -> None:
+    """Load PersonaPlex trainable params back into model."""
+    weights = dict(mx.load(path))
+    model.load_weights(list(weights.items()), strict=False)
+    print(f"[lora] Loaded {len(weights)} PersonaPlex tensors from {path}")
