@@ -253,10 +253,14 @@ def apply_lora(model, cfg: dict) -> int:
             grad_checkpoint(TransformerLayer)
             print("[train] Gradient checkpointing enabled for TransformerLayer")
 
-        train_depformer = lora_cfg_raw.get("train_depformer", False)
-        num_trainable, num_frozen = freeze_non_trainable(model, train_depformer=train_depformer)
+        train_depformer    = lora_cfg_raw.get("train_depformer", False)
+        freeze_text_linear = lora_cfg_raw.get("freeze_text_linear", False)
+        num_trainable, num_frozen = freeze_non_trainable(
+            model, train_depformer=train_depformer, freeze_text_linear=freeze_text_linear
+        )
         print(f"[train] PersonaPlex freeze: {num_trainable:,} trainable / {num_frozen:,} frozen "
-              f"(depformer={'trainable' if train_depformer else 'frozen'})")
+              f"(depformer={'trainable' if train_depformer else 'frozen'}, "
+              f"text_linear={'frozen' if freeze_text_linear else 'trainable'})")
         return n
 
     from train.lora import apply_lora as _apply, LoRAConfig

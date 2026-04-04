@@ -1,7 +1,7 @@
 # mlx-audio-train
 
 A **LoRA / QLoRA finetuning pipeline** for MLX TTS models on Apple Silicon.
-Supports **Qwen3-TTS** and **CSM**, with two distinct training strategies.
+Supports **Qwen3-TTS**, **CSM**, and **PersonaPlex**, with two distinct training strategies.
 
 ---
 
@@ -273,9 +273,67 @@ No PyTorch dependency — uses `soundfile` + `scipy.signal`.
 |-------|-------------|--------|
 | Qwen3-TTS 0.6B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Working |
 | Qwen3-TTS 1.7B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Same pipeline, change `model_id` |
+| PersonaPlex 7B | `personaplex` | Working |
 | CSM (Sesame) | `csm` | Processor + loss implemented |
 | Kokoro | — | Planned |
 | Chatterbox | — | Planned |
+
+---
+
+## PersonaPlex — Full-Duplex Hindi Adaptation
+
+PersonaPlex is a 7B full-duplex speech model (simultaneous ASR + TTS). This repo supports LoRA finetuning it for Hindi language adaptation.
+
+### Quick Start
+
+```bash
+# 1. Prepare paired Hindi data (manifest.json + tokens/*.npz)
+python scripts/prepare_personaplex_dataset.py
+
+# 2. Train
+python scripts/train.py --config configs/personaplex_hindi.yaml
+
+# 3. Run full-duplex inference (in the personaplex-mlx repo)
+python -m personaplex_mlx.local_web \
+  --adapter-weights /path/to/checkpoints/personaplex-hindi/checkpoint-best/adapters.npz
+```
+
+### What Gets Trained
+
+| Component | Trainable | Size | Notes |
+|-----------|-----------|------|-------|
+| Transformer attention (`in_proj`, `out_proj`) | LoRA A/B only | ~29 MB | rank-16 |
+| Depformer bridge (`linear_in`) | LoRA A/B only | small | bridges transformer→depformer; must match training at inference |
+| Audio embeddings (`audio_embs`) | Full weights | ~268 MB | 16 codebooks × 2049 tokens |
+| Vocab projection (`text_linear`) | **Frozen** | 0 MB | see note below |
+| Output norm (`out_norm`) | Full weights | tiny | |
+
+### `freeze_text_linear` (Important)
+
+The `text_linear` layer is a `(32000 × 4096)` = **131M parameter** vocabulary projection. Training it on a small dataset (~1K samples) causes severe overfitting — the model memorises training text patterns and produces repetitive garbage (commas, byte tokens) at inference.
+
+**Always set `freeze_text_linear: true` in the config** unless you have 10K+ samples:
+
+```yaml
+lora:
+  rank:               16
+  alpha:              16.0
+  dropout:            0.0
+  train_depformer:    false
+  freeze_text_linear: true   # freeze 131M vocab projection — prevents overfitting on small datasets
+```
+
+With `freeze_text_linear: true`, adapter size drops from ~560 MB to ~297 MB and inference quality is significantly better on small datasets.
+
+### Data Requirements
+
+| Samples | Expected quality |
+|---------|-----------------|
+| ~1K | Overfits; fails on unseen Hindi phonemes |
+| ~3–5K | Reasonable Hindi phoneme coverage |
+| ~10K+ | Solid generalisation |
+
+Use `scripts/download_indicvoices.py` or `scripts/download_common_voice.py` to pull more Hindi data.
 
 ---
 

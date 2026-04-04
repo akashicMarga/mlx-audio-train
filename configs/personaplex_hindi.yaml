@@ -9,7 +9,8 @@ lora:
   rank:          16
   alpha:         16.0
   dropout:       0.0
-  train_depformer: false   # freeze depformer to prevent autoregressive instability on small datasets
+  train_depformer:   false  # freeze depformer to prevent autoregressive instability on small datasets
+  freeze_text_linear: true  # freeze 131M-param vocab projection — too large to train on small datasets without overfitting
 
 data:
   train_data_dir:      "/Users/akashsingh/Documents/personaplex-mlx/hindi_data_paired"
@@ -30,7 +31,7 @@ eval_audio:
   sample_rate:         24000
 
 trainer:
-  output_dir:          "./checkpoints/personaplex-hindi"
+  output_dir:          "/Users/akashsingh/Documents/checkpoints/personaplex-hindi"
   run_name:            "personaplex-7b-hindi-lora-r16"
   num_epochs:          10
   batch_size:          1
@@ -46,8 +47,8 @@ trainer:
   eval_every_n_steps:  50      # val loss + audio every 50 steps (~4 min)
   val_batches:         10
   log_every_n_steps:   10
-  log_file:            "./checkpoints/personaplex-hindi/train_log.jsonl"
+  log_file:            "/Users/akashsingh/Documents/checkpoints/personaplex-hindi/train_log.jsonl"
   sort_by_length:      true
   prefetch:            2
   audio_loss_weight:   1.0
-  tensorboard_dir:     "./checkpoints/personaplex-hindi/tensorboard"
+  tensorboard_dir:     "/Users/akashsingh/Documents/checkpoints/personaplex-hindi/tensorboard"

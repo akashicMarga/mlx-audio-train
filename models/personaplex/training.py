@@ -161,7 +161,7 @@ def apply_lora_to_transformer(
 # Freeze / unfreeze
 # ─────────────────────────────────────────────────────────────────────────────
 
-def freeze_non_trainable(model: Lm, train_depformer: bool = True) -> tuple[int, int]:
+def freeze_non_trainable(model: Lm, train_depformer: bool = True, freeze_text_linear: bool = False) -> tuple[int, int]:
     """Freeze all parameters except the trainable ones.
 
     Trainable:
@@ -169,13 +169,15 @@ def freeze_non_trainable(model: Lm, train_depformer: bool = True) -> tuple[int, 
       - LoRA adapters (lora_a, lora_b) in depformer.slices[i].linear_in (always)
       - Full depformer (all parameters) — only when train_depformer=True
       - Audio embeddings (audio_embs)
-      - Text linear output head (text_linear)
+      - Text linear output head (text_linear) — only when freeze_text_linear=False
       - Output norm (out_norm)
 
     Frozen:
       - Main transformer weights (except LoRA adapters above)
       - Text embedding (text_emb)
       - Depformer internal weights (when train_depformer=False) — only linear_in LoRA adapters train
+      - text_linear when freeze_text_linear=True (recommended for small datasets to avoid overfitting
+        the 131M-param vocab projection on limited data)
 
     The depformer linear_in LoRA adapters are ALWAYS trainable (even when train_depformer=False)
     because they bridge transformer_out → depformer. Without them, LoRA-shifted transformer_out
@@ -210,7 +212,7 @@ def freeze_non_trainable(model: Lm, train_depformer: bool = True) -> tuple[int, 
             "lora_a" in name or "lora_b" in name
             or (train_depformer and name.startswith("depformer."))
             or name.startswith("audio_embs.")
-            or name.startswith("text_linear.")
+            or (not freeze_text_linear and name.startswith("text_linear."))
             or name.startswith("out_norm.")
         )
         size = param.size
@@ -225,7 +227,8 @@ def freeze_non_trainable(model: Lm, train_depformer: bool = True) -> tuple[int, 
         model.depformer.unfreeze()
     for emb in model.audio_embs:
         emb.unfreeze()
-    model.text_linear.unfreeze()
+    if not freeze_text_linear:
+        model.text_linear.unfreeze()
     model.out_norm.unfreeze()
     # For LoRALinear layers in main transformer attention: unfreeze the whole module,
     # then re-freeze the base linear weight so only lora_a / lora_b remain trainable.
