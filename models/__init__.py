@@ -6,5 +6,7 @@ via scripts/train.py by setting model_type in the YAML config.
 
 Current models:
   - personaplex: NVIDIA PersonaPlex 7B full-duplex conversational speech model
+  - indic_parler_tts: ai4bharat/indic-parler-tts — pure MLX inference stack
 """
 from . import personaplex
+from . import indic_parler_tts
