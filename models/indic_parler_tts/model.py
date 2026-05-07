@@ -14,9 +14,10 @@ Delay pattern (9 codebooks):
   After num_codebooks extra steps, tokens[k, k:k+T] are the audio tokens.
 """
 
+import time
 import numpy as np
 from collections import deque
-from typing import Iterable
+from typing import Generator, Iterable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -340,6 +341,7 @@ class IndicParlerTTS(nn.Module):
         )
 
         with wired_limit(self, [generation_stream]):
+            _t0 = time.perf_counter()
             # 1. Encode style description
             enc_hidden = self.text_encoder(description_ids)  # [1, T_desc, 1024]
 
@@ -396,6 +398,7 @@ class IndicParlerTTS(nn.Module):
                 tokens0 = sampler(_suppress_eos(logits[0, 0]))
 
             tokens0_list = tokens0.tolist()
+            _t_prefill = time.perf_counter() - _t0
 
             generated = [[bos] * (max_steps + 2) for _ in range(num_cb)]
             for k in range(num_cb):
@@ -404,64 +407,43 @@ class IndicParlerTTS(nn.Module):
             while first_unfinished < num_cb and generated[first_unfinished][1] == eos:
                 first_unfinished += 1
 
-            # 3. Autoregressive audio generation with delay pattern.
-            # Input: at step t, CB k uses its own prediction from step t-1
-            # (BOS for the first k steps).
-            # Output assembly: frame p = CB k token from step p+k.
+            # 3. Autoregressive loop
             finished = (first_unfinished == num_cb)
             last_step = 0
-
-            # Repetition detection: if all 9 codebooks produce the exact same
-            # token vector for REP_THRESHOLD consecutive steps the model is stuck
-            # in a loop (speech ended, no EOS sampled). Stop early so we don't
-            # burn time generating near-silence that _trim_silence will cut anyway.
             _REP_THRESHOLD = 20
             _prev_tokens: list[int] | None = None
             _rep_count = 0
+            _t_ar_start = time.perf_counter()
 
             for step in range(1, max_steps):
                 last_step = step
-                offset = T_prompt + step
-
-                # Item 4: precomputed delay mask replaces the per-step Python conditional
-                tokens_prev = mx.array(
-                    [[generated[k][step] for k in range(num_cb)]], dtype=mx.int32
+                tokens_this_step = mx.where(
+                    delay_masks[step][None],
+                    mx.array([[generated[k][step] for k in range(num_cb)]], dtype=mx.int32),
+                    bos_fill,
                 )
-                tokens_this_step = mx.where(delay_masks[step][None], tokens_prev, bos_fill)
-
                 with mx.stream(generation_stream):
-                    audio_emb = self.decoder.embed_audio(tokens_this_step, offset=offset)
+                    emb = self.decoder.embed_audio(tokens_this_step, offset=T_prompt + step)
                     hidden = self.decoder.forward_layers(
-                        audio_emb, enc_hidden,
-                        mask=None,
-                        self_caches=self_caches,
-                        cross_caches=cross_caches,
-                        # encoder_mask omitted: cross-attn KV is cached after prefill,
-                        # so the mask has no effect and the 24 score additions waste cycles
+                        emb, enc_hidden, mask=None,
+                        self_caches=self_caches, cross_caches=cross_caches,
                     )
-                    logits = self.decoder.logits(hidden)  # [1, 1, 9, 1088]
-                    step_logits = logits[0, 0]            # [9, 1088]
-
-                    # Item 5: EOS biasing — gradually increase CB0 EOS logit after warm-up
+                    step_logits = self.decoder.logits(hidden)[0, 0]
                     if step > _EOS_BIAS_MIN_STEP:
                         bias = min(_EOS_BIAS_MAX, _EOS_BIAS_RATE * (step - _EOS_BIAS_MIN_STEP))
                         step_logits = step_logits.at[0, eos].add(bias)
-
-                    # Item 6: repetition penalty using CB0 history applied across all codebooks
                     if _recent_cb0:
                         step_logits = _rep_penalty(list(_recent_cb0), step_logits)
-
                     tokens_mx = sampler(_suppress_eos(step_logits))
 
-                tokens_list = tokens_mx.tolist()  # only sync point per step
+                tokens_list = tokens_mx.tolist()
                 _recent_cb0.append(tokens_list[0])
 
-                # Item 11: force EOS for codebooks that have already finished (HF parity)
                 for k in range(num_cb):
                     if k < first_unfinished or step >= target_T + k:
-                        generated[k][step + 1] = eos
-                    else:
-                        generated[k][step + 1] = tokens_list[k]
+                        tokens_list[k] = eos
+                for k in range(num_cb):
+                    generated[k][step + 1] = tokens_list[k]
 
                 while first_unfinished < num_cb and generated[first_unfinished][step + 1] == eos:
                     first_unfinished += 1
@@ -470,7 +452,6 @@ class IndicParlerTTS(nn.Module):
                     finished = True
                     break
 
-                # Repetition check (only after delay warm-up)
                 if step > num_cb:
                     if tokens_list == _prev_tokens:
                         _rep_count += 1
@@ -480,6 +461,8 @@ class IndicParlerTTS(nn.Module):
                     else:
                         _rep_count = 0
                     _prev_tokens = tokens_list
+
+            _t_ar = time.perf_counter() - _t_ar_start
 
         # 4. Extract audio tokens using the same invariant as Parler's delay mask:
         # a decoded frame is valid only if every codebook contributes a real DAC
@@ -500,9 +483,188 @@ class IndicParlerTTS(nn.Module):
         codes_mx = mx.array(frames, dtype=mx.int32).T
 
         # 5. DAC decode
+        _t_dac = time.perf_counter()
         audio = self.dac.decode(codes_mx)
         mx.eval(audio)
+        _t_dac = time.perf_counter() - _t_dac
+
+        _sps = last_step / _t_ar if _t_ar > 0 and last_step > 0 else 0
+        print(
+            f"[generate] prefill={_t_prefill:.2f}s | "
+            f"AR={_t_ar:.2f}s ({last_step} steps, {_sps:.0f} step/s) | "
+            f"DAC={_t_dac:.2f}s"
+        )
         return np.array(audio, dtype=np.float32)
+
+
+    def stream_generate(
+        self,
+        description_ids: mx.array,
+        prompt_ids: mx.array,
+        max_audio_length_s: float = 10.0,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        seed: int | None = None,
+        encoder_mask: mx.array | None = None,
+        chunk_steps: int = 50,
+    ) -> Generator[np.ndarray, None, None]:
+        """
+        Streaming variant of generate(). Yields float32 audio chunks as they're ready
+        (~chunk_steps * 512 / 44100 s per chunk ≈ 580 ms at chunk_steps=50).
+        Callers can play each chunk immediately for near-real-time output.
+        """
+        cfg = self.cfg.decoder
+        if seed is not None:
+            mx.random.seed(seed)
+        num_cb = cfg.num_codebooks
+        bos = cfg.bos_token_id
+        eos = cfg.eos_token_id
+        target_T = int(max_audio_length_s * 44100 / 512)
+        max_steps = target_T + num_cb - 1
+
+        sampler = _make_mlx_sampler(temperature, top_k, top_p, num_cb)
+        eos_deltas = mx.array(
+            [[0.0 if k <= i else -1e9 for k in range(num_cb)] for i in range(num_cb + 1)],
+            dtype=mx.float32,
+        )
+
+        with wired_limit(self, [generation_stream]):
+            enc_hidden = self.text_encoder(description_ids)
+            T_prompt = prompt_ids.shape[1]
+            prompt_emb = self.embed_prompts(prompt_ids)
+
+            self_caches = [[] for _ in range(cfg.num_layers)]
+            cross_caches = [[] for _ in range(cfg.num_layers)]
+
+            bos_tokens = mx.full((1, num_cb), bos, dtype=mx.int32)
+            bos_audio_emb = self.decoder.embed_audio_no_pos(bos_tokens)
+            first_emb = mx.concatenate([prompt_emb, bos_audio_emb], axis=1)
+            first_emb = first_emb + self.decoder.decoder_position(0, first_emb.shape[1])
+
+            first_unfinished = 0
+
+            def _suppress_eos(raw: mx.array) -> mx.array:
+                if first_unfinished >= num_cb:
+                    return raw
+                return raw.at[:, eos].add(eos_deltas[first_unfinished])
+
+            delay_masks = mx.array(
+                [[step > k for k in range(num_cb)] for step in range(max_steps + 1)],
+                dtype=mx.bool_,
+            )
+            bos_fill = mx.full((1, num_cb), bos, dtype=mx.int32)
+            _rep_penalty = make_repetition_penalty(penalty=1.3, context_size=20)
+            _recent_cb0: deque[int] = deque(maxlen=20)
+            _EOS_BIAS_MIN_STEP = int(0.5 * 44100 / 512)
+            _EOS_BIAS_RATE = 0.05
+            _EOS_BIAS_MAX = 2.0
+
+            with mx.stream(generation_stream):
+                hidden = self.decoder.forward_layers(
+                    first_emb, enc_hidden,
+                    mask=_causal_mask(first_emb.shape[1], dtype=first_emb.dtype),
+                    self_caches=self_caches,
+                    cross_caches=cross_caches,
+                    encoder_mask=encoder_mask,
+                )
+                logits = self.decoder.logits(hidden[:, -1:, :])
+                tokens0 = sampler(_suppress_eos(logits[0, 0]))
+
+            tokens0_list = tokens0.tolist()
+
+            generated = [[bos] * (max_steps + 2) for _ in range(num_cb)]
+            for k in range(num_cb):
+                generated[k][1] = tokens0_list[k]
+
+            while first_unfinished < num_cb and generated[first_unfinished][1] == eos:
+                first_unfinished += 1
+
+            finished = (first_unfinished == num_cb)
+            last_step = 0
+            _REP_THRESHOLD = 20
+            _prev_tokens: list[int] | None = None
+            _rep_count = 0
+            # next_frame_to_yield: first frame index not yet yielded.
+            # Frame p is fully available after step p + num_cb - 1.
+            next_frame_to_yield = 0
+
+            for step in range(1, max_steps):
+                last_step = step
+                tokens_this_step = mx.where(
+                    delay_masks[step][None],
+                    mx.array([[generated[k][step] for k in range(num_cb)]], dtype=mx.int32),
+                    bos_fill,
+                )
+                with mx.stream(generation_stream):
+                    emb = self.decoder.embed_audio(tokens_this_step, offset=T_prompt + step)
+                    hidden = self.decoder.forward_layers(
+                        emb, enc_hidden, mask=None,
+                        self_caches=self_caches, cross_caches=cross_caches,
+                    )
+                    step_logits = self.decoder.logits(hidden)[0, 0]
+                    if step > _EOS_BIAS_MIN_STEP:
+                        bias = min(_EOS_BIAS_MAX, _EOS_BIAS_RATE * (step - _EOS_BIAS_MIN_STEP))
+                        step_logits = step_logits.at[0, eos].add(bias)
+                    if _recent_cb0:
+                        step_logits = _rep_penalty(list(_recent_cb0), step_logits)
+                    tokens_mx = sampler(_suppress_eos(step_logits))
+
+                tokens_list = tokens_mx.tolist()
+                _recent_cb0.append(tokens_list[0])
+
+                for k in range(num_cb):
+                    if k < first_unfinished or step >= target_T + k:
+                        tokens_list[k] = eos
+                for k in range(num_cb):
+                    generated[k][step + 1] = tokens_list[k]
+
+                while first_unfinished < num_cb and generated[first_unfinished][step + 1] == eos:
+                    first_unfinished += 1
+
+                # Yield a chunk when chunk_steps new frames are ready.
+                # Frame p needs generated[num_cb-1][p+num_cb], written at step p+num_cb-1.
+                max_ready_frame = step - num_cb + 1
+                if max_ready_frame >= next_frame_to_yield + chunk_steps - 1:
+                    chunk_frames = []
+                    for p in range(next_frame_to_yield, max_ready_frame + 1):
+                        frame = [generated[k][k + p + 1] for k in range(num_cb)]
+                        if all(0 <= t < self.cfg.dac.codebook_size for t in frame):
+                            chunk_frames.append(frame)
+                    if chunk_frames:
+                        codes_mx = mx.array(chunk_frames, dtype=mx.int32).T
+                        audio_chunk = self.dac.decode(codes_mx)
+                        mx.eval(audio_chunk)
+                        yield np.array(audio_chunk, dtype=np.float32)
+                    next_frame_to_yield = max_ready_frame + 1
+
+                if first_unfinished == num_cb:
+                    finished = True
+                    break
+
+                if step > num_cb:
+                    if tokens_list == _prev_tokens:
+                        _rep_count += 1
+                        if _rep_count >= _REP_THRESHOLD:
+                            finished = True
+                            break
+                    else:
+                        _rep_count = 0
+                    _prev_tokens = tokens_list
+
+            # Yield remaining tail frames not covered by the last chunk.
+            max_frames = (last_step - num_cb + 2) if finished else target_T
+            max_frames = max(max_frames, 0)
+            tail_frames = []
+            for p in range(next_frame_to_yield, max_frames):
+                frame = [generated[k][k + p + 1] for k in range(num_cb)]
+                if all(0 <= t < self.cfg.dac.codebook_size for t in frame):
+                    tail_frames.append(frame)
+            if tail_frames:
+                codes_mx = mx.array(tail_frames, dtype=mx.int32).T
+                audio_tail = self.dac.decode(codes_mx)
+                mx.eval(audio_tail)
+                yield np.array(audio_tail, dtype=np.float32)
 
 
 def _causal_mask(T: int, dtype=mx.float32) -> mx.array:

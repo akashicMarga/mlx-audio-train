@@ -8,6 +8,11 @@ Usage:
         --description "A female speaker delivers clear speech at a moderate pace." \
         --output out.wav
 
+    # Streaming with real-time playback (requires: pip install sounddevice):
+    python scripts/infer_indic_parler.py \
+        --text "नमस्ते, आप कैसे हैं?" \
+        --stream
+
 Supported languages: en, hi, bn, ta, te, kn, ml, mr, gu, pa, or, as, ur, sa, ne, sd, ks, om
 """
 
@@ -39,6 +44,17 @@ def main():
     parser.add_argument("--repo-id", default="ai4bharat/indic-parler-tts", help="HF repo ID")
     parser.add_argument("--seed", type=int, default=None, help="Optional sampling seed")
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream audio chunks to speakers as they're generated (requires sounddevice)",
+    )
+    parser.add_argument(
+        "--chunk-steps",
+        type=int,
+        default=50,
+        help="AR steps per streamed chunk (~580 ms per chunk at default 50)",
+    )
+    parser.add_argument(
         "--no-load-audit",
         action="store_true",
         help="Skip HF-to-MLX weight mapping audit before loading",
@@ -50,7 +66,8 @@ def main():
     )
     args = parser.parse_args()
 
-    from models.indic_parler_tts import load_model, generate
+    from models.indic_parler_tts import load_model, generate, stream_generate
+    import numpy as np
     import soundfile as sf
 
     out_path = Path(args.output)
@@ -65,9 +82,8 @@ def main():
     print(f"[infer] Loaded in {time.time() - t0:.1f}s")
 
     print(f"[infer] Synthesizing: {args.text[:80]}")
-    t1 = time.time()
-    audio = generate(
-        model, tokenizers,
+
+    shared_kwargs = dict(
         description=args.description,
         text=args.text,
         max_audio_length_s=args.max_duration,
@@ -77,10 +93,63 @@ def main():
         seed=args.seed,
     )
 
-    sf.write(str(out_path), audio, 44100)
-    audio_s = len(audio) / 44100
-    print(f"[infer] Generated {audio_s:.2f}s in {time.time() - t1:.1f}s")
-    print(f"[infer] Saved: {out_path}")
+    if args.stream:
+        try:
+            import sounddevice as sd
+        except ImportError:
+            print("[infer] sounddevice not found — install with: pip install sounddevice")
+            sys.exit(1)
+
+        import threading
+        import queue as Q
+
+        print(f"[infer] Streaming to speakers (chunk_steps={args.chunk_steps}) ...")
+        t1 = time.time()
+        chunks = []
+        first_chunk_t = None
+
+        # Producer-consumer: generator (main thread, GPU) fills the queue;
+        # player (background thread, CPU) drains it continuously.
+        # wired_limit/generation_stream must stay on the main thread (Metal GPU context).
+        audio_q: Q.Queue = Q.Queue(maxsize=8)
+
+        def _player_worker():
+            with sd.OutputStream(samplerate=44100, channels=1, dtype="float32") as out_stream:
+                while True:
+                    chunk = audio_q.get()
+                    if chunk is None:
+                        break
+                    out_stream.write(chunk)
+
+        player_thread = threading.Thread(target=_player_worker, daemon=True)
+        player_thread.start()
+
+        for chunk in stream_generate(
+            model, tokenizers, chunk_steps=args.chunk_steps, **shared_kwargs
+        ):
+            audio_q.put(chunk)  # blocks only if player is >8 chunks behind (never happens)
+            chunks.append(chunk)
+            if first_chunk_t is None:
+                first_chunk_t = time.time() - t1
+                print(f"[infer] First audio in {first_chunk_t:.2f}s")
+
+        audio_q.put(None)  # sentinel: tell player we're done
+        player_thread.join()
+        total_t = time.time() - t1
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        audio_s = len(audio) / 44100
+        print(f"[infer] Streamed {audio_s:.2f}s audio in {total_t:.1f}s")
+
+        sf.write(str(out_path), audio, 44100)
+        print(f"[infer] Saved: {out_path}")
+
+    else:
+        t1 = time.time()
+        audio = generate(model, tokenizers, **shared_kwargs)
+        sf.write(str(out_path), audio, 44100)
+        audio_s = len(audio) / 44100
+        print(f"[infer] Generated {audio_s:.2f}s in {time.time() - t1:.1f}s")
+        print(f"[infer] Saved: {out_path}")
 
 
 if __name__ == "__main__":

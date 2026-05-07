@@ -2,19 +2,23 @@
 Top-level API for Indic Parler TTS inference.
 
 Usage:
-    from models.indic_parler_tts import load_model, generate
+    from models.indic_parler_tts import load_model, generate, stream_generate
 
     model, tokenizers = load_model()
-    audio = generate(
-        model, tokenizers,
-        description="A female speaker delivers clear speech at a moderate pace.",
-        text="नमस्ते, आप कैसे हैं?",
-    )
+
+    # Full generation (blocks until done):
+    audio = generate(model, tokenizers, description="...", text="नमस्ते, आप कैसे हैं?")
     import soundfile as sf
     sf.write("out.wav", audio, 44100)
+
+    # Streaming (yields ~580 ms chunks as they're ready):
+    for chunk in stream_generate(model, tokenizers, description="...", text="..."):
+        # play or buffer chunk immediately
+        pass
 """
 
 import numpy as np
+from typing import Generator
 
 import mlx.core as mx
 
@@ -141,3 +145,58 @@ def generate(
         encoder_mask=encoder_mask,
     )
     return _trim_silence(audio)
+
+
+def stream_generate(
+    model,
+    tokenizers: dict,
+    description: str,
+    text: str,
+    max_audio_length_s: float = 10.0,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    top_p: float = 0.9,
+    seed: int | None = None,
+    chunk_steps: int = 50,
+) -> Generator[np.ndarray, None, None]:
+    """
+    Streaming synthesis — yields float32 audio chunks (~580 ms each at chunk_steps=50)
+    as they come off the decoder, before the full utterance is done.
+
+    Args:
+        chunk_steps : AR steps per yielded chunk. 50 steps ≈ 580 ms at 44100 Hz.
+
+    Yields:
+        float32 numpy arrays of audio samples at 44100 Hz.
+        Chunks are raw (no silence trimming); silence will only appear on the last chunk.
+    """
+    desc_enc = tokenizers["description"](
+        description,
+        return_tensors="np",
+        padding=True,
+    )
+    prompt_ids = tokenizers["prompt"](
+        text,
+        return_tensors="np",
+        padding=True,
+    ).input_ids
+
+    desc_mx = mx.array(desc_enc.input_ids, dtype=mx.int32)
+    prompt_mx = mx.array(prompt_ids, dtype=mx.int32)
+
+    enc_attn = desc_enc.attention_mask
+    encoder_mask = mx.array(
+        (1 - enc_attn[:, None, None, :]) * -1e9, dtype=mx.float32
+    )
+
+    yield from model.stream_generate(
+        desc_mx,
+        prompt_mx,
+        max_audio_length_s=max_audio_length_s,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+        encoder_mask=encoder_mask,
+        chunk_steps=chunk_steps,
+    )
