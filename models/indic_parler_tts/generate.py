@@ -110,19 +110,25 @@ def generate(
     Returns:
         float32 numpy array of audio samples at 44100 Hz
     """
-    desc_ids = tokenizers["description"](
+    desc_enc = tokenizers["description"](
         description,
         return_tensors="np",
         padding=True,
-    ).input_ids
+    )
     prompt_ids = tokenizers["prompt"](
         text,
         return_tensors="np",
         padding=True,
     ).input_ids
 
-    desc_mx = mx.array(desc_ids, dtype=mx.int32)
+    desc_mx = mx.array(desc_enc.input_ids, dtype=mx.int32)
     prompt_mx = mx.array(prompt_ids, dtype=mx.int32)
+
+    # Build encoder attention mask: [1, 1, 1, T_enc], additive (-1e9 = ignore pad)
+    enc_attn = desc_enc.attention_mask          # [1, T_enc], 1=valid 0=pad
+    encoder_mask = mx.array(
+        (1 - enc_attn[:, None, None, :]) * -1e9, dtype=mx.float32
+    )
 
     audio = model.generate(
         desc_mx,
@@ -132,5 +138,6 @@ def generate(
         top_k=top_k,
         top_p=top_p,
         seed=seed,
+        encoder_mask=encoder_mask,
     )
     return _trim_silence(audio)

@@ -15,12 +15,13 @@ Delay pattern (9 codebooks):
 """
 
 import numpy as np
+from collections import deque
 from typing import Iterable
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils as mxu
-from mlx_lm.sample_utils import apply_top_k, apply_top_p
+from mlx_lm.sample_utils import apply_top_k, apply_top_p, make_repetition_penalty
 from mlx_lm.generate import wired_limit, generation_stream
 
 from .config import IndicParlerTTSConfig
@@ -307,6 +308,7 @@ class IndicParlerTTS(nn.Module):
         top_k: int = 50,
         top_p: float = 0.9,
         seed: int | None = None,
+        encoder_mask: mx.array | None = None,
     ) -> np.ndarray:
         """
         description_ids : [1, T_desc]  — T5-tokenized style description
@@ -365,12 +367,30 @@ class IndicParlerTTS(nn.Module):
                     return raw
                 return raw.at[:, eos].add(eos_deltas[first_unfinished])
 
+            # Precompute delay mask matrix: delay_masks[step, k] = (step > k)
+            # Avoids rebuilding the Python conditional inside the AR loop each step.
+            delay_masks = mx.array(
+                [[step > k for k in range(num_cb)] for step in range(max_steps + 1)],
+                dtype=mx.bool_,
+            )
+            bos_fill = mx.full((1, num_cb), bos, dtype=mx.int32)
+
+            # Repetition penalty applied to CB0 to smooth output near sentence boundaries.
+            _rep_penalty = make_repetition_penalty(penalty=1.3, context_size=20)
+            _recent_cb0: deque[int] = deque(maxlen=20)
+
+            # EOS biasing: after 0.5s warm-up, gently bias CB0 toward EOS.
+            _EOS_BIAS_MIN_STEP = int(0.5 * 44100 / 512)  # ~41 steps
+            _EOS_BIAS_RATE = 0.05
+            _EOS_BIAS_MAX = 2.0
+
             with mx.stream(generation_stream):
                 hidden = self.decoder.forward_layers(
                     first_emb, enc_hidden,
                     mask=_causal_mask(first_emb.shape[1], dtype=first_emb.dtype),
                     self_caches=self_caches,
                     cross_caches=cross_caches,
+                    encoder_mask=encoder_mask,
                 )
                 logits = self.decoder.logits(hidden[:, -1:, :])
                 tokens0 = sampler(_suppress_eos(logits[0, 0]))
@@ -403,10 +423,11 @@ class IndicParlerTTS(nn.Module):
                 last_step = step
                 offset = T_prompt + step
 
-                tokens_this_step = mx.array(
-                    [[generated[k][step] if step > k else bos for k in range(num_cb)]],
-                    dtype=mx.int32,
-                )  # [1, num_codebooks]
+                # Item 4: precomputed delay mask replaces the per-step Python conditional
+                tokens_prev = mx.array(
+                    [[generated[k][step] for k in range(num_cb)]], dtype=mx.int32
+                )
+                tokens_this_step = mx.where(delay_masks[step][None], tokens_prev, bos_fill)
 
                 with mx.stream(generation_stream):
                     audio_emb = self.decoder.embed_audio(tokens_this_step, offset=offset)
@@ -415,15 +436,30 @@ class IndicParlerTTS(nn.Module):
                         mask=None,
                         self_caches=self_caches,
                         cross_caches=cross_caches,
+                        # encoder_mask omitted: cross-attn KV is cached after prefill,
+                        # so the mask has no effect and the 24 score additions waste cycles
                     )
                     logits = self.decoder.logits(hidden)  # [1, 1, 9, 1088]
-                    tokens_mx = sampler(_suppress_eos(logits[0, 0]))
+                    step_logits = logits[0, 0]            # [9, 1088]
+
+                    # Item 5: EOS biasing — gradually increase CB0 EOS logit after warm-up
+                    if step > _EOS_BIAS_MIN_STEP:
+                        bias = min(_EOS_BIAS_MAX, _EOS_BIAS_RATE * (step - _EOS_BIAS_MIN_STEP))
+                        step_logits = step_logits.at[0, eos].add(bias)
+
+                    # Item 6: repetition penalty using CB0 history applied across all codebooks
+                    if _recent_cb0:
+                        step_logits = _rep_penalty(list(_recent_cb0), step_logits)
+
+                    tokens_mx = sampler(_suppress_eos(step_logits))
 
                 tokens_list = tokens_mx.tolist()  # only sync point per step
+                _recent_cb0.append(tokens_list[0])
 
+                # Item 11: force EOS for codebooks that have already finished (HF parity)
                 for k in range(num_cb):
-                    if step >= target_T + k:
-                        generated[k][step + 1] = eos       # staggered drain
+                    if k < first_unfinished or step >= target_T + k:
+                        generated[k][step + 1] = eos
                     else:
                         generated[k][step + 1] = tokens_list[k]
 
@@ -460,8 +496,8 @@ class IndicParlerTTS(nn.Module):
         if not frames:
             return np.zeros(0, dtype=np.float32)
 
-        codes = np.array(frames, dtype=np.int32).T
-        codes_mx = mx.array(codes)
+        # Item 8: stay in MLX — skip the CPU round-trip through NumPy
+        codes_mx = mx.array(frames, dtype=mx.int32).T
 
         # 5. DAC decode
         audio = self.dac.decode(codes_mx)

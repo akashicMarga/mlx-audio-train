@@ -196,6 +196,80 @@ items 1–3 are landed (biggest-bang items first).
 
 ---
 
+### Tier 4 — NumPy cleanup (low effort, minor gains)
+
+#### 8. Remove residual NumPy from post-loop code
+
+Three one-liners in `model.py` that are trivially replaceable:
+
+| Line | Current | Fix |
+|------|---------|-----|
+| 461 | `return np.zeros(0, dtype=np.float32)` | `return np.array(mx.zeros(0))` or change return type |
+| 463 | `codes = np.array(frames, dtype=np.int32).T` | `codes = mx.array(frames, dtype=mx.int32).T` — stay MLX into DAC decode, skip the CPU round-trip |
+| 469 | `return np.array(audio, dtype=np.float32)` | Return `mx.array` directly; move the numpy conversion to the caller (`generate.py`) at the soundfile write boundary |
+
+No speed impact inside the AR loop (all post-loop), but cleans up the data flow and makes the
+return type consistent if streaming is added later.
+
+---
+
+### Tier 5 — HuggingFace parity
+
+These match features present in the original `ai4bharat/indic-parler-tts` HuggingFace
+implementation that are not yet in the MLX port.
+
+#### 9. Batch generation (batch_size > 1)
+
+Current code hardcodes `[1, ...]` shapes everywhere (encoder, prompt embed, KV caches, logits).
+The HF implementation supports batched generation with left-padded inputs and an attention mask.
+
+**What's needed:**
+- Attention mask on the decoder self-attention during prefill
+- KV cache that tracks per-sample offsets (mlx_lm `BatchKVCache` handles this)
+- Sampler operating on `[B, num_cb, vocab]` logits
+- EOS tracking per sample in the batch
+
+**Benefit:** generate N utterances in roughly the same wall-clock time as 1.
+
+---
+
+#### 10. Attention mask for variable-length prompt inputs
+
+Current decoder steps pass `mask=None` after prefill. For batch_size=1 this is fine (no padding).
+For batch > 1 or very long prompts, missing the cross-attention mask causes the decoder to attend
+to padding tokens in the T5 encoder output, degrading quality.
+
+**What's needed:** Pass `encoder_attention_mask` (from the T5 tokenizer's output) through to
+the cross-attention layers in `decoder.py`. This is a 2–3 line change in `forward_layers` and
+the cross-attention call.
+
+---
+
+#### 11. `ParlerTTSLogitsProcessor` full parity
+
+The HF implementation uses `ParlerTTSLogitsProcessor` which:
+1. Suppresses EOS for codebooks not yet unlocked (we have this)
+2. **Suppresses all non-EOS tokens once a codebook has EOS'd** — once CB k generates EOS, future
+   steps for CB k should be forced to EOS too. We don't do this; we just let the staggered drain
+   handle it via `step >= target_T + k`.
+
+**What's needed:** After `first_unfinished` advances past codebook k, force `generated[k][step+1]`
+to EOS regardless of what the sampler returns. This prevents "re-entry" into non-EOS tokens for
+finished codebooks and keeps the delay pattern clean.
+
+---
+
+#### 12. Classifier-free guidance (CFG)
+
+Some Parler TTS variants (and Dia, which uses the same architecture) support CFG by running two
+forward passes per step — one conditioned, one unconditioned — and interpolating:
+`logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)`.
+
+The unconditioned pass uses a zeroed description embedding. Not implemented in the MLX port.
+Optional feature; only relevant if the model was trained with CFG.
+
+---
+
 ## Recommended implementation order for next session
 
 ```
@@ -205,7 +279,11 @@ items 1–3 are landed (biggest-bang items first).
 4. Streaming generator (item 3) — UX win, requires items 1–2 for best latency
 5. Repetition penalty (item 6) — quality improvement over the current hard-stop heuristic
 6. EOS biasing (item 5) — refinement, tune after 1–4 are stable
-7. KV cache refactor (item 7) — last, highest complexity
+7. HF parity: force-EOS finished codebooks (item 11) — correctness fix, small
+8. HF parity: cross-attention mask (item 10) — correctness fix, 3 lines
+9. NumPy cleanup (item 8) — cosmetic, do anytime
+10. KV cache refactor (item 7) — last, highest complexity
+11. Batch generation (item 9) — requires item 7 + 10
 ```
 
 ---

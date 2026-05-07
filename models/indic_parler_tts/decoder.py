@@ -82,6 +82,7 @@ class ParlerCrossAttention(nn.Module):
         x: mx.array,
         enc_hidden: mx.array,
         cache: list = None,
+        encoder_mask: mx.array = None,
     ) -> mx.array:
         B, T, _ = x.shape
         H, D = self.num_heads, self.head_dim
@@ -100,6 +101,8 @@ class ParlerCrossAttention(nn.Module):
                 cache.append(v)
 
         scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        if encoder_mask is not None:
+            scores = scores + encoder_mask
         attn = mx.softmax(scores.astype(mx.float32), axis=-1).astype(x.dtype)
         out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, T, H * D)
         return self.out(out)
@@ -123,12 +126,13 @@ class ParlerDecoderLayer(nn.Module):
         mask: mx.array = None,
         self_cache: list = None,
         cross_cache: list = None,
+        encoder_mask: mx.array = None,
     ) -> mx.array:
         # Pre-norm self-attention
         h = self.self_attn(self.self_attn_ln(x), mask=mask, cache=self_cache)
         x = x + h
         # Pre-norm cross-attention
-        h = self.cross_attn(self.cross_attn_ln(x), enc_hidden, cache=cross_cache)
+        h = self.cross_attn(self.cross_attn_ln(x), enc_hidden, cache=cross_cache, encoder_mask=encoder_mask)
         x = x + h
         # Pre-norm FFN
         h = self.fc2(gelu(self.fc1(self.ffn_ln(x))))
@@ -177,11 +181,12 @@ class ParlerDecoder(nn.Module):
         mask: mx.array = None,
         self_caches: list = None,
         cross_caches: list = None,
+        encoder_mask: mx.array = None,
     ) -> mx.array:
         for i, layer in enumerate(self.layers):
             sc = self_caches[i] if self_caches is not None else None
             cc = cross_caches[i] if cross_caches is not None else None
-            x = layer(x, enc_hidden, mask=mask, self_cache=sc, cross_cache=cc)
+            x = layer(x, enc_hidden, mask=mask, self_cache=sc, cross_cache=cc, encoder_mask=encoder_mask)
         return self.final_ln(x)
 
     def logits(self, hidden: mx.array) -> mx.array:
