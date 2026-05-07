@@ -157,10 +157,10 @@ def stream_generate(
     top_k: int = 50,
     top_p: float = 0.9,
     seed: int | None = None,
-    chunk_steps: int = 50,
+    chunk_steps: int = 15,
 ) -> Generator[np.ndarray, None, None]:
     """
-    Streaming synthesis — yields float32 audio chunks (~580 ms each at chunk_steps=50)
+    Streaming synthesis — yields float32 audio chunks (~170 ms each at chunk_steps=15)
     as they come off the decoder, before the full utterance is done.
 
     Args:

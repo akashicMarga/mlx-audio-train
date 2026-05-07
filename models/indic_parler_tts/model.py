@@ -589,6 +589,23 @@ class IndicParlerTTS(nn.Module):
             # Frame p is fully available after step p + num_cb - 1.
             next_frame_to_yield = 0
 
+            # DAC left-context overlap: re-decode the last _DAC_CTX frames from
+            # the previous chunk as a prefix so DAC's conv layers have proper
+            # history at each chunk boundary, eliminating click artifacts.
+            _DAC_CTX = 8  # codec frames (~93 ms); covers DAC's conv receptive field
+            _dac_ctx_frames: list[list[int]] = []
+
+            def _decode_chunk(new_frames: list[list[int]]) -> np.ndarray:
+                nonlocal _dac_ctx_frames
+                all_frames = _dac_ctx_frames + new_frames
+                codes = mx.array(all_frames, dtype=mx.int32).T
+                audio = self.dac.decode(codes)
+                mx.eval(audio)
+                # trim the context prefix — only yield the new portion
+                trim = len(_dac_ctx_frames) * 512
+                _dac_ctx_frames = new_frames[-_DAC_CTX:]
+                return np.array(audio, dtype=np.float32)[trim:]
+
             for step in range(1, max_steps):
                 last_step = step
                 tokens_this_step = mx.where(
@@ -632,10 +649,7 @@ class IndicParlerTTS(nn.Module):
                         if all(0 <= t < self.cfg.dac.codebook_size for t in frame):
                             chunk_frames.append(frame)
                     if chunk_frames:
-                        codes_mx = mx.array(chunk_frames, dtype=mx.int32).T
-                        audio_chunk = self.dac.decode(codes_mx)
-                        mx.eval(audio_chunk)
-                        yield np.array(audio_chunk, dtype=np.float32)
+                        yield _decode_chunk(chunk_frames)
                     next_frame_to_yield = max_ready_frame + 1
 
                 if first_unfinished == num_cb:
@@ -661,10 +675,7 @@ class IndicParlerTTS(nn.Module):
                 if all(0 <= t < self.cfg.dac.codebook_size for t in frame):
                     tail_frames.append(frame)
             if tail_frames:
-                codes_mx = mx.array(tail_frames, dtype=mx.int32).T
-                audio_tail = self.dac.decode(codes_mx)
-                mx.eval(audio_tail)
-                yield np.array(audio_tail, dtype=np.float32)
+                yield _decode_chunk(tail_frames)
 
 
 def _causal_mask(T: int, dtype=mx.float32) -> mx.array:

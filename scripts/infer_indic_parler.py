@@ -51,8 +51,8 @@ def main():
     parser.add_argument(
         "--chunk-steps",
         type=int,
-        default=50,
-        help="AR steps per streamed chunk (~580 ms per chunk at default 50)",
+        default=15,
+        help="AR steps per streamed chunk (15 ≈ 270ms TTFA; 50 ≈ 600ms TTFA)",
     )
     parser.add_argument(
         "--no-load-audit",
