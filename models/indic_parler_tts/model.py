@@ -20,6 +20,8 @@ from typing import Iterable
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils as mxu
+from mlx_lm.sample_utils import apply_top_k, apply_top_p
+from mlx_lm.generate import wired_limit, generation_stream
 
 from .config import IndicParlerTTSConfig
 from .t5_encoder import T5Encoder
@@ -312,7 +314,8 @@ class IndicParlerTTS(nn.Module):
         Returns          : float32 numpy array of audio samples at 44100 Hz
         """
         cfg = self.cfg.decoder
-        rng = np.random.default_rng(seed)
+        if seed is not None:
+            mx.random.seed(seed)
         num_cb = cfg.num_codebooks
         bos = cfg.bos_token_id
         eos = cfg.eos_token_id
@@ -320,81 +323,127 @@ class IndicParlerTTS(nn.Module):
         target_T = int(max_audio_length_s * 44100 / 512)
         max_steps = target_T + num_cb - 1
 
-        # 1. Encode style description
-        enc_hidden = self.text_encoder(description_ids)  # [1, T_desc, 1024]
+        # Compiled per-codebook sampler (captures hyperparams as closure constants)
+        sampler = _make_mlx_sampler(temperature, top_k, top_p, num_cb)
 
-        # 2. First decoder pass: prompt text embeddings are prepended to the
-        # initial all-BOS audio step. This mirrors Parler's prompt_cross_attention
-        # false path; the prompt is decoder context, not a separate cached decode.
-        T_prompt = prompt_ids.shape[1]
-        prompt_emb = self.embed_prompts(prompt_ids)  # [1, T_prompt, 1024]
-
-        # KV caches: list of lists [self_k, self_v] and [cross_k, cross_v]
-        self_caches = [[] for _ in range(cfg.num_layers)]
-        cross_caches = [[] for _ in range(cfg.num_layers)]
-
-        bos_tokens = mx.full((1, num_cb), bos, dtype=mx.int32)
-        bos_audio_emb = self.decoder.embed_audio_no_pos(bos_tokens)
-        first_emb = mx.concatenate([prompt_emb, bos_audio_emb], axis=1)
-        first_emb = first_emb + self.decoder.decoder_position(0, first_emb.shape[1])
-
-        hidden = self.decoder.forward_layers(
-            first_emb, enc_hidden,
-            mask=_causal_mask(first_emb.shape[1], dtype=first_emb.dtype),
-            self_caches=self_caches,
-            cross_caches=cross_caches,
+        # Precompute EOS suppression deltas for all possible first_unfinished states.
+        # eos_deltas[i, k] = 0.0 if codebook k is allowed to EOS (k <= i), else -1e9.
+        # Indexing is O(1) — no Python list rebuild per step.
+        eos_deltas = mx.array(
+            [
+                [0.0 if k <= i else -1e9 for k in range(num_cb)]
+                for i in range(num_cb + 1)
+            ],
+            dtype=mx.float32,
         )
-        logits = self.decoder.logits(hidden[:, -1:, :])
-        mx.eval(logits)
-        logits_np = np.array(logits[0, 0])
 
-        generated = [[bos] * (max_steps + 2) for _ in range(num_cb)]
-        for k in range(num_cb):
-            cb_temp = temperature * max(0.25, 1.0 - k * 0.08)
-            token = _sample_token(logits_np[k], cb_temp, top_k, rng, top_p)
-            generated[k][1] = token
+        with wired_limit(self, [generation_stream]):
+            # 1. Encode style description
+            enc_hidden = self.text_encoder(description_ids)  # [1, T_desc, 1024]
 
-        # 3. Autoregressive audio generation with delay pattern
-        #
-        # Input: at step t, CB k uses its own prediction from step t-1 (BOS for first k steps).
-        # Output assembly: frame p = CB k token from step p+k.
-        finished = (generated[0][1] == eos)
-        last_step = 0
+            # 2. First decoder pass: prompt text embeddings are prepended to the
+            # initial all-BOS audio step. This mirrors Parler's prompt_cross_attention
+            # false path; the prompt is decoder context, not a separate cached decode.
+            T_prompt = prompt_ids.shape[1]
+            prompt_emb = self.embed_prompts(prompt_ids)  # [1, T_prompt, 1024]
 
-        for step in range(1, max_steps):
-            last_step = step
-            offset = T_prompt + step
+            # KV caches: list of lists [self_k, self_v] and [cross_k, cross_v]
+            self_caches = [[] for _ in range(cfg.num_layers)]
+            cross_caches = [[] for _ in range(cfg.num_layers)]
 
-            # Each codebook uses its own prediction from the immediately previous step.
-            # The delay lives only in the output assembly (frame p = CB k at step p+k),
-            # not in the input feedback — the first k steps use BOS instead.
-            tokens_this_step = mx.array(
-                [[generated[k][step] if step > k else bos for k in range(num_cb)]],
-                dtype=mx.int32,
-            )  # [1, num_codebooks]
-            audio_emb = self.decoder.embed_audio(tokens_this_step, offset=offset)
+            bos_tokens = mx.full((1, num_cb), bos, dtype=mx.int32)
+            bos_audio_emb = self.decoder.embed_audio_no_pos(bos_tokens)
+            first_emb = mx.concatenate([prompt_emb, bos_audio_emb], axis=1)
+            first_emb = first_emb + self.decoder.decoder_position(0, first_emb.shape[1])
 
-            hidden = self.decoder.forward_layers(
-                audio_emb, enc_hidden,
-                mask=None,
-                self_caches=self_caches,
-                cross_caches=cross_caches,
-            )
-            logits = self.decoder.logits(hidden)  # [1, 1, 9, 1088]
-            mx.eval(logits)
-            logits_np = np.array(logits[0, 0])    # [9, 1088]
+            # EOS processor: CB k may only generate EOS after CB k-1 has done so.
+            # first_unfinished tracks the next codebook allowed to generate EOS.
+            first_unfinished = 0
 
+            def _suppress_eos(raw: mx.array) -> mx.array:
+                if first_unfinished >= num_cb:
+                    return raw
+                return raw.at[:, eos].add(eos_deltas[first_unfinished])
+
+            with mx.stream(generation_stream):
+                hidden = self.decoder.forward_layers(
+                    first_emb, enc_hidden,
+                    mask=_causal_mask(first_emb.shape[1], dtype=first_emb.dtype),
+                    self_caches=self_caches,
+                    cross_caches=cross_caches,
+                )
+                logits = self.decoder.logits(hidden[:, -1:, :])
+                tokens0 = sampler(_suppress_eos(logits[0, 0]))
+
+            tokens0_list = tokens0.tolist()
+
+            generated = [[bos] * (max_steps + 2) for _ in range(num_cb)]
             for k in range(num_cb):
-                cb_temp = temperature * max(0.25, 1.0 - k * 0.08)
-                token = _sample_token(logits_np[k], cb_temp, top_k, rng, top_p)
-                generated[k][step + 1] = token
+                generated[k][1] = tokens0_list[k]
 
-            # CB0 leads the staggered EOS pattern; stop as soon as it generates EOS.
-            # CB1..8 will also EOS in subsequent steps but we don't wait — the frame
-            # extraction filter drops any frame containing a special token.
-            if generated[0][step + 1] == eos:
-                finished = True
-                break
+            while first_unfinished < num_cb and generated[first_unfinished][1] == eos:
+                first_unfinished += 1
+
+            # 3. Autoregressive audio generation with delay pattern.
+            # Input: at step t, CB k uses its own prediction from step t-1
+            # (BOS for the first k steps).
+            # Output assembly: frame p = CB k token from step p+k.
+            finished = (first_unfinished == num_cb)
+            last_step = 0
+
+            # Repetition detection: if all 9 codebooks produce the exact same
+            # token vector for REP_THRESHOLD consecutive steps the model is stuck
+            # in a loop (speech ended, no EOS sampled). Stop early so we don't
+            # burn time generating near-silence that _trim_silence will cut anyway.
+            _REP_THRESHOLD = 20
+            _prev_tokens: list[int] | None = None
+            _rep_count = 0
+
+            for step in range(1, max_steps):
+                last_step = step
+                offset = T_prompt + step
+
+                tokens_this_step = mx.array(
+                    [[generated[k][step] if step > k else bos for k in range(num_cb)]],
+                    dtype=mx.int32,
+                )  # [1, num_codebooks]
+
+                with mx.stream(generation_stream):
+                    audio_emb = self.decoder.embed_audio(tokens_this_step, offset=offset)
+                    hidden = self.decoder.forward_layers(
+                        audio_emb, enc_hidden,
+                        mask=None,
+                        self_caches=self_caches,
+                        cross_caches=cross_caches,
+                    )
+                    logits = self.decoder.logits(hidden)  # [1, 1, 9, 1088]
+                    tokens_mx = sampler(_suppress_eos(logits[0, 0]))
+
+                tokens_list = tokens_mx.tolist()  # only sync point per step
+
+                for k in range(num_cb):
+                    if step >= target_T + k:
+                        generated[k][step + 1] = eos       # staggered drain
+                    else:
+                        generated[k][step + 1] = tokens_list[k]
+
+                while first_unfinished < num_cb and generated[first_unfinished][step + 1] == eos:
+                    first_unfinished += 1
+
+                if first_unfinished == num_cb:
+                    finished = True
+                    break
+
+                # Repetition check (only after delay warm-up)
+                if step > num_cb:
+                    if tokens_list == _prev_tokens:
+                        _rep_count += 1
+                        if _rep_count >= _REP_THRESHOLD:
+                            finished = True
+                            break
+                    else:
+                        _rep_count = 0
+                    _prev_tokens = tokens_list
 
         # 4. Extract audio tokens using the same invariant as Parler's delay mask:
         # a decoded frame is valid only if every codebook contributes a real DAC
@@ -425,28 +474,44 @@ def _causal_mask(T: int, dtype=mx.float32) -> mx.array:
     return mask[None, None, :, :]  # [1, 1, T, T]
 
 
-def _sample_token(
-    logits: np.ndarray,
+def _make_mlx_sampler(
     temperature: float,
     top_k: int,
-    rng: np.random.Generator,
-    top_p: float = 1.0,
-) -> int:
-    if temperature == 0.0:
-        return int(np.argmax(logits))
+    top_p: float,
+    num_cb: int,
+):
+    """
+    Returns a per-codebook sampler function for use in the AR loop.
 
-    logits = logits / temperature
-    if top_k > 0:
-        top_k = min(top_k, logits.shape[-1])
-        kth = np.partition(logits, -top_k)[-top_k]
-        logits = np.where(logits < kth, -1e9, logits)
-    logits = logits - logits.max()
-    probs = np.exp(logits)
-    probs /= probs.sum()
-    if top_p < 1.0:
-        sorted_idx = np.argsort(probs)[::-1]
-        cumprobs = np.cumsum(probs[sorted_idx])
-        cutoff = sorted_idx[np.searchsorted(cumprobs, top_p)]
-        probs[probs < probs[cutoff]] = 0.0
-        probs /= probs.sum()
-    return int(rng.choice(len(probs), p=probs))
+    Uses mlx_lm's compiled apply_top_k / apply_top_p kernels.
+    Per-codebook adaptive temperature is applied before filtering:
+    fine codebooks (higher k) get a slightly lower temperature to
+    reduce acoustic texture noise while coarse codebook stays at full temp.
+    """
+    if temperature == 0.0:
+        return lambda logits: mx.argmax(logits, axis=-1).astype(mx.int32)
+
+    # Captured as a constant — avoids rebuilding this array every step
+    temps = mx.array(
+        [temperature * max(0.25, 1.0 - k * 0.08) for k in range(num_cb)],
+        dtype=mx.float32,
+    )
+    do_top_k = top_k > 0
+    do_top_p = top_p < 1.0
+
+    def sampler(logits: mx.array) -> mx.array:
+        # Per-codebook temperature scaling
+        scaled = logits / temps[:, None]
+        logprobs = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+        if do_top_k:
+            logprobs = apply_top_k(logprobs, top_k)
+            # Renormalise after top-k so apply_top_p's cumulative sum is correct.
+            # Without this, the top-k tokens' probs don't sum to 1: if their
+            # combined mass < (1 - top_p), apply_top_p masks all tokens to -inf
+            # and mx.random.categorical produces undefined behaviour (early EOS).
+            logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
+        if do_top_p:
+            logprobs = apply_top_p(logprobs, top_p)
+        return mx.random.categorical(logprobs).astype(mx.int32)
+
+    return sampler
