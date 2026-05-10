@@ -1,0 +1,104 @@
+# configs/indic_parler_bhojpuri.yaml
+#
+# Plan B — Language Adaptation: Teach Bhojpuri phoneme patterns to Indic Parler TTS.
+#
+# Goal: After training, the model synthesizes Bhojpuri when given Bhojpuri text.
+#       Description strings still control prosody / voice quality.
+#       No specific speaker identity is baked in.
+#
+# Usage:
+#   python scripts/prepare_bhojpuri_dataset.py --mode language --max-hours 10
+#   python scripts/preprocess_bhojpuri_dac.py
+#   python scripts/train.py --config configs/indic_parler_bhojpuri.yaml
+
+model:
+  model_type: indic_parler_tts
+  hf_repo: ai4bharat/indic-parler-tts
+
+# No fixed speaker_description — varied per-clip descriptions from JSONL.
+# This teaches phoneme patterns independent of voice style.
+
+lora:
+  rank: 8
+  alpha: 16                        # scale = 2.0 — Bhojpuri needs larger updates than speaker adapt
+  target_modules:
+    # Self-attention drives phoneme sequence learning
+    - decoder.layers.*.self_attn.q
+    - decoder.layers.*.self_attn.k
+    - decoder.layers.*.self_attn.v
+    - decoder.layers.*.self_attn.out
+    # FFN layers critical for new phoneme distributions
+    - decoder.layers.*.fc1
+    - decoder.layers.*.fc2
+    # Cross-attention so description conditioning still works
+    - decoder.layers.*.cross_attn.q
+    - decoder.layers.*.cross_attn.v
+
+frozen:
+  - text_encoder                   # T5 fully frozen — handles any description already
+  - embed_prompts                  # prompt tokenizer embedding frozen
+  - dac                            # DAC decoder frozen
+
+data:
+  processor: indic_parler
+  train_jsonl: /Users/akashsingh/Documents/exps/bhojpuri/train.jsonl
+  val_jsonl:   /Users/akashsingh/Documents/exps/bhojpuri/val.jsonl
+  max_audio_length_s: 12.0
+  num_codebooks: 9
+  max_frames: 1032                 # 12s × 86Hz = 1032 frames
+
+trainer:
+  loss_fn: parler_tts_loss
+  run_name: parler-bhojpuri-language
+  learning_rate: 1.0e-5            # higher than speaker adapt — new language needs more movement
+  num_epochs: 3
+  batch_size: 1
+  grad_accumulation: 8             # effective batch = 8
+  label_smoothing: 0.1             # diversity across Bhojpuri phonemes
+  grad_clip: 1.0
+  warmup_steps: 100
+  eval_every_n_steps: 200
+  save_every_n_steps: 500
+  output_dir: /Users/akashsingh/Documents/exps/checkpoints/parler-bhojpuri-language
+  tensorboard_dir: /Users/akashsingh/Documents/exps/tensorboard/parler-bhojpuri-language
+  log_file: /Users/akashsingh/Documents/exps/checkpoints/parler-bhojpuri-language/train_log.jsonl
+
+# Bhojpuri-specific stopping criterion (manual eval every 200 steps):
+#   1. Run inference on Bhojpuri test sentence — listen for correct phonemes
+#   2. Run inference on Hindi/Tamil/Telugu sentences — must remain intelligible
+#   3. Val loss on Bhojpuri held-out set must decrease
+#
+# Risk: Hindi accent bleed (Devanagari overlap).
+# Mitigation: Mix 200-300 Hindi samples into training data (set in prepare script).
+
+eval:
+  test_sentences:
+    bhojpuri:
+      - text: "रउरा के राम राम। आज हम एही गाँव में रहीला।"
+        description: "A female speaker delivers speech at a moderate pace. The recording is of very high quality."
+      - text: "ई बहुत नीमन बा। हम कल जाइब।"
+        description: "A female speaker delivers speech at a moderate pace. The audio quality is excellent."
+    hindi_guard:
+      - text: "नमस्ते, आप कैसे हैं?"
+        description: "Divya's voice is slightly expressive and very animated. She speaks at a moderate pace."
+    tamil_guard:
+      - text: "வணக்கம், எப்படி இருக்கீங்க?"
+        description: "A female speaker delivers speech at a moderate pace. The recording is very clean."
+
+# TensorBoard audio: generates these sentences after each eval step and logs waveforms.
+# Launch TensorBoard: tensorboard --logdir /Users/akashsingh/Documents/exps/tensorboard
+eval_audio:
+  enabled: true
+  max_samples: 3
+  max_audio_length_s: 8.0
+  temperature: 1.0
+  test_sentences:
+    - text: "रउरा के राम राम। आज हम एही गाँव में रहीला।"
+      description: "A female speaker delivers speech at a moderate pace. The recording is of very high quality."
+      tag: "bhojpuri_0"
+    - text: "ई बहुत नीमन बा। हम कल जाइब।"
+      description: "A female speaker delivers speech at a moderate pace. The audio quality is excellent."
+      tag: "bhojpuri_1"
+    - text: "नमस्ते, आप कैसे हैं?"
+      description: "Divya's voice is slightly expressive and very animated. She speaks at a moderate pace."
+      tag: "hindi_guard"

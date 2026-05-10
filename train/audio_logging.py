@@ -298,3 +298,57 @@ def make_qwen3_tts_audio_eval_fn(
                 print(f"[audio_logging] Qwen3-TTS sample {i} failed at step {global_step}: {e}")
 
     return audio_eval_fn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Indic Parler TTS audio eval
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_indic_parler_audio_eval_fn(
+    model,
+    tokenizers: dict,
+    eval_audio_cfg: Dict,
+) -> Optional[Callable]:
+    """Returns a callable(model, global_step, tb_writer) for Indic Parler TTS eval audio.
+
+    At each eval step, runs autoregressive generation on each test sentence and
+    logs the waveform to TensorBoard under "eval_audio/<tag>".
+    """
+    if not eval_audio_cfg.get("enabled", True):
+        return None
+
+    test_sentences = eval_audio_cfg.get("test_sentences", [])
+    if not test_sentences:
+        print("[audio_logging] Indic Parler audio eval: no test_sentences — skipping")
+        return None
+
+    max_samples    = eval_audio_cfg.get("max_samples", 3)
+    test_sentences = test_sentences[:max_samples]
+    max_audio_s    = eval_audio_cfg.get("max_audio_length_s", 8.0)
+    temperature    = eval_audio_cfg.get("temperature", 1.0)
+    sample_rate    = 44100
+
+    print(f"[audio_logging] Indic Parler audio eval: {len(test_sentences)} sentences")
+
+    def audio_eval_fn(model, global_step: int, tb_writer) -> None:
+        from models.indic_parler_tts.generate import generate as parler_generate
+        for i, item in enumerate(test_sentences):
+            try:
+                audio = parler_generate(
+                    model,
+                    tokenizers,
+                    description=item["description"],
+                    text=item["text"],
+                    max_audio_length_s=max_audio_s,
+                    temperature=temperature,
+                )
+                audio = _normalize_audio(audio)
+                tag = item.get("tag", f"sample_{i}")
+                tb_writer.add_audio(
+                    f"eval_audio/{tag}", audio, global_step, sample_rate=sample_rate
+                )
+                print(f"[audio_logging] Logged eval_audio/{tag} at step {global_step}")
+            except Exception as e:
+                print(f"[audio_logging] Indic Parler sample {i} failed at step {global_step}: {e}")
+
+    return audio_eval_fn

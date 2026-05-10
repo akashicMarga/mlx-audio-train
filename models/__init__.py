@@ -9,4 +9,4 @@ Current models:
   - indic_parler_tts: ai4bharat/indic-parler-tts — pure MLX inference stack
 """
 from . import personaplex
-from . import indic_parler_tts
+# indic_parler_tts imported lazily in train.py to avoid torch dependency at startup

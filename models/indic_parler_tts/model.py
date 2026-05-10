@@ -22,8 +22,7 @@ from typing import Generator, Iterable
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils as mxu
-from mlx_lm.sample_utils import apply_top_k, apply_top_p, make_repetition_penalty
-from mlx_lm.generate import wired_limit, generation_stream
+# mlx_lm imports are lazy (inside inference methods) to avoid torch at import time
 
 from .config import IndicParlerTTSConfig
 from .t5_encoder import T5Encoder
@@ -316,6 +315,8 @@ class IndicParlerTTS(nn.Module):
         prompt_ids       : [1, T_prompt] — custom-tokenized text to speak
         Returns          : float32 numpy array of audio samples at 44100 Hz
         """
+        from mlx_lm.generate import wired_limit, generation_stream
+        from mlx_lm.sample_utils import make_repetition_penalty
         cfg = self.cfg.decoder
         if seed is not None:
             mx.random.seed(seed)
@@ -514,6 +515,8 @@ class IndicParlerTTS(nn.Module):
         (~chunk_steps * 512 / 44100 s per chunk ≈ 580 ms at chunk_steps=50).
         Callers can play each chunk immediately for near-real-time output.
         """
+        from mlx_lm.generate import wired_limit, generation_stream
+        from mlx_lm.sample_utils import make_repetition_penalty
         cfg = self.cfg.decoder
         if seed is not None:
             mx.random.seed(seed)
@@ -697,6 +700,7 @@ def _make_mlx_sampler(
     fine codebooks (higher k) get a slightly lower temperature to
     reduce acoustic texture noise while coarse codebook stays at full temp.
     """
+    from mlx_lm.sample_utils import apply_top_k, apply_top_p
     if temperature == 0.0:
         return lambda logits: mx.argmax(logits, axis=-1).astype(mx.int32)
 

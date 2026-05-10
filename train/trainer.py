@@ -103,6 +103,51 @@ def get_lr(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Minimal TensorBoard writer (no torch / tensorboardX required)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _TBWriter:
+    """Writes TensorBoard event files using raw protobuf — no torch needed."""
+
+    def __init__(self, logdir: str):
+        from tensorboard.summary.writer.event_file_writer import EventFileWriter
+        Path(logdir).mkdir(parents=True, exist_ok=True)
+        self._writer = EventFileWriter(logdir)
+
+    def _event(self, summary, step: int):
+        from tensorboard.compat.proto import event_pb2
+        return event_pb2.Event(wall_time=__import__("time").time(), step=step, summary=summary)
+
+    def add_scalar(self, tag: str, value: float, step: int):
+        from tensorboard.compat.proto import summary_pb2
+        v = summary_pb2.Summary.Value(tag=tag, simple_value=float(value))
+        self._writer.add_event(self._event(summary_pb2.Summary(value=[v]), step))
+
+    def add_audio(self, tag: str, audio: np.ndarray, step: int, sample_rate: int = 44100):
+        import io, wave
+        from tensorboard.compat.proto import summary_pb2
+        audio = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+        pcm = (audio * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+        a = summary_pb2.Summary.Audio(
+            sample_rate=float(sample_rate), num_channels=1,
+            length_frames=len(audio), encoded_audio_string=buf.getvalue(),
+            content_type="audio/wav",
+        )
+        v = summary_pb2.Summary.Value(tag=tag, audio=a)
+        self._writer.add_event(self._event(summary_pb2.Summary(value=[v]), step))
+
+    def flush(self):
+        self._writer.flush()
+
+    def close(self):
+        self._writer.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -136,18 +181,15 @@ class Trainer:
             Path(config.log_file).parent.mkdir(parents=True, exist_ok=True)
             self._log_fh = open(config.log_file, "w")
 
-        # TensorBoard (soft import — won't crash if tensorboardX not installed)
+        # TensorBoard (uses raw tensorboard protos — no torch dependency)
         self._tb_writer = None
         if config.tensorboard_dir:
             try:
-                from tensorboardX import SummaryWriter
-                tb_dir = str(Path(config.tensorboard_dir).resolve())
-                Path(tb_dir).mkdir(parents=True, exist_ok=True)
-                self._tb_writer = SummaryWriter(logdir=tb_dir)
+                self._tb_writer = _TBWriter(config.tensorboard_dir)
                 print(f"[trainer] TensorBoard → {config.tensorboard_dir}")
                 print(f"[trainer] Run: tensorboard --logdir {config.tensorboard_dir}")
-            except ImportError:
-                print("[trainer] tensorboardX not installed — TensorBoard disabled")
+            except Exception as e:
+                print(f"[trainer] TensorBoard disabled: {e}")
 
         # Save config
         with open(self.output_dir / "trainer_config.json", "w") as f:

@@ -1,0 +1,92 @@
+# configs/indic_parler_bhojpuri_speaker.yaml
+#
+# Plan A — Speaker Adaptation: Add the SYSPIN Bhojpuri Female speaker as a new voice.
+#
+# Goal: After training, the model generates speech in this specific female voice
+#       when the fixed description below is used — no ref_audio needed at inference.
+#       Works for any text in the languages the model already knows (including Bhojpuri
+#       if Plan B was run first, or Hindi/others if used standalone).
+#
+# Run Plan B (language) BEFORE Plan A (speaker) for best Bhojpuri voice results.
+#
+# Usage:
+#   python scripts/prepare_bhojpuri_dataset.py --mode speaker --max-hours 5
+#   python scripts/preprocess_bhojpuri_dac.py
+#   python scripts/train.py --config configs/indic_parler_bhojpuri_speaker.yaml
+
+model:
+  model_type: indic_parler_tts
+  hf_repo: ai4bharat/indic-parler-tts
+
+# Fixed description — one stable point in T5 encoding space → one voice identity.
+# Derived from measured SYSPIN metadata: female, 35yo, studio @ 48kHz/40dBSNR.
+# Do NOT change this between training runs or inference will differ.
+speaker_description: >
+  A female speaker delivers Bhojpuri speech at a moderate pace.
+  The recording is of very high quality, with the speaker's voice
+  sounding clear and very close up. The speaker has a calm and expressive tone.
+
+lora:
+  rank: 4                          # low rank — protects existing 69 speakers
+  alpha: 4                         # scale = 1.0 (conservative — don't overwrite others)
+  target_modules:
+    # Cross-attention is the speaker identity pathway
+    - decoder.layers.*.cross_attn.q
+    - decoder.layers.*.cross_attn.k
+    - decoder.layers.*.cross_attn.v
+    - decoder.layers.*.cross_attn.out
+    # Self-attention for temporal coherence
+    - decoder.layers.*.self_attn.q
+    - decoder.layers.*.self_attn.k
+    - decoder.layers.*.self_attn.v
+    - decoder.layers.*.self_attn.out
+
+frozen:
+  - text_encoder
+  - embed_prompts
+  - dac
+
+data:
+  processor: indic_parler
+  train_jsonl: /Users/akashsingh/Documents/exps/bhojpuri_speaker/train.jsonl
+  val_jsonl:   /Users/akashsingh/Documents/exps/bhojpuri_speaker/val.jsonl
+  max_audio_length_s: 12.0
+  num_codebooks: 9
+  max_frames: 1032
+
+trainer:
+  loss_fn: parler_tts_loss
+  learning_rate: 5.0e-6            # very low — protect existing 69 speakers
+  num_epochs: 2                    # stop early — don't overfit one voice
+  batch_size: 1
+  grad_accumulation: 4             # effective batch = 4
+  label_smoothing: 0.0             # sharp predictions for one speaker
+  grad_clip: 1.0
+  warmup_steps: 50
+  eval_every_n_steps: 50           # check existing speakers more frequently
+  save_every_n_steps: 200
+  checkpoint_dir: /Users/akashsingh/Documents/exps/checkpoints/parler-bhojpuri-speaker
+
+# Stopping criterion (eval every 50 steps):
+#   1. New speaker description → voice quality improves
+#   2. 3–4 existing speaker descriptions must NOT degrade
+# Stop as soon as BOTH conditions hold — don't wait for loss plateau.
+#
+# Catastrophic forgetting risk:
+#   rank=4 limits weight updates to 4 directions per layer.
+#   Existing 69 speakers live in other directions and are largely protected.
+#   Mix 200–300 original indic-parler-tts Hindi training samples if available
+#   for strongest protection.
+
+eval:
+  test_sentences:
+    new_speaker:
+      - text: "रउरा स्वागत बा। आज हम बहुत खुश हईं।"
+        description: "A female speaker delivers Bhojpuri speech at a moderate pace. The recording is of very high quality, with the speaker's voice sounding clear and very close up. The speaker has a calm and expressive tone."
+    existing_speakers_guard:
+      - text: "नमस्ते, आप कैसे हैं? आज का मौसम बहुत अच्छा है।"
+        description: "Divya's voice is slightly expressive and very animated. She speaks at a moderate pace."
+      - text: "Hello, how are you today?"
+        description: "A male speaker delivers speech at a moderate pace with a warm tone. The audio quality is excellent."
+      - text: "வணக்கம், எப்படி இருக்கீங்க?"
+        description: "A female speaker delivers speech at a slightly fast pace. The recording is very clean."

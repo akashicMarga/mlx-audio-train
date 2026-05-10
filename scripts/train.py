@@ -136,8 +136,36 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
         ))
         collate_fn = collate_csm
 
+    elif model_type == "indic_parler_tts":
+        from data.processors.indic_parler import (
+            IndicParlerProcessor, IndicParlerProcessorConfig, IndicParlerDataset,
+        )
+        proc_cfg  = cfg.get("processor", {})
+        processor = IndicParlerProcessor(IndicParlerProcessorConfig(
+            hf_repo            = cfg["model"]["hf_repo"],
+            max_desc_len       = data_cfg.get("max_desc_len",       128),
+            max_prompt_len     = data_cfg.get("max_prompt_len",     256),
+            max_frames         = data_cfg.get("max_frames",         860),
+            num_codebooks      = data_cfg.get("num_codebooks",      9),
+            fixed_description  = data_cfg.get("fixed_description",  None),
+        ))
+        dataset = IndicParlerDataset(
+            jsonl_path  = jsonl_path,
+            processor   = processor,
+            shuffle     = (split == "train"),
+            max_samples = data_cfg.get("max_samples", None),
+        )
+        loader = BatchIterator(
+            dataset,
+            batch_size = t_cfg["batch_size"],
+            drop_last  = (split == "train"),
+            collate_fn = processor.collate,
+            prefetch   = t_cfg.get("prefetch", 2),
+        )
+        return dataset, loader
+
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, qwen3_tts_speaker, csm, personaplex")
+        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, qwen3_tts_speaker, csm, personaplex, indic_parler_tts")
 
     dataset = TTSDataset(ds_config, processor=processor)
     loader  = BatchIterator(
@@ -174,6 +202,13 @@ def load_model(cfg: dict):
         load_lm_weights(model, lm_config, resolved_file, quantized)
         mx.eval(model.parameters())
         print(f"[train] PersonaPlex loaded: d_model={lm_config.transformer.d_model}")
+        return model
+
+    if model_type == "indic_parler_tts":
+        from models.indic_parler_tts.generate import load_model as parler_load
+        hf_repo = cfg["model"]["hf_repo"]
+        model, tokenizers = parler_load(hf_repo)
+        model._eval_tokenizers = tokenizers
         return model
 
     model_id = cfg["model"]["model_id"]
@@ -228,6 +263,13 @@ def build_loss_fn(cfg: dict):
         from train.losses.codec_loss import csm_loss
         def loss_fn(model, batch):
             return csm_loss(model, batch)
+        return loss_fn
+
+    elif model_type == "indic_parler_tts":
+        from train.losses.parler_loss import parler_tts_loss
+        label_smoothing = cfg["trainer"].get("label_smoothing", 0.0)
+        def loss_fn(model, batch):
+            return parler_tts_loss(model, batch, label_smoothing=label_smoothing)
         return loss_fn
 
     else:
@@ -387,6 +429,14 @@ def _build_audio_eval_fn(model, model_type: str, cfg: dict, val_dataset, eval_au
 
     elif model_type in ("qwen3_tts", "qwen3_tts_speaker"):
         return make_qwen3_tts_audio_eval_fn(model, eval_audio_cfg)
+
+    elif model_type == "indic_parler_tts":
+        from train.audio_logging import make_indic_parler_audio_eval_fn
+        tokenizers = getattr(model, "_eval_tokenizers", None)
+        if tokenizers is None:
+            print("[train] audio eval: model has no _eval_tokenizers — skipping")
+            return None
+        return make_indic_parler_audio_eval_fn(model, tokenizers, eval_audio_cfg)
 
     else:
         print(f"[train] audio eval not implemented for model_type={model_type} — skipping")

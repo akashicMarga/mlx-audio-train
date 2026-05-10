@@ -202,40 +202,53 @@ def _recursive_patch(
     rank:     int,
     alpha:    float,
     dropout:  float,
+    _path:    str = "",
 ) -> int:
     """
-    Walk the MLX module tree via module.children() and replace matching
-    Linear / QuantizedLinear layers with LoRA wrappers in-place.
+    Walk the MLX module tree and replace matching Linear layers with LoRA wrappers.
+
+    Supports two matching modes decided once per call tree:
+      - Path patterns (contain '.' or '*'): match the full dotted path from the
+        root passed to apply_lora, e.g. "decoder.layers.*.self_attn.q".
+        Uses fnmatch so '*' matches any single path segment.
+      - Leaf names (no '.' or '*'): match the immediate child key only
+        (legacy behaviour used by qwen3_tts, personaplex, etc.).
     """
+    import fnmatch
     patched = 0
 
-    # MLX stores children via module.children() which returns a nested dict
     children = module.children()
     if not isinstance(children, dict):
         return 0
 
+    use_paths = any("." in t or "*" in t for t in targets)
+
     for key, val in children.items():
-        # Direct match: replace this child with LoRA wrapper
-        if key in targets:
+        full_path = f"{_path}.{key}" if _path else key
+
+        if use_paths:
+            is_target = any(fnmatch.fnmatch(full_path, t) for t in targets)
+        else:
+            is_target = key in targets
+
+        if is_target:
             if isinstance(val, nn.QuantizedLinear):
                 try:
                     setattr(module, key, QLoRALinear.from_quantized(val, rank, alpha, dropout))
                     patched += 1
                 except Exception as e:
-                    print(f"[lora] Warning: could not patch QuantizedLinear '{key}': {e}")
+                    print(f"[lora] Warning: could not patch QuantizedLinear '{full_path}': {e}")
             elif isinstance(val, nn.Linear):
                 setattr(module, key, LoRALinear.from_linear(val, rank, alpha, dropout))
                 patched += 1
 
-        # Recurse into sub-modules
         elif isinstance(val, nn.Module):
-            patched += _recursive_patch(val, targets, rank, alpha, dropout)
+            patched += _recursive_patch(val, targets, rank, alpha, dropout, full_path)
 
-        # Recurse into lists of modules
         elif isinstance(val, list):
-            for item in val:
+            for i, item in enumerate(val):
                 if isinstance(item, nn.Module):
-                    patched += _recursive_patch(item, targets, rank, alpha, dropout)
+                    patched += _recursive_patch(item, targets, rank, alpha, dropout, f"{full_path}.{i}")
 
     return patched
 
