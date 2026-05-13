@@ -41,6 +41,10 @@ test_output_v2/
 test_output_v3/
 test_output*/
 
+# Downloaded / converted model weights (large binaries, not for git)
+out/
+model/
+
 # Logs
 *.log
 
