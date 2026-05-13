@@ -305,7 +305,11 @@ Compact 118M speech-to-speech model ported from [jingyaogong/minimind-o](https:/
 # First run: downloads + converts weights automatically
 python scripts/minimind_o_test_text.py
 
-# Push-to-talk mic demo
+# Web demo (chat UI with streaming audio + sample images for vision)
+pip install flask flask-cors flask-sock
+python scripts/minimind_o_web_demo.py   # open http://localhost:7860
+
+# Push-to-talk mic demo (terminal)
 python scripts/minimind_o_mic_demo.py
 
 # Verify weight conversion is correct

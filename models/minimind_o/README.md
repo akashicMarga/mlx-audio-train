@@ -67,6 +67,60 @@ models/minimind_o/
     vad.py               — SileroVAD + RealtimeSession (always-on streaming)
 ```
 
+## Web Demo
+
+An interactive browser UI with streaming text + audio playback, mic recording, image upload, and 6 built-in sample images for quick vision testing.
+
+```bash
+# Install server deps (one-time)
+pip install flask flask-cors flask-sock
+
+# Launch (auto-detects weights, SenseVoice, Mimi, SigLIP2)
+python scripts/minimind_o_web_demo.py
+
+# Open in browser
+open http://localhost:7860
+```
+
+**Optional flags:**
+
+```bash
+# Disable SenseVoice (text + image only, faster startup)
+python scripts/minimind_o_web_demo.py --sensevoice ""
+
+# Custom port
+python scripts/minimind_o_web_demo.py --port 8080
+
+# Tune streaming (larger chunk = less CPU, more latency)
+python scripts/minimind_o_web_demo.py --audio_chunk_frames 8
+```
+
+**Features:**
+- **Sidebar sample images** — 6 pre-loaded images (cat, dog, pizza, Eiffel Tower, mountain, coffee). Click one to attach it and auto-fill a suggested question.
+- **Mic recording** — click the mic button to start/stop; audio is sent to SenseVoice for encoding.
+- **Image upload** — attach any image from disk via the image button.
+- **Streaming audio** — Mimi codes are decoded and played in real-time as they arrive (no waiting for the full response).
+- **Multi-turn history** — conversation context is maintained across turns (configurable via `--max_history_turns`).
+- **Settings panel** — temperature, top-p, max tokens, adjustable per session.
+
+**Status badges** in the header show which components loaded (green = active):
+
+| Badge | What it means |
+|-------|---------------|
+| SenseVoice | Mic input enabled — speech is encoded to Thinker features |
+| Mimi | Audio output enabled — responses include synthesised speech |
+| Vision | Image input enabled — SigLIP2-p32-256 loaded |
+
+If Vision is grey, download the vision encoder first:
+```bash
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('google/siglip2-base-patch32-256', local_dir='./model/siglip2_p32')
+"
+```
+
+---
+
 ## Scripts
 
 ```bash
