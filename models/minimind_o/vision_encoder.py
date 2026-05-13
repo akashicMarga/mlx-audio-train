@@ -156,6 +156,7 @@ class SiglipVisionEncoder(nn.Module):
 def load_siglip2_mlx(model_dir: str) -> tuple[SiglipVisionEncoder, SiglipImageProcessor]:
     """
     Load SigLIP2 weights from safetensors into an MLX SiglipVisionEncoder.
+    Auto-detects patch size from the conv weight shape.
     Returns (encoder, preprocessor).
     """
     from safetensors import numpy as sf
@@ -166,8 +167,30 @@ def load_siglip2_mlx(model_dir: str) -> tuple[SiglipVisionEncoder, SiglipImagePr
 
     raw = sf.load_file(str(sf_path))
 
-    # Build model with default params (siglip2-base-patch16-256)
-    model = SiglipVisionEncoder()
+    # Auto-detect architecture from weight shapes
+    conv_w   = raw["vision_model.embeddings.patch_embedding.weight"]  # (out, in, kH, kW)
+    pos_w    = raw["vision_model.embeddings.position_embedding.weight"]
+    patch_size   = conv_w.shape[2]           # kH (= kW for square patches)
+    num_patches  = pos_w.shape[0]            # e.g. 64 for p32-256, 256 for p16-256
+    hidden       = conv_w.shape[0]
+    image_size   = int(num_patches ** 0.5) * patch_size  # e.g. 8*32 = 256
+    num_layers   = sum(1 for k in raw if k.startswith("vision_model.encoder.layers.")
+                       and k.endswith(".layer_norm1.weight"))
+    mlp_key      = "vision_model.encoder.layers.0.mlp.fc1.weight"
+    intermediate = raw[mlp_key].shape[0]
+    heads        = 12  # standard for base models
+
+    print(f"  SigLIP2: patch={patch_size}, image={image_size}, "
+          f"patches={num_patches}, layers={num_layers}, hidden={hidden}")
+
+    model = SiglipVisionEncoder(
+        image_size=image_size,
+        patch_size=patch_size,
+        hidden=hidden,
+        heads=heads,
+        layers=num_layers,
+        intermediate=intermediate,
+    )
 
     # ---- patch_embedding: Conv2d weights are (out, in, kH, kW) in safetensors,
     #      MLX Conv2d expects (out, kH, kW, in)

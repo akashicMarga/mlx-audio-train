@@ -1,7 +1,10 @@
 # mlx-audio-train
 
-A **LoRA / QLoRA finetuning pipeline** for MLX TTS models on Apple Silicon.
-Supports **Qwen3-TTS**, **CSM**, and **PersonaPlex**, with two distinct training strategies.
+An **MLX audio experimentation hub** for Apple Silicon — covering LoRA/QLoRA finetuning of TTS models and inference-only speech/multimodal models.
+
+**Finetuning:** Qwen3-TTS (0.6B / 1.7B), PersonaPlex 7B, CSM/Sesame — two training pipelines (language adaptation + speaker cloning).
+
+**Inference:** MiniMind-O (speech-to-speech, 118M), Indic Parler-TTS (Hindi TTS).
 
 ---
 
@@ -269,14 +272,71 @@ No PyTorch dependency — uses `soundfile` + `scipy.signal`.
 
 ## Supported Models
 
-| Model | `model_type` | Status |
-|-------|-------------|--------|
-| Qwen3-TTS 0.6B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Working |
-| Qwen3-TTS 1.7B Base 8bit | `qwen3_tts` / `qwen3_tts_speaker` | Same pipeline, change `model_id` |
-| PersonaPlex 7B | `personaplex` | Working |
-| CSM (Sesame) | `csm` | Processor + loss implemented |
-| Kokoro | — | Planned |
-| Chatterbox | — | Planned |
+### TTS Finetuning (LoRA / QLoRA)
+
+These models are trainable via `scripts/train.py` with a YAML config:
+
+| Model | HF ID | `model_type` | Status |
+|-------|-------|-------------|--------|
+| **Qwen3-TTS 0.6B** | `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit` | `qwen3_tts` / `qwen3_tts_speaker` | Working |
+| **Qwen3-TTS 1.7B** | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` | `qwen3_tts` / `qwen3_tts_speaker` | Working (same pipeline, change `model_id`) |
+| **PersonaPlex 7B** | `mlx-community/personaplex` | `personaplex` | Working — full-duplex, Hindi LoRA adaptation |
+| **CSM / Sesame** | `mlx-community/csm-1b` | `csm` | Processor + loss implemented |
+| Kokoro | — | — | Planned |
+| Chatterbox | — | — | Planned |
+
+---
+
+### Inference-only Models
+
+These live under `models/` and have their own scripts. They are not trained via `scripts/train.py`.
+
+#### MiniMind-O — Speech-to-Speech (`models/minimind_o/`)
+
+Compact 118M speech-to-speech model ported from [jingyaogong/minimind-o](https://github.com/jingyaogong/minimind-o). Thinker (LM) + Talker (acoustic head) + SenseVoice + Mimi. Optionally handles image input via SigLIP2.
+
+| Input | Output | Notes |
+|-------|--------|-------|
+| Speech (mic) | Speech | Push-to-talk demo, SenseVoice → Mimi |
+| Text | Text + Speech | Thinker generates text; Talker generates Mimi codes simultaneously |
+| Image + Text | Text + Speech | SigLIP2-p32-256 (64 patch tokens), optional |
+
+```bash
+# First run: downloads + converts weights automatically
+python scripts/minimind_o_test_text.py
+
+# Push-to-talk mic demo
+python scripts/minimind_o_mic_demo.py
+
+# Verify weight conversion is correct
+python scripts/minimind_o_verify_alignment.py
+
+# Batch inference (text / audio / voice-clone modes)
+python scripts/minimind_o_eval.py --model_dir out/ --mode 0
+```
+
+See [`models/minimind_o/README.md`](models/minimind_o/README.md) for full documentation.
+
+---
+
+#### Indic Parler-TTS — Hindi TTS Inference (`models/indic_parler_tts/`)
+
+MLX port of Indic Parler-TTS optimised for Apple Silicon. Fixes sampling bugs from the upstream port and applies `@mx.compile`-decorated top-k/top-p kernels from `mlx_lm` for faster generation.
+
+| Input | Output | Notes |
+|-------|--------|-------|
+| Text (Hindi + description prompt) | Speech | Parler-style description-conditioned TTS |
+
+Performance after optimisation:
+- Short sentence: **2.5s audio in 4.1s** (was 0.3s audio in 7.7s — broken loop)
+- Long sentence: **5.1s audio in 3.9s** — generation time now scales with content length
+
+```python
+from models.indic_parler_tts import load_model, generate
+
+model, tokenizer = load_model("ai4bharat/indic-parler-tts")
+audio = generate(model, tokenizer, text="आज कैसे हो?", description="A female speaker...")
+```
 
 ---
 
