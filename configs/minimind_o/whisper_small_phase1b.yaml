@@ -1,0 +1,54 @@
+# MiniMind-O — Phase 1b: Whisper-small encoder, top-2 Thinker layers + projector
+#
+# Builds on Phase 1a. Loads the trained audio_proj checkpoint and then
+# continues training with the last 2 Thinker layers unfrozen.
+#
+# What's trainable:
+#   audio_proj        ~1.2M   (projector — already aligned from Phase 1a)
+#   model.layers[-1]  ~7.4M   (last Thinker layer)
+#   model.layers[-2]  ~7.4M   (second-to-last Thinker layer)
+#   model.norm        ~0.002M  (final RMSNorm)
+#   Total:            ~16M params
+#
+# Why Phase 1b:
+#   Phase 1a taught the projector to roughly map Whisper → Thinker space.
+#   Phase 1b lets the top Thinker layers fine-tune to audio-projected input,
+#   improving alignment without touching the lower layers that handle text.
+#
+# Run:
+#   python scripts/minimind_o_phase1b_train.py \
+#       --config configs/minimind_o/whisper_small_phase1b.yaml \
+#       --data   data/indic_train.parquet
+
+model:
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_talker_hidden_layers: 4
+  talker_hidden_size: 768
+  num_attention_heads: 8
+  num_key_value_heads: 4
+
+training:
+  mode: last2
+  freeze_backbone: last2    # unfreeze last 2 Thinker layers + norm
+  freeze_talker: true
+
+  # Warm-start from Phase 1a projector (leave empty to start fresh)
+  load_projector: ./out/fleurs_phase1a/audio_proj_epoch4.npz
+
+  epochs: 5
+  batch_size: 4
+  grad_accumulation: 4
+  learning_rate: 1.0e-4    # lower than Phase 1a — backbone layers need gentle nudging
+  grad_clip: 1.0
+  max_seq_len: 512
+
+  data_path: ./data/indicSUPERB_hindi/train.parquet
+
+  save_dir: ./out/minimind_o_whisper_phase1b
+  save_weight: sft_omni_whisper_phase1b
+  log_interval: 25
+  save_interval: 200

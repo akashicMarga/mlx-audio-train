@@ -319,7 +319,7 @@ python scripts/minimind_o_verify_alignment.py
 python scripts/minimind_o_eval.py --model_dir out/ --mode 0
 ```
 
-See [`models/minimind_o/README.md`](models/minimind_o/README.md) for full documentation.
+See [`models/minimind_o/README.md`](models/minimind_o/README.md) for full documentation and the multilingual → full-duplex development roadmap.
 
 ---
 

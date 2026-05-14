@@ -1,0 +1,46 @@
+# MiniMind-O — Phase 1b: MMS-300m + top Thinker layers
+#
+# Builds on Phase 1a checkpoint. Unfreezes the last 2 Thinker layers so
+# the model learns to generate Indic language text and audio.
+#
+# Run:
+#   python scripts/minimind_o_train.py \
+#       --config configs/minimind_o/mms_phase1b.yaml \
+#       --from_weight ./out/minimind_o_mms_phase1a/sft_omni_mms_proj_768.pth
+#
+# Expected training time: ~1 day on M2 Max with 10K samples
+# Expected data size: 10K+ samples for good Indic coverage
+
+model:
+  audio_encoder_type: mms-300m
+  audio_encoder_path: facebook/mms-300m
+
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_talker_hidden_layers: 4
+  talker_hidden_size: 768
+  num_attention_heads: 8
+  num_key_value_heads: 4
+
+training:
+  # Phase 1b: projector + last 2 Thinker layers
+  mode: full
+  freeze_backbone: last2          # freeze all except last 2 layers + norm
+  freeze_talker: false            # also train Talker for Indic audio output
+
+  epochs: 10
+  batch_size: 4
+  grad_accumulation: 8            # effective batch = 32
+  learning_rate: 2.0e-4           # lower LR — fine-tuning pretrained layers
+  grad_clip: 1.0
+  max_seq_len: 512
+  scheduled_sampling: 0.05
+
+  data_path: ./data/indic_train.parquet
+  tokenizer_path: ""
+  num_workers: 2
+
+  save_dir: ./out/minimind_o_mms_phase1b
+  save_weight: sft_omni_mms_indic
+  log_interval: 50
+  save_interval: 500

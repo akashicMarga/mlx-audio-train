@@ -2,6 +2,50 @@
 
 MLX port of [jingyaogong/minimind-o](https://github.com/jingyaogong/minimind-o) — a compact speech-to-speech model with optional vision input, running natively on Apple Silicon.
 
+## Config-driven architecture
+
+**Every architectural decision comes from a YAML config file. No code changes needed to swap components.**
+
+```yaml
+# configs/minimind_o/mms_phase1a.yaml
+model:
+  audio_encoder_type: mms-300m    # ← change this one line to swap the encoder
+  audio_encoder_path: facebook/mms-300m
+  hidden_size: 768
+
+training:
+  mode: audio_proj                # ← change this to control what trains
+  freeze_backbone: all
+  epochs: 5
+  data_path: ./data/indic_train.parquet
+```
+
+```bash
+# Run any configuration — no code changes
+python scripts/minimind_o_train.py --config configs/minimind_o/mms_phase1a.yaml
+
+# Override individual fields from CLI
+python scripts/minimind_o_train.py --config configs/minimind_o/mms_phase1a.yaml --epochs 10 --lr 2e-4
+```
+
+**What is config-controlled:**
+
+| Config field | Effect |
+|---|---|
+| `model.audio_encoder_type` | Which encoder loads: `sensevoice` / `wav2vec2-base` / `wav2vec2-large` / `mms-300m` / `mms-1b` |
+| `model.audio_hidden_size` | Projector `in_dim` — auto-resolved from encoder type if `0` |
+| `training.mode` | What trains: `audio_proj` / `vision_proj` / `full` |
+| `training.freeze_backbone` | Thinker freeze: `all` / `none` / `last1` / `last2` |
+| `training.freeze_talker` | Whether Talker is frozen |
+| `training.learning_rate` | Optimizer LR |
+| `training.epochs` | Training duration |
+
+**Adding a new encoder** requires only two steps — no model code changes:
+1. Add its hidden size to `AUDIO_ENCODER_HIDDEN_SIZES` in `config.py`
+2. Add a loader function in `speech_encoder.py` and a branch in `load_audio_encoder()`
+
+---
+
 ## Architecture
 
 ```
@@ -256,4 +300,118 @@ OmniConfig(
     bridge_layer=3,              # which Thinker layer feeds the Talker
     spk_emb_size=192,            # CAM++ embedding dim
 )
+```
+
+---
+
+## Roadmap — Multilingual → Full-Duplex S2S
+
+The goal is to evolve MiniMind-O from a Chinese-first single-turn speech model into a multilingual, full-duplex Indian language speech assistant. Four phases, each buildable independently.
+
+---
+
+### Phase 1a — Swap ASR Encoder (SenseVoice → MMS / wav2vec2)
+
+**Goal:** Validate multilingual Indian language understanding with minimal training (projector-only, ~1.2M params). No backbone changes.
+
+**Why:** SenseVoice is strong on Chinese/Japanese but weak on Indian languages. Meta's MMS supports 1000+ languages including all major Indian ones; wav2vec2-large has strong Indic representations.
+
+| File | Change |
+|------|--------|
+| `models/minimind_o/speech_encoder.py` | Add `load_wav2vec2(path)` and `load_mms(path)` — freeze all encoder weights. Add `Wav2Vec2AudioProcessor` wrapper (16kHz → features, output dim 1024). Keep `load_sensevoice()` — encoder type switchable. |
+| `models/minimind_o/config.py` | Add `audio_encoder_type: str = "sensevoice"` (options: `sensevoice`, `mms`, `wav2vec2`). Drive `audio_hidden_size` from encoder type (512 for SenseVoice, 1024 for MMS-large). |
+| `models/minimind_o/projectors.py` | Read `in_dim` from config instead of hardcoded 512. |
+| `models/minimind_o/model.py` | Switch encoder load based on `config.audio_encoder_type`. Everything downstream unchanged. |
+| `configs/minimind_o_mms.yaml` | `audio_encoder_type: mms`, `audio_hidden_size: 1024`, `freeze_backbone: all`, `mode: audio_proj` |
+| `scripts/minimind_o_train.py` | Add `--audio-encoder` CLI arg to override config. |
+
+**Training:** Projector only. ~100–500 steps, minutes on M2.
+
+---
+
+### Phase 1b — Indian Language Data Alignment
+
+**Goal:** Fine-tune Thinker top layers on Indian language audio-text pairs so the model can reason and respond in Indic languages.
+
+| File | Change |
+|------|--------|
+| `scripts/minimind_o_train.py` | Add `freeze_backbone: last2` mode — unfreeze last 2 Thinker layers + norm. |
+| `models/minimind_o/dataset.py` | Support AI4Bharat / IndicTTS dataset format. Handle multiple language sources in one JSONL. |
+| `scripts/prepare_indic_dataset.py` | Download + convert AI4Bharat IndicTTS → MiniMind-O Parquet format. Output: `data/indic_train.parquet`. |
+
+**Training:** Projector + last 2 Thinker layers. ~1 day on M2 Max with 10K samples.
+
+**Data:** [AI4Bharat IndicTTS](https://github.com/AI4Bharat/IndicTTS) — 10K+ samples across Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali.
+
+---
+
+### Phase 2a — Mimi as Input Encoder (Single Codec In + Out)
+
+**Goal:** Replace SenseVoice with the causal Mimi encoder — same codec for input and output. Enables true streaming input (process audio as it arrives, no buffering), lower latency, and architectural simplicity. The Thinker already understands Mimi code space from the Talker side — convergence should be fast.
+
+| File | Change |
+|------|--------|
+| `models/minimind_o/model.py` | Add Mimi encoder path: raw audio → `mimi.encode()` → 8 codebook IDs → embedding lookup → Thinker. Remove `audio_encoder` + `audio_proj` when `use_mimi_input=True`. |
+| `models/minimind_o/config.py` | Add `use_mimi_input: bool = False`. |
+| `scripts/preprocess_mimi_input.py` | Pre-encode user-side audio to Mimi codes (like `preprocess_dataset.py` does for Qwen3-TTS). Saves `.mimi_input.npy` alongside audio. |
+| `models/minimind_o/dataset.py` | Load pre-encoded Mimi input codes when `use_mimi_input=True`. Pass as `user_audio_codes`. |
+| `models/minimind_o/vad.py` | Add chunk-streaming path — process Mimi frames as they arrive (80ms chunks). |
+
+**Training:** Input embedding layer + Thinker. ~1–2 days.
+
+---
+
+### Phase 2b — Full Duplex (Moshi-style, No VAD)
+
+**Goal:** Interleaved dual-stream training — model speaks while listening, no explicit turn-taking, no VAD gating. Closest to how humans actually converse.
+
+| File | Change |
+|------|--------|
+| `models/minimind_o/model.py` | New `forward_duplex()`: two simultaneous Mimi streams (user + model). Interleaved sequence: `[u_t0, m_t0, u_t1, m_t1, ...]` at 12.5Hz. Model predicts next `m_t` conditioned on all prior tokens. |
+| `models/minimind_o/dataset.py` | New `DuplexDataset` — loads two-channel conversation Parquet. Each row: `{user_mimi_codes, model_mimi_codes, text}` frame-aligned. |
+| `scripts/minimind_o_duplex_train.py` | Training loop with `forward_duplex()`. Loss on model-stream only — no backprop through user stream. |
+| `models/minimind_o/vad.py` | Simplify `RealtimeSession` — remove VAD gating, process every 80ms unconditionally. |
+| `scripts/prepare_duplex_dataset.py` | Convert single-speaker pairs to interleaved duplex format. Synthetic duplex: TTS question + TTS answer, interleave with overlap simulation. |
+
+**Training:** Full model on duplex data. Days to weeks depending on dataset size.
+
+**Data (hardest part):** No large Indian language duplex corpus exists publicly. Realistic path: synthetic generation — TTS the question in Speaker A's voice, TTS the answer in Speaker B's voice, interleave with 200–500ms overlap at turn boundaries. Target 50K+ pairs for Phase 2b.
+
+---
+
+## Data Requirements per Phase
+
+| Phase | What you need | Source | Min size |
+|-------|--------------|--------|----------|
+| 1a | Any multilingual audio-text pairs | AI4Bharat, IndicSUPERB, CommonVoice | ~1K samples |
+| 1b | Indian language TTS pairs (text + audio) | AI4Bharat IndicTTS | ~10K samples |
+| 2a | Same as 1b, Mimi pre-encoded | Same | Same |
+| 2b | **Duplex conversations** (two simultaneous streams) | Synthetic or telephone corpus | 50K+ pairs |
+
+---
+
+## Scratch Training vs Fine-tuning
+
+The upstream minimind-o was trained from scratch on a 3090 (24GB VRAM). On Apple Silicon the equivalent is M2 Max (32–96GB unified memory). Key differences:
+
+| | From scratch | Fine-tune from upstream checkpoint |
+|---|---|---|
+| Data needed | 100K–1M samples | 1K–10K samples |
+| Time (M2 Max) | Weeks | Hours–days |
+| Control | Full — your architecture choices | Constrained to upstream design |
+| Best for | Phase 2b (duplex requires it) | Phase 1a, 1b, 2a |
+
+For Phases 1a–2a, **fine-tuning from the upstream checkpoint is strongly recommended**. Scratch training only makes sense for Phase 2b where the architecture changes fundamentally (duplex forward pass, no SenseVoice dependency).
+
+---
+
+## Branch Strategy
+
+```
+main
+ └─ phase-1a-mms-encoder       # swap SenseVoice → MMS, train projector
+     └─ phase-1b-indic-align   # unfreeze last 2 Thinker layers, Indic data
+         └─ phase-2a-mimi-in   # Mimi input codec, streaming
+             └─ phase-2b-duplex # full duplex, new forward pass
+```
 ```

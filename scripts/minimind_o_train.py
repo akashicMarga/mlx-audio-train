@@ -32,6 +32,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
 from models.minimind_o import MiniMindOmni, OmniConfig
+from models.minimind_o.config import OmniTrainingConfig, load_config_yaml
 from models.minimind_o.dataset import OmniDataset
 
 
@@ -147,16 +148,20 @@ def train(args):
     log(f"Loading tokenizer from {args.tokenizer_path} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
-    config = OmniConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        use_moe=bool(args.use_moe),
-    )
+    # Use full OmniConfig from YAML if available, else build from flat CLI args
+    if getattr(args, "omni_config", None) is not None:
+        config = args.omni_config
+    else:
+        config = OmniConfig(
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_hidden_layers,
+            use_moe=bool(args.use_moe),
+        )
 
-    log("Building model ...")
+    log(f"Building model [{config.audio_encoder_type} encoder, {config.audio_hidden_size}d] ...")
     model = MiniMindOmni(
         config,
-        audio_encoder_path=args.audio_encoder_dir,
+        audio_encoder_path=getattr(args, "audio_encoder_dir", "") or "",
         vision_model_path=args.vision_dir or None,
     )
 
@@ -170,12 +175,25 @@ def train(args):
 
     if args.freeze_backbone == "all":
         model.model.freeze()
-        log("Frozen: entire thinker backbone")
+        log("Frozen: entire Thinker backbone")
     elif args.freeze_backbone == "last1":
         model.model.freeze()
         model.model.layers[-1].unfreeze()
         model.model.norm.unfreeze()
-        log("Frozen: all thinker layers except last 1")
+        log("Frozen: all Thinker layers except last 1")
+    elif args.freeze_backbone == "last2":
+        model.model.freeze()
+        for layer in model.model.layers[-2:]:
+            layer.unfreeze()
+        model.model.norm.unfreeze()
+        log("Frozen: all Thinker layers except last 2")
+
+    # Apply freeze_talker from training config (config-driven path)
+    train_cfg = getattr(args, "omni_config", None)  # reuse namespace for flag
+    freeze_talker = getattr(args, "freeze_talker", False)
+    if freeze_talker:
+        model.talker.freeze()
+        log("Frozen: Talker")
 
     if args.mode == "audio_proj":
         model.freeze()
@@ -258,36 +276,114 @@ def _save(model: MiniMindOmni, config: OmniConfig, args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI — config-driven entry point
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="MiniMind-O training (MLX)")
-    parser.add_argument("--save_dir", default="out", type=str)
-    parser.add_argument("--save_weight", default="sft_omni", type=str)
-    parser.add_argument("--epochs", default=15, type=int)
-    parser.add_argument("--batch_size", default=8, type=int)
-    parser.add_argument("--learning_rate", default=5e-4, type=float)
-    parser.add_argument("--num_workers", default=2, type=int)
-    parser.add_argument("--grad_clip", default=1.0, type=float)
-    parser.add_argument("--log_interval", default=100, type=int)
-    parser.add_argument("--save_interval", default=1000, type=int)
-    parser.add_argument("--hidden_size", default=768, type=int)
+    parser = argparse.ArgumentParser(
+        description="MiniMind-O training (MLX) — config-driven",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config-driven usage (recommended):
+  python scripts/minimind_o_train.py --config configs/minimind_o/mms_phase1a.yaml
+
+All architecture + training decisions come from the YAML. CLI flags override individual fields.
+
+Example configs:
+  configs/minimind_o/sensevoice_baseline.yaml  — SenseVoice, full SFT
+  configs/minimind_o/mms_phase1a.yaml          — MMS-300m, projector only (Phase 1a)
+  configs/minimind_o/mms_phase1b.yaml          — MMS-300m, top layers (Phase 1b)
+  configs/minimind_o/wav2vec2_base.yaml        — wav2vec2-base, projector only
+        """
+    )
+
+    # ── Config file (primary) ─────────────────────────────────────────────────
+    parser.add_argument("--config", default="", type=str,
+                        help="Path to YAML config file (recommended). CLI flags override.")
+
+    # ── CLI overrides (optional — take priority over YAML) ───────────────────
+    parser.add_argument("--data_path",       default="", type=str)
+    parser.add_argument("--tokenizer_path",  default="", type=str)
+    parser.add_argument("--from_weight",     default="", type=str,
+                        help="Path to .pth checkpoint to start from")
+    parser.add_argument("--save_dir",        default="", type=str)
+    parser.add_argument("--audio_encoder",   default="", type=str,
+                        help="Override audio_encoder_type from config")
+    parser.add_argument("--mode",            default="", type=str,
+                        choices=["", "audio_proj", "vision_proj", "full"],
+                        help="Override training.mode from config")
+    parser.add_argument("--freeze_backbone", default="", type=str,
+                        choices=["", "none", "all", "last1", "last2"],
+                        help="Override training.freeze_backbone from config")
+    parser.add_argument("--epochs",          default=0, type=int)
+    parser.add_argument("--lr",              default=0.0, type=float)
+    parser.add_argument("--batch_size",      default=0, type=int)
+
+    # ── Legacy flat-arg mode (no --config, backward compat) ──────────────────
+    parser.add_argument("--save_weight",     default="sft_omni", type=str)
+    parser.add_argument("--num_workers",     default=2, type=int)
+    parser.add_argument("--grad_clip",       default=1.0, type=float)
+    parser.add_argument("--log_interval",    default=100, type=int)
+    parser.add_argument("--save_interval",   default=1000, type=int)
+    parser.add_argument("--hidden_size",     default=768, type=int)
     parser.add_argument("--num_hidden_layers", default=8, type=int)
-    parser.add_argument("--max_seq_len", default=512, type=int)
-    parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1])
-    parser.add_argument("--data_path", default="dataset/train_t2a_mini.parquet", type=str)
-    parser.add_argument("--audio_encoder_dir", default="./model/SenseVoiceSmall", type=str)
-    parser.add_argument("--vision_dir", default=None, type=str)
-    parser.add_argument("--tokenizer_path", default="./model", type=str)
-    parser.add_argument("--from_weight", default="llm", type=str)
-    parser.add_argument(
-        "--freeze_backbone", default="none", type=str, choices=["none", "all", "last1"]
-    )
-    parser.add_argument(
-        "--mode", default="all", type=str, choices=["all", "audio_proj", "vision_proj"]
-    )
-    args = parser.parse_args()
+    parser.add_argument("--max_seq_len",     default=512, type=int)
+    parser.add_argument("--use_moe",         default=0, type=int, choices=[0, 1])
+    parser.add_argument("--audio_encoder_dir", default="", type=str)
+    parser.add_argument("--vision_dir",      default=None, type=str)
+
+    cli = parser.parse_args()
+
+    if cli.config:
+        # ── Config-driven path ────────────────────────────────────────────────
+        omni_cfg, train_cfg = load_config_yaml(cli.config)
+
+        # Apply CLI overrides on top of YAML
+        if cli.data_path:       train_cfg.data_path       = cli.data_path
+        if cli.tokenizer_path:  train_cfg.tokenizer_path  = cli.tokenizer_path
+        if cli.save_dir:        train_cfg.save_dir         = cli.save_dir
+        if cli.mode:            train_cfg.mode             = cli.mode
+        if cli.freeze_backbone: train_cfg.freeze_backbone  = cli.freeze_backbone
+        if cli.epochs > 0:      train_cfg.epochs           = cli.epochs
+        if cli.lr > 0:          train_cfg.learning_rate    = cli.lr
+        if cli.batch_size > 0:  train_cfg.batch_size       = cli.batch_size
+        if cli.audio_encoder:   omni_cfg.audio_encoder_type = cli.audio_encoder
+
+        log(f"Config: {cli.config}")
+        log(f"  encoder={omni_cfg.audio_encoder_type} ({omni_cfg.audio_hidden_size}d)"
+            f"  mode={train_cfg.mode}  freeze={train_cfg.freeze_backbone}")
+
+        # Bridge to legacy train() function via argparse namespace
+        import types
+        args = types.SimpleNamespace(
+            save_dir=train_cfg.save_dir,
+            save_weight=train_cfg.save_weight,
+            epochs=train_cfg.epochs,
+            batch_size=train_cfg.batch_size,
+            learning_rate=train_cfg.learning_rate,
+            num_workers=train_cfg.num_workers,
+            grad_clip=train_cfg.grad_clip,
+            log_interval=train_cfg.log_interval,
+            save_interval=train_cfg.save_interval,
+            hidden_size=omni_cfg.hidden_size,
+            num_hidden_layers=omni_cfg.num_hidden_layers,
+            max_seq_len=train_cfg.max_seq_len,
+            use_moe=int(omni_cfg.use_moe),
+            data_path=train_cfg.data_path,
+            audio_encoder_dir=omni_cfg.audio_encoder_path,
+            vision_dir=cli.vision_dir,
+            tokenizer_path=train_cfg.tokenizer_path,
+            from_weight=cli.from_weight or "none",
+            freeze_backbone=train_cfg.freeze_backbone,
+            mode=train_cfg.mode,
+            # Pass the full OmniConfig so train() can use it directly
+            omni_config=omni_cfg,
+        )
+    else:
+        # ── Legacy flat-arg path (backward compat) ────────────────────────────
+        args = cli
+        args.omni_config = None   # train() will build OmniConfig from individual args
+
     train(args)
 
 

@@ -81,9 +81,27 @@ def load_models(args):
     model  = MiniMindOmni(config, audio_encoder_path="")
     weights = [(k, mx.array(v)) for k, v in np.load(weights_path, allow_pickle=False).items()]
     model.load_weights(weights, strict=False)
+
+    # ── Overlay fine-tuned checkpoint if provided ─────────────────────────────
+    ckpt_dir = args.checkpoint
+    if ckpt_dir and os.path.exists(ckpt_dir):
+        import glob as _glob
+        for npz_path in sorted(_glob.glob(os.path.join(ckpt_dir, "*.npz"))):
+            name = os.path.basename(npz_path).replace(".npz", "")
+            npz_w = [(k, mx.array(v)) for k, v in np.load(npz_path, allow_pickle=False).items()]
+            if name == "audio_proj":
+                model.audio_proj.load_weights(npz_w, strict=False)
+            elif name.startswith("thinker_layer"):
+                idx = int(name.replace("thinker_layer", ""))
+                model.model.layers[idx].load_weights(npz_w, strict=False)
+            elif name == "thinker_norm":
+                model.model.norm.load_weights(npz_w, strict=False)
+        print(f"  Checkpoint loaded from {ckpt_dir}")
+
     model.eval()
     M["model"]  = model
     M["config"] = config
+    M["encoder_type"] = args.encoder
     print("OK")
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
@@ -139,6 +157,21 @@ def load_models(args):
     else:
         M["sensevoice"] = None
 
+    # ── Whisper encoder (alternative to SenseVoice) ──────────────────────────
+    if args.encoder.startswith("whisper"):
+        try:
+            from models.minimind_o.config import OmniConfig as _OC
+            from models.minimind_o.speech_encoder import load_whisper
+            _cfg = _OC(audio_encoder_type=args.encoder)
+            whisper_enc, _ = load_whisper(_cfg.audio_encoder_path, args.encoder)
+            M["whisper_enc"] = whisper_enc
+            print(f"Whisper OK  ({args.encoder})")
+        except Exception as e:
+            M["whisper_enc"] = None
+            print(f"Whisper MISSING: {e} — mic input disabled")
+    else:
+        M["whisper_enc"] = None
+
     # ── MLX SigLIP2 vision encoder ───────────────────────────────────────────
     if args.vision_dir and os.path.exists(args.vision_dir):
         try:
@@ -161,19 +194,32 @@ def load_models(args):
 # ---------------------------------------------------------------------------
 
 def encode_audio_mlx(wav_np: np.ndarray) -> mx.array:
-    """wav (16kHz float32 numpy) → (T, hidden) MLX audio features.
+    """wav (16kHz float32 numpy) → (T, hidden) projected MLX features.
 
-    Shape contract: returns (T, hidden_size).
-    - T   = number of encoder frames (depends on audio length, typically 20–200)
-    - hidden_size = 768 (Thinker hidden dim after audio_proj)
-    Caller uses shape[0] (T) to build the <|audio_pad|> prompt tokens.
+    Dispatches on M["encoder_type"]:
+      sensevoice  — SenseVoice fbank → encoder → audio_proj
+      whisper-*   — Whisper mel → encoder → audio_proj
+    Returns (T, hidden_size=768).
     """
-    sv = M["sensevoice"]
-    audio_mx = mx.array(wav_np.astype(np.float32))
-    feats   = sv._extract_features(audio_mx)        # (T_fbank, 560)
-    enc_out = sv.encoder(feats[None])               # (1, T, 512)
-    mx.eval(enc_out)
-    projected = M["model"].audio_proj(enc_out)[0]   # drop batch dim → (T, 768)
+    enc_type = M.get("encoder_type", "sensevoice")
+
+    if enc_type.startswith("whisper"):
+        whisper_enc = M.get("whisper_enc")
+        if whisper_enc is None:
+            raise RuntimeError("Whisper encoder not loaded")
+        enc_np, _ = whisper_enc(wav_np)          # (1, T, 768) numpy, no grad
+        enc_mx = mx.array(enc_np)               # (1, T, 768)
+        projected = M["model"].audio_proj(enc_mx)[0]  # (T, 768)
+    else:
+        sv = M["sensevoice"]
+        if sv is None:
+            raise RuntimeError("SenseVoice encoder not loaded")
+        audio_mx = mx.array(wav_np.astype(np.float32))
+        feats   = sv._extract_features(audio_mx)      # (T_fbank, 560)
+        enc_out = sv.encoder(feats[None])             # (1, T, 512)
+        mx.eval(enc_out)
+        projected = M["model"].audio_proj(enc_out)[0] # (T, 768)
+
     mx.eval(projected)
     assert projected.ndim == 2, f"encode_audio_mlx: expected (T, hidden), got {projected.shape}"
     return projected
@@ -272,11 +318,10 @@ def chat():
         prompt_text = text
         transcript = ""   # speech-to-text transcript for multi-turn history
 
-        if audio_b64 and M.get("sensevoice"):
+        has_audio_enc = M.get("sensevoice") is not None or M.get("whisper_enc") is not None
+        if audio_b64 and has_audio_enc:
             try:
                 # Browser sends WebM/Opus — pydub handles any format via ffmpeg.
-                # soundfile alone can't decode WebM, which was causing silent failures
-                # and the model falling back to generic "How can I help you?" greetings.
                 from pydub import AudioSegment
                 raw = base64.b64decode(audio_b64)
                 seg = (AudioSegment.from_file(io.BytesIO(raw))
@@ -290,8 +335,7 @@ def chat():
                 if rms > 1e-6:
                     wav = wav * (0.1 / rms)
 
-                # Get SenseVoice transcript — used for multi-turn history so the
-                # model has a text record of what was said in previous turns
+                # Transcript: SenseVoice if available, else Whisper ASR
                 sv = M.get("sensevoice")
                 if sv is not None:
                     try:
@@ -300,18 +344,22 @@ def chat():
                         transcript = result.text.strip()
                     except Exception:
                         transcript = ""
+                elif M.get("whisper_enc") is not None:
+                    try:
+                        import mlx_whisper
+                        transcript = mlx_whisper.transcribe(
+                            wav,
+                            path_or_hf_repo=M["args"].encoder.replace("whisper-", "mlx-community/whisper-") + "-mlx",
+                            language="hi",
+                            verbose=False,
+                        )["text"].strip()
+                    except Exception:
+                        transcript = ""
 
                 mlx_audio_feats = [encode_audio_mlx(wav)]
-                n_feat = mlx_audio_feats[0].shape[0]  # T audio frames — NOT shape[1] (=768=hidden)
-                print(f"[audio] wav={len(wav)/16000:.1f}s  frames={n_feat}", flush=True)
+                n_feat = mlx_audio_feats[0].shape[0]  # T frames, NOT hidden size
+                print(f"[audio] wav={len(wav)/16000:.1f}s  frames={n_feat}  transcript={transcript[:40]}", flush=True)
 
-                # Prompt sent to the model this turn:
-                # <|audio_pad|> * T  → actual speech features injected here
-                # + typed text if any
-                # NOTE: we deliberately do NOT append the transcript here.
-                # SenseVoice English ASR is noisy (e.g. "Eiffel" → "i felt"), so
-                # putting the garbled transcript into the model prompt causes
-                # repetition loops. The transcript is only shown to the user in the UI.
                 audio_prompt = config.audio_special_token * n_feat
                 prompt_text = audio_prompt + (f"\n\n{text}" if text else "")
 
@@ -335,9 +383,14 @@ def chat():
         try:
             prompt_str = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
-            prompt_str = f"<s>user\n{prompt_text}</s><s>assistant\n"
+            # MiniMind tokenizer has no chat_template — use its native format
+            bos, eos = tok.bos_token, tok.eos_token
+            prompt_str = ""
+            for m in messages:
+                prompt_str += f"{bos}{m['role']}\n{m['content']}{eos}\n"
+            prompt_str += f"{bos}assistant\n"
 
-        input_ids = mx.array(tok(prompt_str).input_ids, dtype=mx.int32)[None, :]
+        input_ids = mx.array(tok(prompt_str, add_special_tokens=False).input_ids, dtype=mx.int32)[None, :]
 
         # ── Generate ─────────────────────────────────────────────────────────
         frames: list = []
@@ -363,17 +416,22 @@ def chat():
                 mlx_audio_feats=mlx_audio_feats,
                 mlx_vision_feats=mlx_vision_feats,
             ):
-                # Text token
+                # Text token — y contains only generated tokens (not input)
                 if y is not None:
-                    n_tokens = y.shape[1]  # (batch=1, seq_len) — seq_len = tokens generated
+                    n_tokens = y.shape[1]
                     if text_ttft is None:
                         text_ttft = (time.time() - t0) * 1000
                         yield sse({"type": "ttft", "text_ttft": round(text_ttft, 1)})
                     decoded = tok.decode(y[0].tolist(), skip_special_tokens=True)
-                    if decoded and len(decoded) > len(full_text):
-                        delta = decoded[len(full_text):]
-                        full_text = decoded
-                        yield sse({"type": "text", "content": delta})
+                    # Strip U+FFFD replacement chars — they appear for partial byte-pair
+                    # tokens (e.g. Hindi chars tokenised as [0xE0 0xA4] + [0xBx]) and
+                    # would break the len() comparison, masking valid characters.
+                    clean = decoded.replace('�', '')
+                    if len(clean) > len(full_text):
+                        delta = clean[len(full_text):]
+                        full_text = clean
+                        if delta:
+                            yield sse({"type": "text", "content": delta})
 
                 # Audio frame
                 if af and all(c < config.audio_stop_token for c in af):
@@ -442,6 +500,10 @@ def main():
 
     p = argparse.ArgumentParser(description="MiniMind-O Web Demo (MLX)")
     p.add_argument("--weights", default="", help="Path to weights.npz (auto-detected if empty)")
+    p.add_argument("--checkpoint", default="",
+                   help="Phase 1b checkpoint dir to overlay (e.g. out/fleurs_phase1b/epoch2)")
+    p.add_argument("--encoder", default="sensevoice",
+                   help="Audio encoder: sensevoice | whisper-small | whisper-base (default: sensevoice)")
     p.add_argument("--sensevoice", default="mlx-community/SenseVoiceSmall",
                    help="SenseVoice HF repo for mic input (pass '' to disable)")
     p.add_argument("--vision_dir", default=os.path.join(repo_root, "model", "siglip2_p32"),

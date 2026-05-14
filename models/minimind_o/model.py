@@ -28,7 +28,7 @@ import numpy as np
 
 from models.minimind_o.config import OmniConfig
 from models.minimind_o.projectors import MMAudioProjector, MMVisionProjector
-from models.minimind_o.speech_encoder import load_sensevoice
+from models.minimind_o.speech_encoder import load_audio_encoder
 from models.minimind_o.talker import TalkerModule
 from models.minimind_o.thinker import MiniMindModel
 
@@ -117,11 +117,15 @@ class MiniMindOmni(nn.Module):
     def __init__(
         self,
         config: Optional[OmniConfig] = None,
-        audio_encoder_path: str = "./model/SenseVoiceSmall",
+        audio_encoder_path: str = "",   # overrides config.audio_encoder_path when set
         vision_model_path: Optional[str] = None,
     ):
         super().__init__()
         self.config = config or OmniConfig()
+
+        # Override encoder path from constructor arg (for backward compat)
+        if audio_encoder_path:
+            self.config.audio_encoder_path = audio_encoder_path
 
         self.model = MiniMindModel(self.config)  # kept as "model" to match weight keys
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
@@ -131,13 +135,16 @@ class MiniMindOmni(nn.Module):
 
         self.talker = TalkerModule(self.config)
 
+        # Projector in_dim comes from config.audio_hidden_size which is auto-resolved
+        # from audio_encoder_type — changing the encoder type in config.yaml is enough
         self.audio_proj = MMAudioProjector(self.config.audio_hidden_size, self.config.hidden_size)
         self.vision_proj = MMVisionProjector(self.config.image_hidden_size, self.config.hidden_size)
 
+        # Audio encoder: config-driven dispatch — no code change needed to swap encoders
         self.audio_encoder = None
         self.audio_processor = None
-        if audio_encoder_path:
-            self.audio_encoder, self.audio_processor = load_sensevoice(audio_encoder_path)
+        if self.config.audio_encoder_path:
+            self.audio_encoder, self.audio_processor = load_audio_encoder(self.config)
 
         self.vision_encoder = None
         self.vision_processor = None
@@ -169,8 +176,14 @@ class MiniMindOmni(nn.Module):
         self, audio_inputs, audio_lens=None
     ) -> Optional[List[Optional[mx.array]]]:
         """
-        audio_inputs: torch.Tensor (batch, T, 560) fbank features
-        Returns list of mx.array per batch item (or None for empty items).
+        Encode audio through the configured encoder → project → return per-item features.
+
+        audio_inputs shape depends on encoder type:
+          sensevoice:     torch.Tensor (batch, T, 560)  — fbank features
+          wav2vec2 / mms: torch.Tensor (batch, T_samples) — raw 16kHz waveform
+
+        Returns list[mx.array (T, hidden)] per batch item, or None.
+        The downstream injection and projector are encoder-agnostic.
         """
         import torch
 
@@ -179,33 +192,56 @@ class MiniMindOmni(nn.Module):
         if not audio_inputs.any():
             return None
 
-        batch_mask = audio_inputs.flatten(1).any(1)
-        enc_dtype = next(self.audio_encoder.parameters()).dtype
-        valid_fbank = audio_inputs[batch_mask].to(dtype=enc_dtype)
+        from models.minimind_o.config import WHISPER_ENCODER_TYPES
+        enc_type   = self.config.audio_encoder_type
+        batch_size = audio_inputs.size(0)
 
-        if audio_lens is not None:
-            valid_lens = audio_lens[batch_mask].to(valid_fbank.device)
+        if enc_type == "sensevoice":
+            # SenseVoice: fbank (B, T_fbank, 560) + lengths
+            batch_mask = audio_inputs.flatten(1).any(1)
+            try:
+                enc_dtype = next(iter(self.audio_encoder.encoder.parameters())).dtype
+            except Exception:
+                enc_dtype = torch.float32
+            valid_inputs = audio_inputs[batch_mask].to(dtype=enc_dtype)
+            valid_lens   = audio_lens[batch_mask] if audio_lens is not None else \
+                           torch.tensor([valid_inputs.size(1)] * valid_inputs.size(0))
+            enc_np, _    = self.audio_encoder(valid_inputs, valid_lens)
+            valid_count  = int(batch_mask.sum())
+
+        elif enc_type in WHISPER_ENCODER_TYPES:
+            # Whisper: raw 16kHz waveform (B, T_samples) — encoder handles mel internally
+            # Process each item individually (variable length)
+            batch_mask   = audio_inputs.abs().flatten(1).any(1)
+            valid_inputs = audio_inputs[batch_mask]
+            enc_out_list = []
+            for i in range(valid_inputs.size(0)):
+                wav_np       = valid_inputs[i].float().cpu().numpy()
+                out_np, _    = self.audio_encoder(wav_np)  # (1, T_speech, H)
+                enc_out_list.append(out_np[0])             # (T_speech, H)
+            enc_np      = np.stack(enc_out_list)           # (valid, T_speech, H) — same length since all trimmed to speech
+            valid_count = int(batch_mask.sum())
+
         else:
-            valid_lens = torch.tensor(
-                [valid_fbank.size(1)] * valid_fbank.size(0), device=valid_fbank.device
-            )
-
-        with torch.no_grad():
-            enc_out, _ = self.audio_encoder(valid_fbank, valid_lens)  # (valid, T, 512)
+            # wav2vec2 / MMS: raw waveform (B, T_samples)
+            batch_mask   = audio_inputs.abs().flatten(1).any(1)
+            valid_inputs = audio_inputs[batch_mask]
+            valid_lens_arg = audio_lens[batch_mask] if audio_lens is not None else None
+            enc_np, _    = self.audio_encoder(valid_inputs, valid_lens_arg)
+            valid_count  = int(batch_mask.sum())
 
         emb_list: List[mx.array] = []
-        for i in range(enc_out.size(0)):
-            length = max(1, min(int(valid_lens[i].item()), enc_out.size(1)))
-            feat_np = enc_out[i, :length].float().cpu().numpy()  # (T, 512)
-            feat_mx = mx.array(feat_np)[None, ...]                # (1, T, 512)
-            projected = self.audio_proj(feat_mx).squeeze(0)       # (T, hidden)
+        for i in range(valid_count):
+            feat_np = enc_np[i].astype(np.float32)        # (T, H)
+            feat_mx = mx.array(feat_np)[None, ...]        # (1, T, H)
+            projected = self.audio_proj(feat_mx).squeeze(0)  # (T, hidden)
             emb_list.append(projected)
 
         if batch_mask.all():
             return emb_list
-        out: List[Optional[mx.array]] = [None] * audio_inputs.size(0)
+        out: List[Optional[mx.array]] = [None] * batch_size
         j = 0
-        for i in range(audio_inputs.size(0)):
+        for i in range(batch_size):
             if batch_mask[i]:
                 out[i] = emb_list[j]
                 j += 1

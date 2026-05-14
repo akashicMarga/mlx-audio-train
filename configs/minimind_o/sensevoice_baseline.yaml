@@ -1,0 +1,47 @@
+# MiniMind-O — SenseVoice baseline (default upstream config)
+#
+# Audio encoder: SenseVoice-Small (MLX-native, Chinese/Japanese/Korean primary)
+# Use this to reproduce upstream behaviour or fine-tune on Chinese speech data.
+#
+# Run:
+#   python scripts/minimind_o_train.py --config configs/minimind_o/sensevoice_baseline.yaml
+
+model:
+  audio_encoder_type: sensevoice
+  audio_encoder_path: mlx-community/SenseVoiceSmall
+  # audio_hidden_size: 512  ← auto-resolved from encoder type, no need to set
+
+  # Thinker / Talker (match upstream checkpoint)
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_talker_hidden_layers: 4
+  talker_hidden_size: 768
+  num_attention_heads: 8
+  num_key_value_heads: 4
+
+  # Vision (optional — comment out if not needed)
+  image_token_len: 64
+  image_hidden_size: 768
+
+training:
+  # Phase: full SFT on existing data
+  mode: full
+  freeze_backbone: none
+  freeze_talker: false
+
+  epochs: 15
+  batch_size: 4
+  grad_accumulation: 4            # effective batch = 16
+  learning_rate: 5.0e-4
+  grad_clip: 1.0
+  max_seq_len: 512
+  scheduled_sampling: 0.05
+
+  data_path: ./data/minimind_o_train.parquet
+  tokenizer_path: ""              # empty = auto-detected from HF cache
+  num_workers: 2
+
+  save_dir: ./out/minimind_o_sensevoice
+  save_weight: sft_omni
+  log_interval: 50
+  save_interval: 500

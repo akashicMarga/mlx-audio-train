@@ -1,0 +1,38 @@
+# MiniMind-O — wav2vec2-base encoder, projector-only
+#
+# Audio encoder: facebook/wav2vec2-base-960h (768d, English-primary)
+# Use this as a stepping stone before MMS if you only need English.
+#
+# Run:
+#   python scripts/minimind_o_train.py --config configs/minimind_o/wav2vec2_base.yaml
+
+model:
+  audio_encoder_type: wav2vec2-base
+  audio_encoder_path: facebook/wav2vec2-base-960h
+  # audio_hidden_size: 768  ← auto-resolved
+
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_talker_hidden_layers: 4
+  talker_hidden_size: 768
+
+training:
+  mode: audio_proj
+  freeze_backbone: all
+  freeze_talker: true
+
+  epochs: 5
+  batch_size: 4
+  grad_accumulation: 4
+  learning_rate: 5.0e-4
+  grad_clip: 1.0
+  max_seq_len: 512
+
+  data_path: ./data/train.parquet
+  tokenizer_path: ""
+  num_workers: 2
+
+  save_dir: ./out/minimind_o_wav2vec2
+  save_weight: sft_omni_wav2vec2
+  log_interval: 25
+  save_interval: 200

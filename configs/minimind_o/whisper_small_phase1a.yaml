@@ -1,0 +1,51 @@
+# MiniMind-O — Phase 1a: Whisper-small encoder, projector-only training
+#
+# Audio encoder: whisper-small (MLX-native, truly multilingual, 768d)
+# Trains ONLY the audio projector (~1.2M params). Everything else frozen.
+#
+# Why whisper-small:
+#   - Truly multilingual — no per-language adapters (unlike MMS)
+#   - MLX-native via mlx_whisper — no PyTorch needed
+#   - 768d output = matches Thinker hidden size exactly, projector is lightweight
+#   - Excellent Hindi/Indic coverage from multilingual pre-training
+#   - One pip install: pip install mlx-whisper
+#
+# Run:
+#   python scripts/minimind_o_train.py --config configs/minimind_o/whisper_small_phase1a.yaml
+#
+# Expected training time: ~100-500 steps, minutes on M2 Max
+# Expected data size: 1K+ samples sufficient for projector alignment
+
+model:
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+  # audio_hidden_size: 768  ← auto-resolved, projector will be 768→768
+
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_talker_hidden_layers: 4
+  talker_hidden_size: 768
+  num_attention_heads: 8
+  num_key_value_heads: 4
+
+training:
+  mode: audio_proj
+  freeze_backbone: all
+  freeze_talker: true
+
+  epochs: 5
+  batch_size: 4
+  grad_accumulation: 4
+  learning_rate: 5.0e-4
+  grad_clip: 1.0
+  max_seq_len: 512
+  scheduled_sampling: 0.05
+
+  data_path: ./data/indicSUPERB_hindi/train.parquet
+  tokenizer_path: ""
+  num_workers: 2
+
+  save_dir: ./out/minimind_o_whisper_phase1a
+  save_weight: sft_omni_whisper_proj
+  log_interval: 25
+  save_interval: 200
