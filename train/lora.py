@@ -135,6 +135,8 @@ DEFAULT_TARGETS = {
     "chatterbox": ["q_proj", "k_proj", "v_proj", "out_proj"],
     # PersonaPlex: LoRA on attention projections only; depformer is fully trainable
     "personaplex": ["in_proj", "out_proj"],
+    # LFM 2.5 Audio: LoRA on the LFM backbone transformer layers only
+    "lfm_audio":  ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "default":    ["q_proj", "k_proj", "v_proj", "o_proj"],
 }
 
@@ -146,6 +148,8 @@ DEFAULT_SCOPE = {
     "kokoro":     None,              # patch all
     "chatterbox": None,
     "personaplex": "transformer",    # main transformer only, not depformer
+    # LFM: scope to model.lfm to avoid patching audio_encoder / audio_head
+    "lfm_audio":  "lfm",
     "default":    None,
 }
 
