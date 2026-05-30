@@ -2,7 +2,7 @@
 """
 train.py — Universal MLX TTS finetuning entry point.
 
-Supports: qwen3_tts | csm | kokoro | chatterbox | personaplex  (model_type in config)
+Supports: qwen3_tts | csm | kokoro | chatterbox | personaplex | lfm_audio  (model_type in config)
 
 Usage:
     # Qwen3-TTS Hindi LoRA
@@ -136,6 +136,20 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
         ))
         collate_fn = collate_csm
 
+    elif model_type == "lfm_audio":
+        from data.processors.lfm_audio import LFMAudioProcessor, LFMAudioProcessorConfig, collate_lfm_audio
+        # Reuse pre-loaded LFM processor from model if available
+        lfm_proc = getattr(model, "processor", None) if model is not None else None
+        processor = LFMAudioProcessor(LFMAudioProcessorConfig(
+            model_id         = cfg["model"]["model_id"],
+            max_text_len     = proc_cfg.get("max_text_len",      256),
+            max_audio_frames = proc_cfg.get("max_audio_frames",  512),
+            training_mode    = proc_cfg.get("training_mode",     "tts"),
+            system_prompt    = proc_cfg.get("system_prompt",     "You are a text-to-speech assistant."),
+            processor        = lfm_proc,
+        ))
+        collate_fn = collate_lfm_audio
+
     elif model_type == "indic_parler_tts":
         from data.processors.indic_parler import (
             IndicParlerProcessor, IndicParlerProcessorConfig, IndicParlerDataset,
@@ -165,7 +179,7 @@ def build_dataset(cfg: dict, split: str = "train", model=None):
         return dataset, loader
 
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, qwen3_tts_speaker, csm, personaplex, indic_parler_tts")
+        raise ValueError(f"Unknown model_type: {model_type}. Supported: qwen3_tts, qwen3_tts_speaker, csm, lfm_audio, personaplex, indic_parler_tts")
 
     dataset = TTSDataset(ds_config, processor=processor)
     loader  = BatchIterator(
@@ -228,6 +242,12 @@ def load_model(cfg: dict):
         model = mlx_load(model_id)
         return model
 
+    elif model_type == "lfm_audio":
+        from mlx_audio.sts.utils import load_model as sts_load
+        print(f"[train] Loading LFM 2.5 Audio from: {model_id}")
+        model = sts_load(model_id)
+        return model
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -270,6 +290,23 @@ def build_loss_fn(cfg: dict):
         label_smoothing = cfg["trainer"].get("label_smoothing", 0.0)
         def loss_fn(model, batch):
             return parler_tts_loss(model, batch, label_smoothing=label_smoothing)
+        return loss_fn
+
+    elif model_type == "lfm_audio":
+        from train.losses.lfm_audio_loss import lfm_audio_tts_loss, lfm_audio_asr_loss
+        label_smoothing   = cfg["trainer"].get("label_smoothing",   0.0)
+        text_loss_weight  = cfg["trainer"].get("text_loss_weight",  0.0)
+        training_mode     = cfg.get("processor", {}).get("training_mode", "tts")
+        if training_mode == "asr":
+            def loss_fn(model, batch):
+                return lfm_audio_asr_loss(model, batch, label_smoothing=label_smoothing)
+        else:
+            def loss_fn(model, batch):
+                return lfm_audio_tts_loss(
+                    model, batch,
+                    label_smoothing=label_smoothing,
+                    text_loss_weight=text_loss_weight,
+                )
         return loss_fn
 
     else:
@@ -350,6 +387,16 @@ def run_smoke_test(model, loss_fn, cfg: dict):
         batch = {
             "input_tokens":  mx.array(input_tokens),
             "target_tokens": mx.array(target_tokens),
+        }
+    elif model_type == "lfm_audio":
+        # LFM 2.5 Audio: text_ids + audio_codes [B, T, 8] + masks
+        batch = {
+            "text_ids":      mx.array(np.random.randint(0, 1000, (2, 20),     dtype=np.int32)),
+            "audio_codes":   mx.array(np.random.randint(0, 2049, (2, 50, 8),  dtype=np.int32)),
+            "text_lengths":  mx.array(np.array([20, 18], dtype=np.int32)),
+            "audio_lengths": mx.array(np.array([50, 45], dtype=np.int32)),
+            "text_mask":     mx.array(np.ones((2, 20), dtype=bool)),
+            "audio_mask":    mx.array(np.ones((2, 50), dtype=bool)),
         }
     else:
         batch = {
@@ -486,7 +533,16 @@ def main():
     # Freeze model-specific submodules that must not be trained.
     # PersonaPlex: freeze_non_trainable() already handled this inside apply_lora.
     # Other models: freeze speech_tokenizer (gc_func breaks value_and_grad) + speaker_encoder.
-    if model_type != "personaplex":
+    if model_type == "lfm_audio":
+        # Freeze audio_encoder (ConformerEncoder) and audio_head (Depthformer).
+        # LoRA is applied only to model.lfm (the LFM transformer backbone).
+        for attr in ("audio_encoder", "audio_head", "audio_embedding", "depth_embeddings",
+                     "depth_linear", "audio_adapter", "detokenizer"):
+            sub = getattr(model, attr, None)
+            if sub is not None:
+                sub.freeze()
+                print(f"[train] Froze model.{attr}")
+    elif model_type != "personaplex":
         always_freeze = ["speech_tokenizer"]
         if model_type != "qwen3_tts_speaker":
             always_freeze.append("speaker_encoder")

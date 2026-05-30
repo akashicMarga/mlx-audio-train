@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LFM 2.5 Audio 1.5B — TTS Fine-tuning Config
+# Model: LiquidAI/LFM2.5-Audio-1.5B (8-bit quantized MLX port)
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/LFM2.5-Audio-1.5B-8bit"
+  model_type: "lfm_audio"
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  # LoRA on the LFM transformer backbone attention + MLP layers.
+  # Scope is limited to "lfm" (see train/lora.py DEFAULT_SCOPE) to avoid
+  # patching the ConformerEncoder (audio encoder) or audio embeddings.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/train.jsonl"
+  val_jsonl:   "./data/val.jsonl"
+  target_sr:    24000          # Mimi codec expects 24kHz
+  min_duration: 1.0
+  max_duration: 15.0
+  normalize: true
+  trim: true
+  max_samples: null            # set to e.g. 200 for a quick test run
+
+trainer:
+  output_dir: "./checkpoints/lfm-audio"
+  run_name:   "lfm2.5-1.5b-tts-lora-r8"
+
+  # Training duration
+  num_epochs: 10
+  max_steps: null
+
+  # Memory: batch_size=1 is safe on M-series with this model size.
+  # Effective batch = batch_size × grad_accumulation.
+  batch_size: 1
+  grad_accumulation: 16       # effective batch = 16
+
+  # Optimizer
+  learning_rate: 2.0e-5
+  weight_decay:  0.01
+  grad_clip:     1.0
+
+  # LR schedule
+  warmup_steps:  50
+  lr_schedule:   "cosine"
+
+  # Checkpointing
+  save_every_n_steps:  200
+  save_every_n_epochs: 1
+  keep_last_n:         3
+
+  # Validation
+  eval_every_n_steps: 100
+  val_batches:        10
+
+  # Logging
+  log_every_n_steps: 10
+  log_file: "./checkpoints/lfm-audio/train_log.jsonl"
+
+  sort_by_length: true
+  prefetch:       2
+
+  label_smoothing: 0.0
+
+  # Optional: add a small weight to the auxiliary text CE loss during TTS training.
+  # 0.0 = train on audio codes only (recommended for TTS).
+  text_loss_weight: 0.0
+
+processor:
+  max_text_len:    256
+  max_audio_frames: 512      # ~41 s at 12.5 Hz (Mimi codec)
+  training_mode:   "tts"     # "tts" | "asr"
+  system_prompt:   "You are a text-to-speech assistant."

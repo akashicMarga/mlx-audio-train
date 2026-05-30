@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LFM 2.5 Audio 1.5B — ASR Fine-tuning on OHF-Voice
+#
+# Mirrors the official Liquid4All cookbook:
+#   github.com/Liquid4All/cookbook/tree/main/examples/voice-assistant
+#
+# Dataset: Paulescu/OHF-Voice-audio-20260504  (55 K audio/function-call pairs)
+# Task:    ASR — audio → function call string (e.g. "HassStartTimer|$minutes=5")
+#
+# Prepare dataset:
+#   python scripts/prepare_ohf_voice.py --output-dir data/ohf_voice
+#   python scripts/preprocess_lfm_audio.py \
+#       --input data/ohf_voice/train.jsonl \
+#       --model-id mlx-community/LFM2.5-Audio-1.5B-8bit \
+#       --save-mel
+#
+# Train:
+#   python scripts/train.py --config configs/lfm_audio_asr.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/LFM2.5-Audio-1.5B-8bit"
+  model_type: "lfm_audio"
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  # LoRA on the LFM transformer backbone only.
+  # ConformerEncoder (audio_encoder) stays frozen — its weights are already
+  # trained on speech and do not need adaptation for a new domain.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/ohf_voice/train.jsonl"
+  val_jsonl:   "./data/ohf_voice/val.jsonl"
+  target_sr:    24000        # Mimi codec + WAV files are at 24kHz
+  min_duration: 0.5
+  max_duration: 20.0
+  normalize: true
+  trim: true
+  max_samples: null          # set to e.g. 1000 for a quick test run
+
+trainer:
+  output_dir: "./checkpoints/lfm-audio-asr"
+  run_name:   "lfm2.5-1.5b-asr-lora-r8"
+
+  # Official cookbook: 10 000 steps, batch 32 on A100.
+  # On Apple Silicon: smaller batch + more accumulation.
+  num_epochs: 5
+  max_steps: 10000           # set null to train for full num_epochs
+
+  batch_size: 1
+  grad_accumulation: 32      # effective batch = 32 (matches official)
+
+  # Official cookbook: lr=5e-5, warmup=250
+  learning_rate: 5.0e-5
+  weight_decay:  0.01
+  grad_clip:     1.0
+
+  warmup_steps:  250
+  lr_schedule:   "cosine"
+
+  save_every_n_steps:  500
+  save_every_n_epochs: 1
+  keep_last_n:         3
+
+  eval_every_n_steps: 100
+  val_batches:        20     # official: validate on 5% of train split
+
+  log_every_n_steps: 10
+  log_file: "./checkpoints/lfm-audio-asr/train_log.jsonl"
+
+  sort_by_length: true
+  prefetch:       2
+
+  label_smoothing: 0.0
+
+processor:
+  max_text_len:    512       # function-call strings are short; 512 is safe
+  max_audio_frames: 512      # ~41 s at 12.5 Hz
+  training_mode:   "asr"     # audio → text prediction
+  system_prompt:   "Perform ASR."   # matches official cookbook exactly
