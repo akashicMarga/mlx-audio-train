@@ -1,0 +1,59 @@
+# OmniVox — Phase 1b: projector + top-N Sarvam layers (audio → text)
+#
+# Builds on Phase 1a. Unfreezes the top N backbone layers + final norm to give
+# the LM itself a chance to adapt to Hindi audio features.
+#
+# Trainable (default N=2):
+#   audio_proj              ~5.8M   (already aligned from Phase 1a)
+#   backbone.layers[-1]     ~50M    (last Sarvam-1 layer)
+#   backbone.layers[-2]     ~50M    (second-to-last)
+#   backbone.norm           ~2K     (final RMSNorm)
+#   Total:                  ~106M
+#
+# IMPORTANT: Phase 1b requires fp16 backbone for weight updates.
+#   Use a non-quantized Sarvam-1 MLX model or convert from 4-bit.
+#
+# Run:
+#   python scripts/omnivox_phase1b_train.py \
+#       --config    configs/omnivox/sarvam_phase1b.yaml \
+#       --projector /Users/akashsingh/Documents/exps/omnivox_sarvam_phase1a/audio_proj_epoch5.npz
+
+model:
+  # NOTE: switch to fp16 Sarvam-1 for Phase 1b. The 4-bit version can't be updated.
+  backbone_path: mlx-community/sarvam-1-4bit  # TODO: convert to fp16 MLX
+  backbone_arch: llama
+
+  hidden_size:       2048
+  vocab_size:        68096
+  num_hidden_layers: 28
+  bridge_layer:      23
+
+  audio_pad_id:        3
+  audio_pad_token_str: "<<reserved_token_0>>"
+
+  rms_norm_eps: 1.0e-6
+  bos_token: "<s>"
+  eos_token: "</s>"
+
+  talker_hidden_size:   2048
+  num_attention_heads:  16
+  num_key_value_heads:  8
+
+training:
+  mode: last2
+  unfreeze_top_layers: 2
+
+  data_path:     /Users/akashsingh/Documents/exps/fleurs_hindi/train.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/fleurs_hindi/val.parquet
+
+  load_projector: /Users/akashsingh/Documents/exps/omnivox_sarvam_phase1a/audio_proj_epoch5.npz
+
+  epochs:            5
+  batch_size:        1
+  grad_accumulation: 4
+  learning_rate:     5.0e-5
+  grad_clip:         1.0
+  max_seq_len:       512
+
+  save_dir: /Users/akashsingh/Documents/exps/omnivox_sarvam_phase1b
+  log_interval:  25

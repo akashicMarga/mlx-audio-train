@@ -1,0 +1,62 @@
+# OmniVox — Phase 1a: projector alignment (Sarvam-1 backbone)
+#
+# Goal: teach MMAudioProjector(768→2048) to map Whisper-small features into
+# Sarvam-1 2B's embedding space so the frozen backbone can predict the
+# matching Hindi text tokens.
+#
+# What's trainable (~5.8M params):
+#   audio_proj.ln   (LayerNorm, 768)
+#   audio_proj.fc1  (768 → 2048)
+#   audio_proj.fc2  (2048 → 2048)
+#
+# Backbone: 4-bit quantized Sarvam-1 is fine for Phase 1a (frozen).
+# Gradients flow through the quantized layers without updating them.
+#
+# Run:
+#   python scripts/omnivox_phase1a_train.py \
+#       --config   configs/omnivox/sarvam_phase1a.yaml \
+#       --data     /Users/akashsingh/Documents/exps/fleurs_hindi/train.parquet \
+#       --val-data /Users/akashsingh/Documents/exps/fleurs_hindi/val.parquet
+
+model:
+  backbone_path: mlx-community/sarvam-1-4bit
+  backbone_arch: llama
+
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+  audio_hidden_size:  768
+
+  hidden_size:        2048
+  vocab_size:         68096
+  num_hidden_layers:  28
+  bridge_layer:       23
+
+  # Repurpose <<reserved_token_0>> (id=3) as audio_pad — in-vocab, no resize.
+  audio_pad_id:        3
+  audio_pad_token_str: "<<reserved_token_0>>"
+
+  rms_norm_eps: 1.0e-6
+  bos_token: "<s>"
+  eos_token: "</s>"
+
+  # Talker — matches backbone hidden (2048) and GQA ratio (16/8).
+  talker_hidden_size:   2048
+  num_attention_heads:  16
+  num_key_value_heads:  8
+
+training:
+  mode: audio_proj
+
+  data_path:     /Users/akashsingh/Documents/exps/fleurs_hindi/train.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/fleurs_hindi/val.parquet
+
+  epochs:            5
+  batch_size:        1
+  grad_accumulation: 4
+  learning_rate:     5.0e-4
+  grad_clip:         1.0
+  max_seq_len:       512
+
+  save_dir: /Users/akashsingh/Documents/exps/omnivox_sarvam_phase1a
+  log_interval:  25
+  save_interval: 200

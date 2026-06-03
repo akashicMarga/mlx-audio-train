@@ -56,11 +56,16 @@ def build_tokens_with_audio(
     tokenizer,
     bos_ids: list[int],
     eos_ids: list[int],
+    audio_pad_str: str = "<|audio_pad|>",
 ) -> tuple[list[int], list[int]]:
     """
     Build (token_ids, labels) for one sample.
-    The first user turn gets <|audio_pad|> × T_audio injected in place of text.
+    The first user turn gets `audio_pad_str` × T_audio injected in place of text.
     Labels are -100 everywhere except assistant turns.
+
+    audio_pad_str: the literal string that tokenizes to the configured audio_pad_id.
+        - Qwen2.5:  "<|audio_pad|>"  (added as additional_special_token)
+        - Sarvam-1: "<<reserved_token_0>>" (reuses existing reserved vocab slot, id=3)
     """
     bos = tokenizer.bos_token
     eos = tokenizer.eos_token
@@ -71,7 +76,7 @@ def build_tokens_with_audio(
         role    = turn["role"]
         content = turn["content"]
         if role == "user" and T_audio > 0 and not first_user_done:
-            content = "<|audio_pad|>" * T_audio
+            content = audio_pad_str * T_audio
             first_user_done = True
         prompt += f"{bos}{role}\n{content}{eos}\n"
 
@@ -163,6 +168,7 @@ def evaluate(
     bos_ids: list[int],
     eos_ids: list[int],
     max_samples: int = 200,
+    audio_pad_str: str = "<|audio_pad|>",
 ) -> float:
     """
     Compute average val loss on up to max_samples samples (no gradients).
@@ -183,7 +189,8 @@ def evaluate(
             mlx_projected = [proj[0]]
 
         token_ids, labels = build_tokens_with_audio(
-            sample["convs"], T_audio, tokenizer, bos_ids, eos_ids
+            sample["convs"], T_audio, tokenizer, bos_ids, eos_ids,
+            audio_pad_str=audio_pad_str,
         )
         ids  = mx.array([token_ids], dtype=mx.int32)
         labs = mx.array([labels],    dtype=mx.int32)
@@ -217,6 +224,7 @@ def generate_text_sample(
     bos_ids: list[int],
     eos_ids: list[int],
     max_new: int = 80,
+    audio_pad_str: str = "<|audio_pad|>",
 ) -> tuple[str, str]:
     """
     Greedily decode text from one val sample.
@@ -246,7 +254,7 @@ def generate_text_sample(
         role    = turn["role"]
         content = turn["content"]
         if role == "user" and T_audio > 0 and not first_user_done:
-            content = "<|audio_pad|>" * T_audio
+            content = audio_pad_str * T_audio
             first_user_done = True
         prompt += f"{bos}{role}\n{content}{eos}\n"
     prompt += f"{bos}assistant\n"
@@ -289,11 +297,13 @@ def save_text_samples(
     epoch: int,
     save_dir: str,
     n_samples: int = 5,
+    audio_pad_str: str = "<|audio_pad|>",
 ) -> None:
     """Generate text for n_samples val items and write to samples_epoch{N}.txt."""
     lines = [f"=== Epoch {epoch} Text Samples ===\n"]
     for i, sample in enumerate(val_samples[:n_samples]):
-        ref, gen = generate_text_sample(model, sample, tokenizer, bos_ids, eos_ids)
+        ref, gen = generate_text_sample(model, sample, tokenizer, bos_ids, eos_ids,
+                                         audio_pad_str=audio_pad_str)
         lines.append(f"[{i+1}] ref: {ref}")
         lines.append(f"[{i+1}] gen: {gen}")
         lines.append("")

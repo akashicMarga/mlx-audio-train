@@ -1,0 +1,61 @@
+# OmniVox — T2A: text → Mimi codes (Sarvam-1 backbone)
+#
+# Goal: train Talker + audio_proj to speak Hindi from Hindi text.
+# Backbone (Sarvam-1) stays frozen — it's the language model.
+# Once T2A converges, the Talker can speak any Hindi the backbone produces.
+#
+# What's trainable (~258M params):
+#   talker.*       ~252M   (4-layer Talker @ 2048d, 8 codebook heads)
+#   audio_proj     ~5.8M   (kept in loop so A2A can warm-start from this checkpoint)
+#   backbone.*     FROZEN
+#
+# Loss = text_loss + audio_loss (cross-entropy on next text token + 8 Mimi codes)
+#
+# Run:
+#   python scripts/omnivox_t2a_train.py \
+#       --config   configs/omnivox/sarvam_t2a.yaml \
+#       --data     /Users/akashsingh/Documents/exps/omnivox_t2a/train.parquet \
+#       --val-data /Users/akashsingh/Documents/exps/omnivox_t2a/val.parquet
+
+model:
+  backbone_path: mlx-community/sarvam-1-4bit
+  backbone_arch: llama
+
+  hidden_size:       2048
+  vocab_size:        68096
+  num_hidden_layers: 28
+  bridge_layer:      23
+
+  audio_pad_id:        3
+  audio_pad_token_str: "<<reserved_token_0>>"
+
+  rms_norm_eps: 1.0e-6
+  bos_token: "<s>"
+  eos_token: "</s>"
+
+  # Talker hidden size DECOUPLED from backbone — the backbone is 2048d but the
+  # Talker only needs ~1024d for acoustic prediction. The embed_proj (Linear
+  # 2048→1024) handles the dimension bridge. This shrinks the Talker from 252M
+  # → ~70M params (4× smaller), reduces overfit on tiny datasets, and gives
+  # 4× smaller checkpoints (~240MB vs 961MB).
+  talker_hidden_size:   1024
+  num_attention_heads:  8       # head_dim = 1024 / 8 = 128 (same as backbone)
+  num_key_value_heads:  4       # GQA ratio 2:1, same as backbone
+
+training:
+  mode: t2a
+
+  # v5: Hindi (1900) + Bhojpuri SYSPIN single-speaker (27322) = 29222 clips / 53.9h
+  data_path:     /Users/akashsingh/Documents/exps/omnivox_t2a_synth/train_v5.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/omnivox_t2a_synth/val.parquet
+
+  epochs:            20
+  batch_size:        1
+  grad_accumulation: 4
+  learning_rate:     2.0e-4
+  grad_clip:         1.0
+  max_seq_len:       512
+
+  save_dir: /Users/akashsingh/Documents/exps/omnivox_sarvam_t2a_v5
+  log_interval:  50
+  save_interval: 400

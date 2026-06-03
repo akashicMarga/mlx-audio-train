@@ -1,0 +1,55 @@
+# OmniVox — T2A: Hindi text → Mimi speech codes
+#
+# Trains Qwen2.5-0.5B + Talker to speak Hindi from Hindi text.
+# This is Phase 0 of the full S2S pipeline — must run before A2A.
+#
+# What's trainable (~60.9M):
+#   talker.*     ~59.4M  (all Talker layers, TalkerEmbedding, TalkerHead)
+#   audio_proj    ~1.5M  (included so A2A can warm-start from this checkpoint)
+#   qwen.*        FROZEN (Qwen2.5-0.5B backbone — already knows Hindi text)
+#
+# IMPORTANT: use fp16 backbone for T2A (Talker weight updates require full precision)
+#   mlx-community/Qwen2.5-0.5B-Instruct  (~1 GB, fp16)
+#
+# Prepare data first (one-time, ~5 min):
+#   python scripts/omnivox_prepare_t2a.py \
+#       --input    /Users/akashsingh/Documents/exps/hindi/train.jsonl \
+#       --audio-dir /Users/akashsingh/Documents/exps/hindi \
+#       --output   /Users/akashsingh/Documents/exps/omnivox_t2a/train.parquet
+#
+#   python scripts/omnivox_prepare_t2a.py \
+#       --input    /Users/akashsingh/Documents/exps/hindi/val.jsonl \
+#       --audio-dir /Users/akashsingh/Documents/exps/hindi \
+#       --output   /Users/akashsingh/Documents/exps/omnivox_t2a/val.parquet
+#
+# Then train:
+#   python scripts/omnivox_t2a_train.py \
+#       --config configs/omnivox/whisper_small_t2a.yaml
+
+model:
+  # 4-bit is fine for T2A — Qwen is frozen, only Talker trains (no Qwen weight updates)
+  # fp16 only needed in Phase 1b when Qwen top layers are actually updated.
+  backbone_path: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+  audio_hidden_size:  768
+
+  hidden_size:   896
+  bridge_layer:  20     # Qwen layer whose hidden states feed into Talker
+
+training:
+  mode: t2a
+
+  data_path:     /Users/akashsingh/Documents/exps/omnivox_t2a/train_merged.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/omnivox_t2a/val_merged.parquet
+
+  epochs:            15
+  batch_size:        1
+  grad_accumulation: 4
+  learning_rate:     5.0e-4
+  grad_clip:         1.0
+
+  save_dir: /Users/akashsingh/Documents/exps/omnivox_t2a_out
+  log_interval:  25
+  save_interval: 200

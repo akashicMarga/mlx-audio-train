@@ -1,0 +1,51 @@
+# OmniVox — Phase 1a: Projector alignment only
+#
+# Goal: teach MMAudioProjector(768→896) to map Whisper-small features into
+# Qwen2.5-0.5B's embedding space so the frozen Qwen can predict the matching
+# Hindi/Indic text tokens.
+#
+# What's trainable (~1.5M params):
+#   audio_proj.ln   (LayerNorm, 768)
+#   audio_proj.fc1  (768 → 896)
+#   audio_proj.fc2  (896 → 896)
+#
+# Backbone: 4-bit quantized Qwen2.5-0.5B is fine for Phase 1a.
+# Gradients flow THROUGH the frozen quantized layers to reach audio_proj —
+# they just don't UPDATE the quantized weights.
+#
+# Recommended data: FLEURS Hindi (clips ≤12s, ~8.9s mean — fits 400-frame budget)
+#   python scripts/minimind_o_prepare_fleurs.py --output data/fleurs_hindi
+#
+# Run:
+#   python scripts/omnivox_phase1a_train.py \
+#       --config configs/omnivox/whisper_small_phase1a.yaml \
+#       --data   data/fleurs_hindi/train.parquet \
+#       --val-data data/fleurs_hindi/val.parquet
+
+model:
+  # Qwen2.5-0.5B backbone (4-bit OK for Phase 1a — backbone is frozen)
+  backbone_path: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+
+  # Audio encoder
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+  audio_hidden_size:  768    # Whisper-small output dim
+
+  hidden_size: 896           # Qwen2.5-0.5B hidden dim — do not change
+
+training:
+  mode: audio_proj           # Phase 1a: projector only
+
+  data_path:     /Users/akashsingh/Documents/exps/fleurs_hindi/train.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/fleurs_hindi/val.parquet
+
+  epochs:            5
+  batch_size:        1       # effective batch via grad_accumulation
+  grad_accumulation: 4
+  learning_rate:     5.0e-4  # high LR fine for projector-only (small param space)
+  grad_clip:         1.0
+  max_seq_len:       512
+
+  save_dir: ./out/omnivox_phase1a
+  log_interval:  25
+  save_interval: 200

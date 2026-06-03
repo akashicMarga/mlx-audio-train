@@ -1,0 +1,53 @@
+# OmniVox — Phase 1b: Top-2 Qwen layers + projector fine-tuning
+#
+# Builds on Phase 1a. Loads the trained audio_proj checkpoint and continues
+# training with the top-2 Qwen2.5-0.5B layers + final norm unfrozen.
+#
+# What's trainable (~15.5M params):
+#   audio_proj          ~1.5M  (projector, warm-started from Phase 1a)
+#   qwen.model.layers[-1]  ~7M (last Qwen layer — adapts to audio-projected input)
+#   qwen.model.layers[-2]  ~7M (second-to-last)
+#   qwen.model.norm        ~1K (final RMSNorm)
+#
+# IMPORTANT — use fp16 backbone for Phase 1b:
+#   Phase 1a: 4-bit is fine (frozen backbone, only projector updates)
+#   Phase 1b: we update Qwen layers → need full-precision (fp16) weights
+#   Switch backbone_path to: mlx-community/Qwen2.5-0.5B-Instruct (~1 GB)
+#
+# Run:
+#   python scripts/omnivox_phase1b_train.py \
+#       --config    configs/omnivox/whisper_small_phase1b.yaml \
+#       --data      data/fleurs_hindi/train.parquet \
+#       --val-data  data/fleurs_hindi/val.parquet \
+#       --projector out/omnivox_phase1a/audio_proj_epoch5.npz
+
+model:
+  # fp16 backbone required for Phase 1b weight updates
+  backbone_path: mlx-community/Qwen2.5-0.5B-Instruct
+
+  audio_encoder_type: whisper-small
+  audio_encoder_path: mlx-community/whisper-small-mlx
+  audio_hidden_size:  768
+
+  hidden_size: 896
+
+training:
+  mode: last2                # Phase 1b: top-N Qwen layers + projector
+  unfreeze_top_layers: 2     # number of top Qwen layers to unfreeze
+
+  # Warm-start from Phase 1a projector (leave empty to start fresh)
+  load_projector: ./out/omnivox_phase1a/audio_proj_epoch5.npz
+
+  data_path:     /Users/akashsingh/Documents/exps/fleurs_hindi/train.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/fleurs_hindi/val.parquet
+
+  epochs:            5
+  batch_size:        1
+  grad_accumulation: 4
+  learning_rate:     1.0e-4  # lower than Phase 1a — backbone layers need gentle nudge
+  grad_clip:         1.0
+  max_seq_len:       512
+
+  save_dir: ./out/omnivox_phase1b
+  log_interval:  25
+  save_interval: 200
