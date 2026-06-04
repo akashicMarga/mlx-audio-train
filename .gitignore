@@ -53,3 +53,5 @@ checkpoints/
 
 #audio files
 *.wav
+
+evals/

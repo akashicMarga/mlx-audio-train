@@ -62,7 +62,15 @@ def extract_sample(row):
 
     Each row has an 'audio_chat' field: list of {role, content[]} dicts.
     The user turn contains audio, the assistant turn contains the text label.
+
+    The audio field may be:
+      - bytes:  raw WAV file (actual OHF-Voice format as of 2026-05)
+      - dict:   {"array": np.ndarray, "sampling_rate": int}
+      - object: with .array / .sampling_rate attrs (HF Audio feature)
     """
+    import io
+    import numpy as np
+
     audio_arr = None
     sr        = None
     text      = None
@@ -73,8 +81,13 @@ def extract_sample(row):
         for item in content:
             modality = item.get("modality", item.get("type", ""))
             if role == "user" and modality == "audio":
-                audio_data = item.get("audio", {})
-                if isinstance(audio_data, dict):
+                audio_data = item.get("audio")
+                if isinstance(audio_data, bytes):
+                    # Raw WAV bytes — decode with soundfile
+                    import soundfile as sf
+                    buf = io.BytesIO(audio_data)
+                    audio_arr, sr = sf.read(buf, dtype="float32")
+                elif isinstance(audio_data, dict):
                     audio_arr = audio_data.get("array")
                     sr        = audio_data.get("sampling_rate", 24000)
                 elif hasattr(audio_data, "array"):
@@ -165,7 +178,10 @@ def main():
             wav_path = wav_dir / f"{idx:06d}.wav"
             sf.write(str(wav_path), audio_np, args.sample_rate)
 
-            records.append({"audio": str(wav_path), "text": text.strip()})
+            # Store path relative to jsonl_path.parent (= out_dir) so that
+            # base_dataset.py's "base / audio" join resolves correctly.
+            rel_path = wav_path.relative_to(jsonl_path.parent)
+            records.append({"audio": str(rel_path), "text": text.strip()})
 
             if (idx + 1) % 500 == 0:
                 print(f"  [{split_name}] {idx+1}/{len(dataset)} processed ...")

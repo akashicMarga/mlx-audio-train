@@ -274,9 +274,11 @@ class Trainer:
                         out[k] = s
                 return out
             if isinstance(d, list):
-                out = [_strip_empty(v) for v in d]
-                out = [v for v in out if not _is_empty(v)]
-                return out
+                # Preserve list length — do NOT remove empty elements.
+                # For hybrid models (e.g. LFM Mamba+Transformer), non-LoRA
+                # layers produce {} gradient entries. Removing them compresses
+                # the list, breaking index alignment with model.trainable_parameters().
+                return [_strip_empty(v) for v in d]
             return d  # mx.array leaf
 
         def _inner_fn(params, batch):

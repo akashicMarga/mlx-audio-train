@@ -47,7 +47,7 @@ training:
 
   # v5: Hindi (1900) + Bhojpuri SYSPIN single-speaker (27322) = 29222 clips / 53.9h
   data_path:     /Users/akashsingh/Documents/exps/omnivox_t2a_synth/train_v5.parquet
-  val_data_path: /Users/akashsingh/Documents/exps/omnivox_t2a_synth/val.parquet
+  val_data_path: /Users/akashsingh/Documents/exps/omnivox_t2a_synth/val_syspin.parquet
 
   epochs:            20
   batch_size:        1

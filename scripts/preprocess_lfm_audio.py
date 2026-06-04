@@ -89,7 +89,7 @@ def encode_audio_codes(processor, audio, sr: int, target_sr: int = 24000):
     codes    = processor.tokenize_audio(audio_mx)    # [1, 8, T]
     mx.eval(codes)
     # Transpose to [T, 8]
-    return np.array(codes[0]).T.astype("int32")
+    return np.array(codes[0]).T.astype(np.int32)
 
 
 def encode_mel(processor, audio, sr: int, target_sr: int = 16000):
@@ -112,7 +112,7 @@ def encode_mel(processor, audio, sr: int, target_sr: int = 16000):
     audio_mx = mx.array(audio_f32)
     mel = processor.preprocess_audio(audio_mx)  # [T_mel, 128]
     mx.eval(mel)
-    return mel.astype("float32")
+    return np.array(mel, dtype=np.float32)  # convert mlx → numpy
 
 
 def main():
@@ -128,6 +128,7 @@ def main():
         input_path.stem + "_codes.jsonl"
     )
 
+    base    = input_path.parent  # resolve relative audio paths against JSONL dir
     lines   = input_path.read_text().strip().splitlines()
     records = [json.loads(l) for l in lines if l.strip()]
 
@@ -139,7 +140,14 @@ def main():
 
     for idx, rec in enumerate(records):
         audio_path = rec.get("audio", "")
-        if not audio_path or not Path(audio_path).exists():
+        if not audio_path:
+            print(f"  [{idx+1}/{len(records)}] SKIP: no audio path")
+            skipped += 1
+            out_lines.append(json.dumps(rec))
+            continue
+        # Resolve relative to JSONL parent so both absolute and relative paths work
+        audio_path = str(base / audio_path) if not Path(audio_path).is_absolute() else audio_path
+        if not Path(audio_path).exists():
             print(f"  [{idx+1}/{len(records)}] SKIP: audio not found: {audio_path}")
             skipped += 1
             out_lines.append(json.dumps(rec))
@@ -176,7 +184,7 @@ def main():
 
             if need_mel:
                 mel = encode_mel(processor, audio, sr, target_sr=16000)
-                np.save(str(mel_npy), np.array(mel))
+                np.save(str(mel_npy), mel)  # encode_mel already returns np.ndarray
 
             rec["codec_path"] = str(codec_npy)
             if need_mel:

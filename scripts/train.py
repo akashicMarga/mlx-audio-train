@@ -243,9 +243,10 @@ def load_model(cfg: dict):
         return model
 
     elif model_type == "lfm_audio":
-        from mlx_audio.sts.utils import load_model as sts_load
+        from mlx_audio.sts.models.lfm_audio import LFM2AudioModel
         print(f"[train] Loading LFM 2.5 Audio from: {model_id}")
-        model = sts_load(model_id)
+        model = LFM2AudioModel.from_pretrained(model_id)
+        mx.eval(model.parameters())
         return model
 
     else:
@@ -389,15 +390,25 @@ def run_smoke_test(model, loss_fn, cfg: dict):
             "target_tokens": mx.array(target_tokens),
         }
     elif model_type == "lfm_audio":
-        # LFM 2.5 Audio: text_ids + audio_codes [B, T, 8] + masks
-        batch = {
-            "text_ids":      mx.array(np.random.randint(0, 1000, (2, 20),     dtype=np.int32)),
-            "audio_codes":   mx.array(np.random.randint(0, 2049, (2, 50, 8),  dtype=np.int32)),
-            "text_lengths":  mx.array(np.array([20, 18], dtype=np.int32)),
-            "audio_lengths": mx.array(np.array([50, 45], dtype=np.int32)),
-            "text_mask":     mx.array(np.ones((2, 20), dtype=bool)),
-            "audio_mask":    mx.array(np.ones((2, 50), dtype=bool)),
-        }
+        training_mode = cfg.get("processor", {}).get("training_mode", "tts")
+        if training_mode == "asr":
+            # ASR: audio_features (mel) in, text tokens out
+            batch = {
+                "text_ids":       mx.array(np.random.randint(0, 1000, (2, 20),      dtype=np.int32)),
+                "audio_features": mx.array(np.zeros((2, 100, 128),                  dtype=np.float32)),
+                "text_lengths":   mx.array(np.array([20, 18],                        dtype=np.int32)),
+                "text_mask":      mx.array(np.ones((2, 20),                          dtype=bool)),
+            }
+        else:
+            # TTS: text conditioning in, audio codes [B, T, 8] out
+            batch = {
+                "text_ids":      mx.array(np.random.randint(0, 1000, (2, 20),     dtype=np.int32)),
+                "audio_codes":   mx.array(np.random.randint(0, 2049, (2, 50, 8),  dtype=np.int32)),
+                "text_lengths":  mx.array(np.array([20, 18], dtype=np.int32)),
+                "audio_lengths": mx.array(np.array([50, 45], dtype=np.int32)),
+                "text_mask":     mx.array(np.ones((2, 20), dtype=bool)),
+                "audio_mask":    mx.array(np.ones((2, 50), dtype=bool)),
+            }
     else:
         batch = {
             "text_ids":      mx.array(np.random.randint(0, 1000, (2, 20), dtype=np.int32)),
@@ -539,9 +550,16 @@ def main():
         for attr in ("audio_encoder", "audio_head", "audio_embedding", "depth_embeddings",
                      "depth_linear", "audio_adapter", "detokenizer"):
             sub = getattr(model, attr, None)
-            if sub is not None:
+            if sub is None:
+                continue
+            if isinstance(sub, list):
+                # depth_embeddings is a list of nn.Module items
+                for item in sub:
+                    if hasattr(item, "freeze"):
+                        item.freeze()
+            else:
                 sub.freeze()
-                print(f"[train] Froze model.{attr}")
+            print(f"[train] Froze model.{attr}")
     elif model_type != "personaplex":
         always_freeze = ["speech_tokenizer"]
         if model_type != "qwen3_tts_speaker":

@@ -15,6 +15,7 @@ ASR loss (audio → text) — optional, not yet wired into the trainer but
     the function is provided so it can be called directly or extended.
 """
 
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 from typing import Dict, List, Optional, Tuple
@@ -72,12 +73,12 @@ def lfm_audio_tts_loss(
     Returns (total_loss, metrics_dict) where metrics include per-codebook losses.
     """
     text_ids    = batch["text_ids"]     # [B, T_text]
-    audio_codes = batch["audio_codes"]  # [B, T_audio, 8]
+    audio_codes = batch["audio_codes"]  # [B, T_audio, C]  C may be 32 (all Mimi codebooks)
     audio_mask  = batch["audio_mask"]   # [B, T_audio]
 
     # Teacher forcing: input is all-but-last frame, target is all-but-first frame
-    audio_in  = audio_codes[:, :-1, :]  # [B, T_audio-1, 8]
-    audio_tgt = audio_codes[:, 1:,  :]  # [B, T_audio-1, 8]
+    audio_in  = audio_codes[:, :-1, :]  # [B, T_audio-1, C]
+    audio_tgt = audio_codes[:, 1:,  :]  # [B, T_audio-1, C]
     loss_mask = audio_mask[:, 1:]        # [B, T_audio-1]
 
     # Forward pass — audio_features=None for TTS (no input speech)
@@ -146,33 +147,57 @@ def lfm_audio_asr_loss(
     """
     ASR training loss for LFM 2.5 Audio.
 
-    Input audio features (mel spectrograms) are encoded by the ConformerEncoder.
-    The model generates text tokens autoregressively.
+    When batch contains "modalities", uses model._prefill with the proper
+    modality layout so audio is positioned BEFORE the assistant tokens (matching
+    inference-time ChatState layout). This lets the model attend to audio when
+    predicting the function call.
 
-    Batch keys: text_ids, audio_features, text_mask
-    audio_codes = None in ASR mode (no audio output target).
+    Without "modalities" (legacy), audio is appended after text — broken for ASR.
+
+    Batch keys: text_ids, audio_features, text_mask, modalities (optional)
     """
-    text_ids        = batch["text_ids"]         # [B, T_text]
-    audio_features  = batch["audio_features"]   # [B, T_mel, 128]
-    text_mask       = batch["text_mask"]         # [B, T_text]
+    text_ids       = batch["text_ids"]       # [B, N_text]
+    audio_features = batch["audio_features"] # [B, T_mel, 128]
+    text_mask      = batch["text_mask"]      # [B, N_text]
 
-    # Forward pass — audio_codes=None for ASR (no audio output)
-    text_logits, audio_logits = model(
-        text_tokens    = text_ids,
-        audio_features = audio_features,
-        audio_codes    = None,
-    )
-    # text_logits: [B, T_total, V_text] — predictions at text positions
+    if "modalities" in batch:
+        modalities = batch["modalities"]     # [B, N_total]  N_total = N_text + N_audio_frames
 
-    T_text  = text_ids.shape[1]
+        # Forward with audio in the user-turn position (before assistant tokens)
+        hidden_states, _ = model._prefill(
+            text_tokens    = text_ids,
+            audio_features = audio_features,
+            audio_codes    = None,
+            modalities     = modalities,
+        )
+        # Apply text projection to ALL positions → [B, N_total, V]
+        text_logits_full = model.lfm.embed_tokens.as_linear(hidden_states)
+
+        # Extract logits at TEXT positions only (modality == 1)
+        # Assume batch_size=1 for index extraction; generalises to larger batches below
+        mods_np   = np.array(modalities[0].tolist())
+        text_pos  = np.where(mods_np == 1)[0]        # [N_text]
+
+        # Gather: [B, N_text, V]  — mx.take preserves gradients
+        text_pos_mx  = mx.array(text_pos.astype(np.int32))
+        text_logits  = mx.take(text_logits_full[0], text_pos_mx, axis=0)[None]
+
+    else:
+        # Legacy: audio concatenated at end — model cannot attend to audio for ASR
+        text_logits, _ = model(
+            text_tokens    = text_ids,
+            audio_features = audio_features,
+            audio_codes    = None,
+        )
+
+    N_text  = text_ids.shape[1]
     T_logit = text_logits.shape[1]
-    T_min   = min(T_text - 1, T_logit)
+    T_min   = min(N_text - 1, T_logit)
 
     if T_min <= 0:
         loss = mx.array(0.0)
         return loss, {"loss": 0.0}
 
-    # Next-token prediction on text positions
     text_logits_shift = text_logits[:, :T_min, :]
     text_targets      = text_ids[:, 1:T_min + 1]
     text_mask_shift   = text_mask[:, 1:T_min + 1]

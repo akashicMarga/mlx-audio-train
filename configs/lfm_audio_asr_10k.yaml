@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LFM 2.5 Audio — ASR full run (all 950 samples, 10 000 steps, rank 16)
+# Matches the cookbook's recommended training scale.
+# Expected time: ~2 hours on M-series Apple Silicon.
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/LFM2.5-Audio-1.5B-8bit"
+  model_type: "lfm_audio"
+
+lora:
+  rank: 16          # double the capacity vs quick-test (rank 8)
+  alpha: 32.0       # keep alpha = 2 × rank
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/ohf_voice/train.jsonl"
+  val_jsonl:   "./data/ohf_voice/val.jsonl"
+  target_sr:    24000
+  min_duration: 0.5
+  max_duration: 20.0
+  normalize: true
+  trim: true
+  # no max_samples — use all 950
+
+trainer:
+  output_dir: "./checkpoints/lfm-audio-asr-10k"
+  run_name:   "lfm2.5-asr-10k"
+
+  num_epochs: 200          # high ceiling; max_steps will stop us first
+  max_steps:  10000
+
+  batch_size: 1
+  grad_accumulation: 8    # effective batch = 8 (matches data scale)
+
+  learning_rate: 5.0e-5   # cookbook default
+  weight_decay:  0.01
+  grad_clip:     1.0
+
+  warmup_steps:  250       # cookbook default
+  lr_schedule:   "cosine"
+
+  save_every_n_steps:  1000
+  save_every_n_epochs: 999
+  keep_last_n:         3
+
+  eval_every_n_steps:  500
+  val_batches:         10
+
+  log_every_n_steps:   50
+  log_file: "./checkpoints/lfm-audio-asr-10k/train_log.jsonl"
+
+  sort_by_length: true
+  prefetch:       2
+
+  label_smoothing: 0.0
+
+processor:
+  max_text_len:    512
+  max_audio_frames: 512
+  training_mode:   "asr"
+  system_prompt:   "Perform ASR."

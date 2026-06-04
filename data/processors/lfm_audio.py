@@ -110,6 +110,14 @@ class LFMAudioProcessor:
 
         self._loaded = True
 
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _calc_audio_frames(mel_frames: int) -> int:
+        """ConformerEncoder output length: 3 stride-2 conv layers (kernel=3, padding=1)."""
+        def _conv(n): return (n + 2 * 1 - 3) // 2 + 1
+        return _conv(_conv(_conv(mel_frames)))
+
     # ── Audio encoding ────────────────────────────────────────────────────
 
     def encode_audio_codes(self, audio: np.ndarray, audio_path: str = None) -> np.ndarray:
@@ -173,7 +181,8 @@ class LFMAudioProcessor:
         try:
             audio_f32 = audio.astype(np.float32)
             audio_mx  = mx.array(audio_f32)
-            mel = self._lfm_processor.preprocess_audio(audio_mx)  # [T_mel, 128]
+            # Pass the actual sample rate so preprocess_audio can resample to 16kHz.
+            mel = self._lfm_processor.preprocess_audio(audio_mx, sample_rate=self.config.sample_rate)
             mx.eval(mel)
             return np.array(mel, dtype=np.float32)
         except Exception as e:
@@ -183,35 +192,78 @@ class LFMAudioProcessor:
     # ── Text encoding ─────────────────────────────────────────────────────
 
     def encode_text(self, text: str) -> np.ndarray:
-        """
-        Text → token IDs with chat template formatting.
-        Returns int32 array of shape [T_text].
-        """
+        """TTS mode: text → token IDs with chat template. Returns int32 [T_text]."""
         self._load()
         if self._tokenizer is None:
             return np.array([1, 2, 3], dtype=np.int32)
-
-        # Try chat template first (LFM uses chat-style prompting)
         try:
             messages = [
                 {"role": "system", "content": self.config.system_prompt},
                 {"role": "user",   "content": text},
             ]
-            ids = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
+            ids = self._tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
             return np.array(ids, dtype=np.int32)[:self.config.max_text_len]
         except Exception:
             pass
-
-        # Fallback: plain tokenize
         try:
             ids = self._tokenizer.encode(text, add_special_tokens=True)
             return np.array(ids, dtype=np.int32)[:self.config.max_text_len]
         except Exception:
             return np.array([1, 2, 3], dtype=np.int32)
+
+    def build_asr_sequence(self, text: str, mel_frames: int):
+        """
+        Build text_tokens + modalities for ASR training.
+
+        Audio is placed in the user turn (BEFORE assistant tokens) so the
+        model can attend to it when predicting the function call.  This
+        matches the inference-time layout produced by ChatState.add_audio().
+
+        Returns (text_tokens [N_text], modalities [N_total]) as int32 arrays,
+        where N_total = N_text + N_audio_frames.
+        """
+        self._load()
+        tok = self._tokenizer
+        if tok is None:
+            return np.array([1, 2, 3], dtype=np.int32), None
+
+        TEXT     = 1  # LFMModality.TEXT
+        AUDIO_IN = 2  # LFMModality.AUDIO_IN
+
+        text_tokens: list = []
+        modalities:  list = []
+
+        def _add_text(s):
+            ids = tok.encode(s, add_special_tokens=False)
+            text_tokens.extend(ids)
+            modalities.extend([TEXT] * len(ids))
+
+        # BOS
+        bos_id = getattr(tok, "bos_token_id", 1)
+        if bos_id is not None:
+            text_tokens.append(bos_id)
+            modalities.append(TEXT)
+
+        # System turn
+        _add_text(f"<|im_start|>system\n{self.config.system_prompt}<|im_end|>\n")
+
+        # User turn header (no content text — audio fills this space)
+        _add_text("<|im_start|>user\n")
+
+        # AUDIO_IN frames (no text tokens for these positions)
+        n_audio = self._calc_audio_frames(mel_frames)
+        modalities.extend([AUDIO_IN] * n_audio)
+
+        # User turn footer
+        _add_text("<|im_end|>\n")
+
+        # Assistant turn with function call
+        _add_text(f"<|im_start|>assistant\n{text}<|im_end|>\n")
+
+        return (
+            np.array(text_tokens, dtype=np.int32),
+            np.array(modalities,  dtype=np.int32),
+        )
 
     # ── Main processing call ──────────────────────────────────────────────
 
@@ -222,26 +274,36 @@ class LFMAudioProcessor:
             return sample
 
         try:
-            text_ids    = self.encode_text(sample.text)
             audio_codes = self.encode_audio_codes(sample.audio, audio_path=sample.audio_path)
 
             if len(audio_codes) > self.config.max_audio_frames:
                 audio_codes = audio_codes[:self.config.max_audio_frames]
 
+            if self.config.training_mode == "asr":
+                # Compute mel first so we know N_audio_frames for the modalities array
+                mel = self.encode_audio_features(sample.audio, audio_path=sample.audio_path)
+                mel_frames = mel.shape[0] if mel is not None else 0
+                text_ids, modalities = self.build_asr_sequence(sample.text, mel_frames)
+            else:
+                text_ids   = self.encode_text(sample.text)
+                mel        = None
+                modalities = None
+
             result = {
                 "text_ids":      text_ids,
-                "audio_codes":   audio_codes,    # [T_audio, 8]
+                "audio_codes":   audio_codes,
                 "text_length":   len(text_ids),
                 "audio_length":  len(audio_codes),
                 "text":          sample.text,
                 "audio_path":    sample.audio_path,
             }
 
-            # ASR mode: include mel features
-            mel = self.encode_audio_features(sample.audio, audio_path=sample.audio_path)
             if mel is not None:
                 result["audio_features"]        = mel
                 result["audio_features_length"] = mel.shape[0]
+
+            if modalities is not None:
+                result["modalities"] = modalities
 
             return result
 
@@ -279,8 +341,12 @@ def collate_lfm_audio(
     T_text  = max(s["text_length"]  for s in samples)
     T_audio = max(s["audio_length"] for s in samples)
 
-    text_ids    = np.full((B, T_text),                 pad_text_id,  dtype=np.int32)
-    audio_codes = np.full((B, T_audio, num_codebooks), pad_audio_id, dtype=np.int32)
+    # Infer actual codebook count from data — Mimi may output more codebooks (e.g. 32)
+    # than the model's audio head depth (e.g. 8). Store all; the loss slices as needed.
+    actual_codebooks = samples[0]["audio_codes"].shape[1] if samples[0].get("audio_codes") is not None else num_codebooks
+
+    text_ids    = np.full((B, T_text),                    pad_text_id,  dtype=np.int32)
+    audio_codes = np.full((B, T_audio, actual_codebooks), pad_audio_id, dtype=np.int32)
 
     for i, s in enumerate(samples):
         tl = s["text_length"]
@@ -315,5 +381,16 @@ def collate_lfm_audio(
                 mel_arr[i, :m.shape[0]] = m
             batch["audio_features"]        = mx.array(mel_arr)
             batch["audio_feature_lengths"] = mx.array(mel_lens)
+
+    # ASR mode: include modalities (TEXT=1 / AUDIO_IN=2 per sequence position)
+    if any("modalities" in s for s in samples):
+        mods_list = [s["modalities"] for s in samples if s.get("modalities") is not None]
+        if len(mods_list) == B:
+            T_mod = max(len(m) for m in mods_list)
+            # Pad with TEXT (1); padded positions are outside text_mask so ignored in loss
+            mods_arr = np.ones((B, T_mod), dtype=np.int32)
+            for i, m in enumerate(mods_list):
+                mods_arr[i, :len(m)] = m
+            batch["modalities"] = mx.array(mods_arr)
 
     return batch

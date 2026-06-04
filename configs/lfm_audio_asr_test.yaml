@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LFM 2.5 Audio — ASR quick-test config (1000 samples, 200 steps)
+# Mirrors lfm_audio_asr.yaml but scaled down for a local sanity run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_id: "mlx-community/LFM2.5-Audio-1.5B-8bit"
+  model_type: "lfm_audio"
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+data:
+  train_jsonl: "./data/ohf_voice/train.jsonl"
+  val_jsonl:   "./data/ohf_voice/val.jsonl"
+  target_sr:    24000
+  min_duration: 0.5
+  max_duration: 20.0
+  normalize: true
+  trim: true
+  max_samples: 1000
+
+trainer:
+  output_dir: "./checkpoints/lfm-audio-asr-test"
+  run_name:   "lfm2.5-asr-test"
+
+  num_epochs: 20
+  max_steps:  200         # ~6 min/step on M-series → ~20 min total
+
+  batch_size: 1
+  grad_accumulation: 8   # smaller accumulation = more frequent updates for testing
+
+  learning_rate: 5.0e-5
+  weight_decay:  0.01
+  grad_clip:     1.0
+
+  warmup_steps:  20
+  lr_schedule:   "cosine"
+
+  save_every_n_steps:  100
+  save_every_n_epochs: 999   # effectively disabled
+  keep_last_n:         2
+
+  eval_every_n_steps: 50
+  val_batches:        10
+
+  log_every_n_steps: 5
+  log_file: "./checkpoints/lfm-audio-asr-test/train_log.jsonl"
+
+  sort_by_length: true
+  prefetch:       2
+
+  label_smoothing: 0.0
+
+processor:
+  max_text_len:    512
+  max_audio_frames: 512
+  training_mode:   "asr"
+  system_prompt:   "Perform ASR."
