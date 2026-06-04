@@ -1,6 +1,6 @@
 # Training Pipelines — What They Do and Why
 
-This repo supports three distinct ways to finetune Qwen3-TTS. Each trains a different capability into the model and produces a different kind of adapter. Understanding which one to use and why matters a lot for the quality of your output.
+This repo supports fine-tuning pipelines for **Qwen3-TTS** (TTS language/speaker adaptation) and **LFM 2.5 Audio** (speech-to-text / voice-to-function-call). Each pipeline trains a different capability into the model and produces a different kind of adapter.
 
 ---
 
@@ -182,3 +182,84 @@ All pipelines use JSONL with one sample per line.
 ```
 
 The `ref_audio` should always be a clip of the **target speaker** (the voice you want to bake in). Using the same 5–10 second clip for every sample gives the strongest, most consistent speaker identity signal.
+
+---
+
+## Pipeline 4 — LFM 2.5 Audio ASR / Voice-to-Function-Call
+
+**Config**: `configs/lfm_audio_asr_10k.yaml`
+**Model**: LFM 2.5 Audio 1.5B (hybrid Mamba+Transformer)
+**Use when**: You want to fine-tune a speech model to output structured text (function calls, commands, intents) from audio input.
+
+### What it trains
+
+LoRA adapters on the attention + MLP layers of the LFM backbone (Mamba layers are frozen — they have no `self_attn`, so LoRA can't patch them). The model learns to output `FunctionName|$arg=val` strings from spoken audio.
+
+```bash
+# Quick smoke test (~5 min)
+python scripts/train.py --config configs/lfm_audio_asr_test.yaml
+
+# Full run (~12 hours on M-series, keep Mac awake)
+caffeinate -i python scripts/train.py --config configs/lfm_audio_asr_10k.yaml
+```
+
+### Architecture: hybrid Mamba + Transformer
+
+LFM 2.5 Audio uses Mamba layers at indices 0,1,3,4,6,7,9,11,13,15 and Transformer (attention) layers at 2,5,8,10,12,14. LoRA patches the 6 attention layers, producing 18 LoRA matrices (q/k/v/o/gate/up/down × 6 layers, some layers don't have all projections).
+
+Gradient trees contain empty `{}` at Mamba positions. `_strip_empty` must preserve list structure — removing empty elements compresses the list from 16 to 6 elements, causing `optimizer.update` to misalign indices and crash with `KeyError: 'self_attn'`.
+
+### Critical: modality positioning
+
+LFM 2.5 Audio's `model.__call__` appends audio embeddings *after* all text tokens. In a causal model this means the model cannot attend to audio when predicting the assistant response — it will always transcribe instead of generating function calls, regardless of training steps.
+
+**The fix:** call `model._prefill` with explicit `modalities` so audio is placed inside the user turn (before the assistant tokens). This matches the inference-time `ChatState.add_audio()` layout.
+
+```
+Wrong (model.__call__):  [system][user " "][assistant "HassLightTurnOn..."][AUDIO]
+Correct (with modalities): [system][user AUDIO_IN×N][assistant "HassLightTurnOn..."]
+```
+
+With the wrong layout: val_loss 1.40 at step 500, model never produces function calls.
+With the correct layout: val_loss 0.05 at step 500, function calls appear within ~200 steps.
+
+### Inference: MLX threading
+
+MLX GPU streams are thread-local. Gradio runs inference in worker threads by default → `RuntimeError: There is no Stream(gpu, 1) in current thread`. Use Flask with `threaded=False, use_reloader=False` to keep everything on the main thread.
+
+```bash
+python scripts/lfm_asr_demo.py --adapter checkpoints/lfm-audio-asr-10k/checkpoint-final
+# open http://localhost:7860
+```
+
+### Results (10k steps, LoRA rank 16, Apple Silicon)
+
+Dataset: `Paulescu/OHF-Voice-audio-20260504` — 950 train / 50 val / 2766 test samples, 41 Home Assistant intent classes.
+
+| Metric | LoRA rank 16 (this) | Full FT — LiquidAI cookbook (A100) |
+|---|---|---|
+| Format compliance | **99.0%** | 99.7% |
+| Function-name accuracy | **82.0%** | 98.8% |
+| Argument accuracy | **61.0%** | ~97% |
+| Trainable params | 884K / 169M (0.52%) | 100% |
+| Training time | ~12 hours (M-series) | ~2 hours (A100) |
+
+Pre-trained adapter: [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA](https://huggingface.co/akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA)
+
+### Things to experiment with
+
+| Change | Expected effect |
+|---|---|
+| LoRA rank 32 / 64 | Better argument accuracy; more capacity for exact arg patterns |
+| Full fine-tuning (remove LoRA) | Should approach cookbook accuracy; needs ~16 GB RAM |
+| More data (full 55K OHF-Voice) | Large accuracy gains — we used only 950 samples |
+| Unfreeze audio encoder | May improve accuracy on accented speech |
+| Longer training (20–30k steps) | Model was still improving at 10k |
+
+### Data format
+
+```json
+{"audio": "path/to/clip.wav", "text": "HassLightTurnOn|$area=hall", "codec_path": "path/to/clip.codec.npy"}
+```
+
+`codec_path` is optional — pre-compute with `scripts/preprocess_lfm_audio.py` to speed up training.

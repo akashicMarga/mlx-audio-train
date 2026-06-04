@@ -1,8 +1,8 @@
 # mlx-audio-train
 
-An **MLX audio experimentation hub** for Apple Silicon — covering LoRA/QLoRA finetuning of TTS models and inference-only speech/multimodal models.
+An **MLX audio experimentation hub** for Apple Silicon — covering LoRA/QLoRA finetuning of TTS and speech-to-speech models, all runnable locally on M-series Macs.
 
-**Finetuning:** Qwen3-TTS (0.6B / 1.7B), PersonaPlex 7B, CSM/Sesame — two training pipelines (language adaptation + speaker cloning).
+**Finetuning:** Qwen3-TTS (0.6B / 1.7B), PersonaPlex 7B, CSM/Sesame, **LFM 2.5 Audio 1.5B** (ASR → function calling).
 
 **Inference:** MiniMind-O (speech-to-speech, 118M), Indic Parler-TTS (Hindi TTS).
 
@@ -417,3 +417,62 @@ This repo is LoRA / QLoRA on Apple Silicon with MLX.
 | All 16 codec levels | Yes (additive input embeddings) | No (first codebook only as input; `code_predictor` is an auxiliary loss head) |
 | Post-training step | Bake speaker to `codec_embedding[3000]` | `bake_speaker_embedding.py` (same) |
 | Checkpoint size | Full model (~1.2 GB) | Adapters only (~46 MB) |
+
+---
+
+## LFM 2.5 Audio — ASR / Voice-to-Function-Call Fine-tuning
+
+LFM 2.5 Audio is a hybrid Mamba+Transformer 1.5B speech-to-speech model from LiquidAI. This repo adds a LoRA fine-tuning pipeline that teaches it to output structured function calls from audio input — e.g. spoken "switch on the hall light" → `HassLightTurnOn|$area=hall`.
+
+### Quick start
+
+```bash
+# 200-step smoke test (~5 min on M-series)
+python scripts/train.py --config configs/lfm_audio_asr_test.yaml
+
+# Full 10k-step run (~12 hours on M-series, keep Mac awake)
+caffeinate -i python scripts/train.py --config configs/lfm_audio_asr_10k.yaml
+
+# Evaluate against the OHF-Voice test split
+python scripts/lfm_asr_eval.py \
+    --adapter checkpoints/lfm-audio-asr-10k/checkpoint-final \
+    --samples-per-function 10
+
+# Interactive demo
+python scripts/lfm_asr_demo.py --adapter checkpoints/lfm-audio-asr-10k/checkpoint-final
+# open http://localhost:7860
+```
+
+### Results (10k steps, LoRA rank 16, Apple Silicon)
+
+Evaluated on `Paulescu/OHF-Voice-audio-20260504` test split, 205 samples across 41 functions.
+
+| Metric | LoRA (this repo) | Full FT (LiquidAI cookbook, A100) |
+|---|---|---|
+| Format compliance | **99.0%** | 99.7% |
+| Function-name accuracy | **82.0%** | 98.8% |
+| Argument accuracy | **61.0%** | ~97% |
+| Trainable params | 884K / 169M (**0.52%**) | 100% |
+| Hardware | Apple Silicon | A100 80GB |
+| Training time | ~12 hours | ~2 hours |
+
+Pre-trained adapter: [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA](https://huggingface.co/akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA)
+
+### What we learned / things to try
+
+**Critical implementation detail:** LFM 2.5 Audio's `model.__call__` concatenates audio embeddings *after* the text sequence. For ASR fine-tuning this is wrong — the model can't attend to audio when predicting the assistant tokens. You must call `model._prefill` with explicit `modalities` so audio is placed in the user turn (before the assistant), matching the inference-time `ChatState` layout. Without this fix, val_loss looks reasonable but the model never produces function calls.
+
+**Experiments worth running:**
+- **Higher LoRA rank** (32, 64): more capacity for exact argument patterns; expect better arg accuracy
+- **Full fine-tuning**: remove LoRA and unfreeze all params — needs ~16 GB RAM minimum
+- **More data**: OHF-Voice has 55K samples; we used 950. Scale up for large accuracy gains
+- **Longer training**: the model was still improving at 10k steps; 20–30k may close the gap further
+- **LoRA on audio encoder**: currently frozen; unfreezing may help with accented speech
+
+### Architecture notes (LFM 2.5 Audio)
+
+- Hybrid Mamba + Transformer: attention at layers 2,5,8,10,12,14; Mamba elsewhere
+- LoRA applies only to attention layers (18 patched layers)
+- Audio path: 16kHz mel → ConformerEncoder (3× stride-2) → AUDIO_IN tokens in sequence
+- Text path: standard tokenizer, chat template with `<|im_start|>` / `<|im_end|>`
+- LoRA `_strip_empty` bug: Mamba layers produce `{}` gradients — must preserve list length or optimizer.update misaligns indices
