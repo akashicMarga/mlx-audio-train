@@ -51,7 +51,20 @@ model/
 # checkpoints
 checkpoints/
 
-#audio files
+# audio files
 *.wav
+*.mp3
+*.flac
+*.ogg
+
+# dataset / training artifacts (never commit raw data or generated files)
+data/ohf_voice/
+data/*.jsonl
+data/**/*.jsonl
+data/**/*.npy
+*.npy
+*.safetensors
+train_log.jsonl
+trainer_config.json
 
 evals/

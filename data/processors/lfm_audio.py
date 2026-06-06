@@ -274,7 +274,13 @@ class LFMAudioProcessor:
             return sample
 
         try:
-            audio_codes = self.encode_audio_codes(sample.audio, audio_path=sample.audio_path)
+            if self.config.training_mode == "asr":
+                # Audio codes are not used in the ASR loss — skip expensive Mimi encoding
+                dur = len(sample.audio) / self.config.sample_rate
+                n   = max(1, int(dur * 12.5))
+                audio_codes = np.zeros((n, self.config.num_codebooks), dtype=np.int32)
+            else:
+                audio_codes = self.encode_audio_codes(sample.audio, audio_path=sample.audio_path)
 
             if len(audio_codes) > self.config.max_audio_frames:
                 audio_codes = audio_codes[:self.config.max_audio_frames]

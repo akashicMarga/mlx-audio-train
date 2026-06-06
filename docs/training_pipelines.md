@@ -232,19 +232,22 @@ python scripts/lfm_asr_demo.py --adapter checkpoints/lfm-audio-asr-10k/checkpoin
 # open http://localhost:7860
 ```
 
-### Results (10k steps, LoRA rank 16, Apple Silicon)
+### Results
 
-Dataset: `Paulescu/OHF-Voice-audio-20260504` — 950 train / 50 val / 2766 test samples, 41 Home Assistant intent classes.
+Dataset: `Paulescu/OHF-Voice-audio-20260504` — 41 Home Assistant intent classes, test split.
 
-| Metric | LoRA rank 16 (this) | Full FT — LiquidAI cookbook (A100) |
-|---|---|---|
-| Format compliance | **99.0%** | 99.7% |
-| Function-name accuracy | **82.0%** | 98.8% |
-| Argument accuracy | **61.0%** | ~97% |
-| Trainable params | 884K / 169M (0.52%) | 100% |
-| Training time | ~12 hours (M-series) | ~2 hours (A100) |
+| Metric | v1: 950 samples, 10K steps | **v2: 50K samples, 4K steps** | Cookbook (full FT, A100) |
+|---|---|---|---|
+| Format compliance | 99.0% | **100.0%** | 99.7% |
+| Function-name accuracy | 82.0% | **92.2%** | 98.8% |
+| Argument accuracy | 61.0% | **70.0%** | ~97% |
+| Trainable params | 884K / 169M (0.52%) | 884K / 169M (0.52%) | 100% |
 
-Pre-trained adapter: [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA](https://huggingface.co/akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA)
+**Key finding:** going from 950 → 49,909 training samples gained +10% function-name accuracy and +9% argument accuracy, using fewer training steps. Data volume matters more than training duration for LoRA fine-tuning. The model had already found its best checkpoint at step 4,000 (val_loss 0.020) — stopping early saved hours of compute.
+
+Pre-trained adapters:
+- v2 (50K samples): [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA-v2](https://huggingface.co/akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA-v2)
+- v1 (950 samples): [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA](https://huggingface.co/akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA)
 
 ### Things to experiment with
 
@@ -252,9 +255,8 @@ Pre-trained adapter: [akashicmarga/LFM2.5-Audio-1.5B-ASR-LoRA](https://huggingfa
 |---|---|
 | LoRA rank 32 / 64 | Better argument accuracy; more capacity for exact arg patterns |
 | Full fine-tuning (remove LoRA) | Should approach cookbook accuracy; needs ~16 GB RAM |
-| More data (full 55K OHF-Voice) | Large accuracy gains — we used only 950 samples |
-| Unfreeze audio encoder | May improve accuracy on accented speech |
-| Longer training (20–30k steps) | Model was still improving at 10k |
+| Unfreeze audio encoder | May improve accuracy on accented or noisy speech |
+| Longer training (20K steps) | Val loss was still healthy at 4K; more epochs may push args further |
 
 ### Data format
 
