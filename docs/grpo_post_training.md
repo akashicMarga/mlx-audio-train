@@ -261,3 +261,63 @@ reward only on a 10s cap.
    saves. Meaningful reward-rise needs a real SFT'd adapter as the start (the
    base model gives zero-variance rewards → zero advantage) and full-length
    rollouts — GRPO is a refinement stage, not a from-scratch trainer.
+
+## Validated result (first real run)
+
+Interleaved-layout run on the Hindi SFT adapter
+([akashicmarga/qwen3-tts-hindi-lora](https://hf.co/akashicmarga/qwen3-tts-hindi-lora)),
+400 steps, `kl_beta=0.08`, 863 IndicVoices-R "Read" prompts → published as
+[akashicmarga/qwen3-tts-hindi-lora-grpo](https://hf.co/akashicmarga/qwen3-tts-hindi-lora-grpo).
+Held-out eval (120 sentences, 2 seeds; CER capped at 1.0):
+
+| | CER ↓ | DNSMOS OVRL ↑ | SIG ↑ |
+|---|---|---|---|
+| SFT baseline | 0.205 | 3.237 | 3.573 |
+| GRPO (interleaved) | **0.183** | **3.271** | **3.608** |
+
+CER −11% rel, better on 75/120 (Wilcoxon p≈7e-4; paired t p≈0.09 — the mean is
+outlier-sensitive, the rank test is the robust claim). MOS small but significant
+(p<0.05). KL stayed ~0.015 — and **DNSMOS went up, not down**, which is the
+direct evidence the policy did *not* hack the CER reward into robotic
+over-articulation. The concatenated-layout run (v1) lost to SFT on the same
+eval — confirming the interleaved layout was essential.
+
+## Next steps / known limitations
+
+Ordered roughly by value-per-effort. Items 1–3 are small and unblock the
+ablation (4).
+
+1. **In-loop legibility (cheap, do first).**
+   - Log the **zero-variance skip ratio per window**, not just a total at the
+     end — a high skip rate means the optimizer is getting sparse signal even
+     though the run "looks alive."
+   - Wire a **periodic fixed-prompt held-out eval** (every 25–50 steps) via the
+     base `Trainer.audio_eval_fn` hook: rollout a fixed prompt set and log
+     CER + duration + trailing-silence fraction + KL (+ save audio). Today the
+     held-out eval is post-hoc only; in-loop makes runs self-documenting.
+
+2. **Sequence-normalized PG option** (`pg_norm: token | sequence`). The current
+   PG is token-averaged (`sum/total_tokens`), which gives longer rollouts more
+   gradient mass — the known GRPO length bias (Dr. GRPO / DAPO). Empirically v3
+   went the *right* way on length (it learned to terminate), but a per-sequence
+   normalized objective (mean per-rollout logp, then mean over rollouts) is
+   worth comparing.
+
+3. **Anti-reward-hacking guard.** CER rewards ASR-friendly speech, which can
+   degenerate into slow/over-enunciated audio. v3 did *not* (MOS rose, KL tiny),
+   but the defense is run-dependent: add an explicit **speaking-rate / duration
+   penalty** to the reward, and do not lower `kl_beta` or drop the length guard.
+   Note DNSMOS is English-trained → a rough relative proxy for Hindi naturalness,
+   not a native MOS; a Hindi-tuned MOS or human listening is the real check.
+
+4. **Controlled ablation** (small scale, ~100–150 steps each, audio snapshots
+   every 25–50 steps): interleaved vs concatenated × token- vs sequence-norm PG
+   × `sft_lambda` 0 vs 0.1. We have partial evidence on axis 1 (v1 vs v3) but
+   nothing controlled, and zero data on the other two axes.
+
+5. **Richer reward for a bigger gain.** CER alone plateaued (~step 200). Adding
+   a naturalness/MOS term (or speaker-similarity for Pipeline 2) alongside CER is
+   the lever for further improvement beyond the modest CER-only result.
+
+6. **Pipeline 2 (speaker cloning) interleaved.** Wired but only validated on the
+   concatenated path; exercise it end-to-end on the (proven) interleaved layout.
