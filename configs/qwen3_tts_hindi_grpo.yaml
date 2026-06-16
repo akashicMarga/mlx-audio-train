@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3-TTS 0.6B — Hindi GRPO Post-Training (Pipeline 3)
+# Runs AFTER SFT (configs/qwen3_tts_hindi.yaml). Refines the SFT adapter with
+# RL on a direct intelligibility reward (1 − CER). See docs/grpo_post_training.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+pipeline: grpo            # dispatch GRPOTrainer in scripts/train.py
+
+model:
+  model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+  tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  model_type: "qwen3_tts"
+  custom_lang_ids:
+    hi: 2051
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+data:
+  # GRPO only needs prompt TEXT (codec labels are unused unless sft_lambda>0).
+  # Reuse the SFT jsonl; the loader extracts text per sample.
+  train_jsonl: "./data/hindi/train_codes.jsonl"
+  target_sr: 24000
+  max_samples: null
+
+grpo:
+  # Resume the SFT adapter — this becomes BOTH the initial policy AND (snapshotted
+  # at start) the frozen KL reference. Required: GRPO should refine SFT, not base.
+  init_adapters: "./checkpoints/qwen3-hindi/checkpoint-best/adapters.safetensors"
+
+  group_size:      4          # G rollouts per prompt
+  prompts_per_step: 4         # B → 16 rollouts/step (maps to grad_accumulation)
+  max_new_tokens:  240        # ~20s at 12Hz; match dataset durations
+  temperature:     0.9
+  top_p:           0.95
+  top_k:           50
+
+  # Loss terms (see train/losses/grpo_loss.py)
+  kl_beta:        0.05        # KL(π_θ ‖ π_ref_SFT) weight (k3 estimator)
+  kl_clip:        10.0        # clamp |logπ_ref − logπ_θ| before exp (k3 stability)
+  sub_pg_weight:  0.0         # advantage-weight the code_predictor head too (0 = off)
+  sft_lambda:     0.1         # optional CE anchor on real SFT batches (0 = off)
+  skip_zero_variance: true    # drop groups where all rollouts get the same reward (no PG signal)
+
+  rewards:
+    intelligibility:
+      weight:    1.0
+      asr_model: "mlx-community/whisper-large-v3-turbo"
+      metric:    cer          # CER > WER for Devanagari robustness
+      language:  hi
+    length_penalty:
+      weight:        0.5
+      no_eos_penalty:  1.0     # hit max_new_tokens without EOS
+      silence_penalty: 0.5     # excessive trailing silence (degeneracy guard)
+    # speaker_similarity:      # Pipeline 2 only (needs include_ref_mel + ref audio)
+    #   weight: 1.0
+
+trainer:
+  output_dir: "./checkpoints/qwen3-hindi-grpo"
+  run_name:   "qwen3-0.6b-hindi-grpo"
+  lang_code:  "hi"
+
+  num_epochs: 100             # cycles over prompts; real bound is max_steps
+  max_steps:  300
+  grad_accumulation: 4        # == prompts_per_step (B); one step = one rollout batch (on-policy)
+
+  learning_rate: 5.0e-6       # ~4x lower than SFT — RL is noisy
+  weight_decay:  0.01
+  grad_clip:     1.0
+  warmup_steps:  10
+  lr_schedule:   "constant"   # short RL run; cosine optional
+
+  log_every_n_steps:  1
+  save_every_n_steps: 50
+  eval_every_n_steps: 999999  # GRPO has no held-out loss; reward_mean is the signal
+  save_every_n_epochs: 999999
+
+  # tensorboard_dir: "/tmp/tb/qwen3-hindi-grpo"   # reward_mean/cer_mean/kl curves

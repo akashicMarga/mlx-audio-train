@@ -11,9 +11,19 @@ for language adaptation, speaker similarity for voice cloning. GRPO lets
 us optimize those metrics directly, with no reward model and no value
 network.
 
-**Status: design only — not implemented.** Use this when SFT plateaus
-(e.g. the Hindi adapter is fluent but WER is stuck, or speaker similarity
-stalls). Not worth the rollout cost before that.
+**Status: implemented** (`train/grpo/`, `train/losses/grpo_loss.py`,
+`configs/qwen3_tts_hindi_grpo.yaml`; run via `scripts/train.py` with
+`pipeline: grpo`). Use this when SFT plateaus (e.g. the Hindi adapter is fluent
+but WER is stuck, or speaker similarity stalls). Not worth the rollout cost
+before that.
+
+> **Note on this doc vs. the code.** A few details below were revised during
+> implementation; the corrections are called out inline with **[impl]**. The
+> two that matter most: (1) the policy is **codebook 0 only** — SFT supervises
+> only cb0 (`processors/qwen3_tts.py` stores `codes[0,0]`); cb1–15 come from the
+> frozen `code_predictor` at decode time. (2) The KL **reference is a frozen
+> snapshot of the SFT adapter** (`lora_snapshot`/`lora_swapped`), *not* a
+> LoRA-disable toggle — see the KL section for why the toggle is incorrect.
 
 ---
 
@@ -27,9 +37,13 @@ stalls). Not worth the rollout cost before that.
   `train/lora.py`), so the optimizer/grad path is identical to the
   existing `Trainer` — including the `_strip_empty` workaround for the
   frozen `speech_tokenizer`.
-- A frozen reference policy comes for free with LoRA: running the model
-  with LoRA deltas disabled *is* the SFT-anchored reference for the KL
-  penalty (or snapshot the adapters at stage start).
+- A frozen reference policy comes from a one-time **snapshot of the SFT
+  adapter** at stage start. **[impl]** The original idea here — "run with LoRA
+  deltas disabled" — is *wrong* on two counts: disabling anchors to the *base*
+  model (fighting the SFT adaptation), and the disabled path runs bfloat16 while
+  the enabled path upcasts to float32, so the two diverge ~3 nats over 28 layers
+  and the k3 KL explodes. The snapshot runs the *identical* float32 forward,
+  differing only in adapter weights → KL is exactly 0 at stage start.
 
 ## Training step anatomy
 
@@ -87,6 +101,17 @@ Notes:
   Pipeline 2) must match `qwen3_tts_loss` / `qwen3_tts_speaker_loss`
   exactly — both functions already share `_build_codec_prefix`, so the
   rollout module imports it rather than re-implementing.
+- **[impl] Layout decision.** Sampling and Phase-B teacher-forcing both use the
+  **SFT concatenated layout** (`[text | prefix | codec…]`), *not* the official
+  `generate()` interleaving (which sums text+codec frame-by-frame via
+  `trailing_text_hidden`). Those are different distributions on the same weights;
+  GRPO's on-policy correctness only needs Phase A and Phase B to agree, and the
+  concatenated layout is what the SFT adapter was trained on. So the rollout
+  feeds back **only the cb0 embedding** each step (matching the loss), and cb1–15
+  are sampled solely to decode audio — they don't condition the cb0 stream.
+- **[impl] Prompt tokenisation** uses `Qwen3TTSProcessor.encode_text` (same as
+  SFT), not the chat-template wrapper `generate()` builds, for the same
+  same-regime reason.
 - Decode to audio with the frozen `model.speech_tokenizer` (code2wav),
   same path inference uses. Decoding is pure scoring input — wrap the
   whole phase in `mx.stop_gradient` semantics (just don't trace it).
@@ -108,10 +133,16 @@ about, plus one quality anchor to prevent degradation.
 
 The KL term plays the role of the paper's LLM-based quality reward: it
 stops the policy from gaming ASR (e.g. slow robotic over-articulation)
-by anchoring it to the SFT distribution. With QLoRA the reference
-log-probs cost one extra forward with the LoRA contribution zeroed —
-add a `set_lora_enabled(model, flag)` toggle to `train/lora.py` that
-scales `lora_b` output by 0/1.
+by anchoring it to the SFT distribution. **[impl]** Reference log-probs are
+computed once per rollout via `lora_swapped(model, snapshot)` — one extra
+forward with the frozen SFT adapter installed, on the same float32 path the
+policy uses. (`set_lora_enabled`/`lora_disabled` exist in `train/lora.py` but
+must **not** be used as the KL reference; see "Why GRPO fits this stack".)
+Two further fixes the implementation needed: log-probs are computed in
+**float32** regardless of logits dtype (bfloat16 `log_softmax` is garbage in the
+low-probability tail), and the k3 log-ratio is **clamped** to ±`kl_clip`
+(default 10) before `exp` to stop a deep-tail sampled token from blowing up the
+estimator.
 
 ASR is the throughput bottleneck. Use `mlx-whisper` (small or
 large-v3-turbo) in the same process; batch the G rollouts of one prompt
@@ -147,11 +178,21 @@ def qwen3_tts_grpo_loss(model, batch, *, kl_beta=0.05, sft_lambda=0.0):
                   "reward_mean": float(batch["advantages_raw_mean"])}
 ```
 
-A thin `GRPOTrainer` orchestrates the two phases; it can subclass
-`Trainer` and override the inner loop, keeping checkpointing, LR
-schedule, TensorBoard, and JSONL logging untouched. Log `reward_mean`,
-`cer_mean`, `spk_sim_mean`, and `kl` — reward going up while KL stays
-bounded is the health signal.
+**[impl]** Two alignment details the sketch above glosses: (1) GRPO scores
+**every** sampled token, so the codec window is `logits[:, off : off+T]` against
+`targets = codec_ids` (full) — unlike `qwen3_tts_loss`, which drops `codec_ids[0]`.
+(2) The PG term has **no label smoothing** (smoothing distorts the gradient);
+smoothing is reserved for the optional SFT-mixin. Both `pg` and the reference
+forward share one helper, `grpo_codec_logits`, so the slice can't drift apart.
+
+**[impl]** Rather than overriding the inner loop, `GRPOTrainer` subclasses
+`Trainer` and feeds it a `GRPORolloutLoader` that runs Phase A lazily per pull
+and yields a Phase-B batch; the base loop then does loss+backward+step and
+auto-logs every metric the loss returns. Set `grad_accumulation =
+prompts_per_step` so one optimizer step == one on-policy rollout batch.
+Checkpointing, LR schedule, TensorBoard, and JSONL logging are untouched. Watch
+`reward_mean`, `cer_mean`, and `kl` — reward up while KL stays bounded is the
+health signal.
 
 ## Config sketch
 
@@ -202,13 +243,21 @@ reward only on a 10s cap.
   checkpoints are gated PyTorch models; their training code is not
   public).
 
-## Implementation order
+## Implementation order  *(all done — file map for the built pipeline)*
 
-1. `set_lora_enabled()` toggle in `train/lora.py` (reference policy).
-2. `train/grpo/rollout.py` — batched sampler sharing `_build_codec_prefix`;
-   validate by decoding rollouts and listening.
-3. `train/grpo/rewards.py` — CER reward via mlx-whisper + length guard;
-   speaker-sim reward behind `include_ref_mel`.
-4. `train/losses/grpo_loss.py` + `GRPOTrainer` two-phase loop.
-5. `configs/qwen3_tts_hindi_grpo.yaml`; smoke test = 5 steps,
-   `group_size: 2`, dummy reward, assert reward_mean rises on a toy task.
+1. ✅ Reference policy in `train/lora.py` — `lora_snapshot()` + `lora_swapped()`
+   (the float32-safe, SFT-anchored reference). `set_lora_enabled()`/`lora_disabled()`
+   also exist but are *not* the KL reference (see KL section).
+2. ✅ `train/grpo/rollout.py` — `sample_rollouts` (cb0 sampler + frozen
+   `code_predictor` for cb1–15 → decode), `grpo_codec_logits` (shared aligned
+   forward), `gather_token_logprobs`, `decode_codes_to_audio`.
+3. ✅ `train/grpo/rewards.py` — CER via mlx-whisper + length/silence guard,
+   group advantages; speaker-sim reward behind `w_speaker` (Pipeline 2).
+4. ✅ `train/losses/grpo_loss.py` (`qwen3_tts_grpo_loss`) + `train/grpo/trainer.py`
+   (`GRPORolloutLoader` + `GRPOTrainer`).
+5. ✅ `configs/qwen3_tts_hindi_grpo.yaml`; wired into `scripts/train.py` via
+   `pipeline: grpo`. Smoke-tested end-to-end (5 steps, `group_size: 2`,
+   whisper-tiny): loop runs, reference KL anchors at 0, optimizer steps, ckpt
+   saves. Meaningful reward-rise needs a real SFT'd adapter as the start (the
+   base model gives zero-variance rewards → zero advantage) and full-length
+   rollouts — GRPO is a refinement stage, not a from-scratch trainer.
