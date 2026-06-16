@@ -253,6 +253,82 @@ def load_model(cfg: dict):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
+def build_grpo_prompts(cfg: dict, model) -> list:
+    """Build the GRPO prompt list from the train jsonl.
+
+    GRPO only needs prompt TEXT (codec labels are unused unless sft_lambda>0).
+    Text is tokenised via the SAME Qwen3TTSProcessor.encode_text the SFT used,
+    so rollouts run in the regime the SFT adapter was trained on.
+    """
+    import mlx.core as mx
+    from data.processors.qwen3_tts import Qwen3TTSProcessor, Qwen3TTSProcessorConfig
+
+    data_cfg  = cfg.get("data", {})
+    proc_cfg  = cfg.get("processor", {})
+    jsonl_path = data_cfg.get("train_jsonl")
+    if not jsonl_path or not Path(jsonl_path).exists():
+        raise FileNotFoundError(f"[grpo] train_jsonl not found: {jsonl_path}")
+
+    lang_code = cfg["trainer"].get("lang_code", "auto")
+    processor = Qwen3TTSProcessor(Qwen3TTSProcessorConfig(
+        model_id     = cfg["model"]["model_id"],
+        tokenizer_id = cfg["model"]["tokenizer_id"],
+        max_text_len = proc_cfg.get("max_text_len", 256),
+        lang_code    = lang_code,
+    ))
+
+    # Pipeline 2: when the speaker-similarity reward is on, each prompt also needs
+    # a speaker embedding (for the rollout prefix) and a ref_mel (for the reward),
+    # both derived from the record's ref_audio. The frozen speaker_encoder makes
+    # spk_embeds adapter-independent, so compute it once here.
+    want_speaker = cfg.get("grpo", {}).get("rewards", {}).get(
+        "speaker_similarity", {}).get("weight", 0.0) > 0
+    if want_speaker and getattr(model, "speaker_encoder", None) is None:
+        raise RuntimeError("[grpo] speaker_similarity reward needs model.speaker_encoder")
+    sr = data_cfg.get("target_sr", 24000)
+
+    def _speaker_fields(rec):
+        from data.audio_utils import load_audio, mel_spectrogram
+        ref_audio = rec.get("ref_audio")
+        if not ref_audio or not Path(ref_audio).exists():
+            return None
+        wav, _ = load_audio(ref_audio, target_sr=sr)
+        ref_mel = mx.array(mel_spectrogram(wav, sr=sr))[None, ...]   # [1, T, 128]
+        spk = mx.stop_gradient(model.speaker_encoder(ref_mel))        # [1, D]
+        # ref_mel → reward; spk_embeds → concatenated-layout prefix; ref_audio →
+        # interleaved-layout prefix (generate() re-extracts the speaker from it).
+        return {"spk_embeds": spk, "ref_mel": ref_mel, "ref_audio": ref_audio}
+
+    max_samples = data_cfg.get("max_samples", None)
+    prompts, skipped = [], 0
+    with open(jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            text = rec.get("text")
+            if not text:
+                continue
+            prompt = {
+                "text_ids":  mx.array(processor.encode_text(text)),
+                "text":      text,
+                "lang_code": rec.get("lang_code", lang_code),
+            }
+            if want_speaker:
+                spk = _speaker_fields(rec)
+                if spk is None:
+                    skipped += 1
+                    continue
+                prompt.update(spk)
+            prompts.append(prompt)
+            if max_samples and len(prompts) >= max_samples:
+                break
+    note = f" ({skipped} skipped: missing ref_audio)" if skipped else ""
+    print(f"[grpo] built {len(prompts)} prompts from {jsonl_path}{note}")
+    return prompts
+
+
 def build_loss_fn(cfg: dict):
     """Return the appropriate loss function for the model type."""
     model_type = cfg["model"]["model_type"]
@@ -505,6 +581,110 @@ def _build_audio_eval_fn(model, model_type: str, cfg: dict, val_dataset, eval_au
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def run_grpo(model, cfg: dict, args):
+    """GRPO post-training entry point (Pipeline 3).
+
+    Loads the SFT adapter (becomes initial policy AND frozen KL reference),
+    builds the prompt list, and runs GRPOTrainer.train_grpo. Reuses the base
+    Trainer machinery (checkpointing/LR/logging) via GRPOTrainer.
+    """
+    from train.grpo.trainer import GRPOTrainer
+    from train.grpo.rewards import RewardConfig
+    from train.lora import load_adapters
+    from train.trainer import TrainerConfig
+
+    g = cfg.get("grpo", {})
+    t = cfg["trainer"]
+
+    if getattr(model, "speech_tokenizer", None) is None:
+        print("[grpo] ERROR: model.speech_tokenizer is required for rollout decode.")
+        sys.exit(1)
+
+    # Load the SFT adapter — the starting policy and (snapshotted) reference.
+    init_adapters = g.get("init_adapters")
+    if init_adapters and os.path.exists(init_adapters):
+        load_adapters(model, init_adapters)
+        print(f"[grpo] loaded SFT adapter (policy + reference): {init_adapters}")
+    elif init_adapters:
+        print(f"[grpo] WARNING: init_adapters not found ({init_adapters}); "
+              f"starting from BASE — KL will anchor to base, not SFT.")
+    else:
+        print("[grpo] WARNING: no init_adapters set; starting from BASE adapter.")
+
+    prompts = build_grpo_prompts(cfg, model)
+    if not prompts:
+        print("[grpo] ERROR: no prompts built. Check data.train_jsonl.")
+        sys.exit(1)
+
+    # Reward config from the YAML rewards block.
+    rw = g.get("rewards", {})
+    intel = rw.get("intelligibility", {})
+    length = rw.get("length_penalty", {})
+    speaker = rw.get("speaker_similarity", {})
+    reward_cfg = RewardConfig(
+        w_intel   = intel.get("weight",   1.0),
+        w_length  = length.get("weight",  0.5),
+        w_speaker = speaker.get("weight", 0.0),
+        asr_model = intel.get("asr_model", "mlx-community/whisper-large-v3-turbo"),
+        language  = intel.get("language",  cfg["trainer"].get("lang_code", "auto")),
+        metric    = intel.get("metric",    "cer"),
+        no_eos_penalty = length.get("no_eos_penalty", 1.0),
+        silence_penalty = length.get("silence_penalty", 0.5),
+    )
+
+    trainer_config = TrainerConfig(
+        output_dir          = t.get("output_dir",          "./checkpoints/grpo"),
+        run_name            = t.get("run_name",            "grpo"),
+        num_epochs          = t.get("num_epochs",          100),
+        grad_accumulation   = t.get("grad_accumulation",   g.get("prompts_per_step", 4)),
+        max_steps           = t.get("max_steps",           300),
+        learning_rate       = t.get("learning_rate",       5e-6),
+        weight_decay        = t.get("weight_decay",        0.01),
+        grad_clip           = t.get("grad_clip",           1.0),
+        warmup_steps        = t.get("warmup_steps",        10),
+        lr_schedule         = t.get("lr_schedule",         "constant"),
+        save_every_n_steps  = t.get("save_every_n_steps",  50),
+        save_every_n_epochs = t.get("save_every_n_epochs", 999999),
+        keep_last_n         = t.get("keep_last_n",         3),
+        log_every_n_steps   = t.get("log_every_n_steps",   1),
+        log_file            = t.get("log_file",            None),
+        tensorboard_dir     = t.get("tensorboard_dir",     None),
+    )
+
+    # SFT-mixin: build a real SFT batch loader only when the term is active
+    # (it needs codec labels, i.e. a pre-tokenized train_codes.jsonl).
+    sft_lambda = g.get("sft_lambda", 0.0)
+    sft_loader = None
+    if sft_lambda > 0:
+        _, sft_loader = build_dataset(cfg, "train", model=model)
+        if sft_loader is None:
+            print("[grpo] WARNING: sft_lambda>0 but no SFT loader built; mixin disabled.")
+            sft_lambda = 0.0
+
+    import shutil
+    Path(trainer_config.output_dir).mkdir(parents=True, exist_ok=True)
+    shutil.copy(args.config, Path(trainer_config.output_dir) / "model_config.yaml")
+
+    trainer = GRPOTrainer(trainer_config)
+    trainer.train_grpo(
+        model, prompts,
+        reward_cfg     = reward_cfg,
+        group_size     = g.get("group_size",     4),
+        max_new_tokens = g.get("max_new_tokens",  240),
+        temperature    = g.get("temperature",     0.9),
+        top_p          = g.get("top_p",            0.95),
+        top_k          = g.get("top_k",            50),
+        lang_code      = t.get("lang_code",       "auto"),
+        layout         = g.get("layout",          "interleaved"),
+        kl_beta        = g.get("kl_beta",          0.05),
+        kl_clip        = g.get("kl_clip",          10.0),
+        sub_pg_weight  = g.get("sub_pg_weight",    0.0),
+        sft_lambda     = sft_lambda,
+        sft_loader     = sft_loader,
+        skip_zero_variance = g.get("skip_zero_variance", True),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX Audio Finetuning")
     parser.add_argument("--config",     required=True,        help="Path to YAML config")
@@ -598,6 +778,13 @@ def main():
                 print(f"[train] Resumed from: {args.resume}")
             else:
                 print(f"[train] Warning: no adapters found at {adapter_path}")
+
+    # ── GRPO post-training (Pipeline 3) ─────────────────────────────────────
+    # Dispatched before the SFT path: it has its own loss, trainer, and data
+    # (prompt text only). Requires model.speech_tokenizer (for rollout decode).
+    if cfg.get("pipeline") == "grpo":
+        run_grpo(model, cfg, args)
+        return
 
     # Build loss function
     loss_fn = build_loss_fn(cfg)

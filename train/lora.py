@@ -46,6 +46,9 @@ class LoRALinear(nn.Module):
         self.rank   = rank
         self.scale  = alpha / rank
         self.dropout = nn.Dropout(p=dropout) if dropout > 0 else None
+        # When False, __call__ returns the frozen base path only — used to obtain
+        # the SFT-anchored reference policy for GRPO (see set_lora_enabled).
+        self.enabled = True
 
         self.weight = mx.zeros((out_f, in_f))
         if bias:
@@ -56,10 +59,12 @@ class LoRALinear(nn.Module):
         self.lora_b = mx.zeros((out_f, rank))
 
     def __call__(self, x: mx.array) -> mx.array:
-        x_d = self.dropout(x) if self.dropout else x
         y = x @ self.weight.T
         if "bias" in self:
             y = y + self.bias
+        if not self.enabled:
+            return y
+        x_d = self.dropout(x) if self.dropout else x
         return y + (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
 
     def fuse(self) -> nn.Linear:
@@ -106,6 +111,9 @@ class QLoRALinear(nn.Module):
         self.rank    = rank
         self.scale   = alpha / rank
         self.dropout = nn.Dropout(p=dropout) if dropout > 0 else None
+        # When False, __call__ returns the frozen base path only — used to obtain
+        # the SFT-anchored reference policy for GRPO (see set_lora_enabled).
+        self.enabled = True
         # Freeze base so its internal gc_func attrs are excluded from
         # trainable_parameters() traversal — gradients to lora_a/b flow
         # through the input x directly, not through base weights.
@@ -119,6 +127,8 @@ class QLoRALinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         # Frozen quantized forward (handles affine/symmetric correctly)
         y = self.base(x)
+        if not self.enabled:
+            return y
         # Trainable LoRA delta
         x_d = self.dropout(x) if self.dropout else x
         return y + (x_d @ self.lora_a.T @ self.lora_b.T) * self.scale
@@ -317,6 +327,109 @@ def get_trainable_params(model: nn.Module) -> Dict[str, mx.array]:
 
     _walk(model)
     return result
+
+
+def set_lora_enabled(model: nn.Module, enabled: bool) -> int:
+    """Toggle every LoRA/QLoRA adapter in the tree on or off.
+
+    Disabling makes each wrapped layer return only its frozen base path, so a
+    forward pass yields the SFT-anchored *reference policy* used for the GRPO KL
+    term — no copying of weights, no extra modules. Returns the number of
+    adapters toggled. Pair with `lora_disabled(model)` for scoped use.
+    """
+    count = 0
+
+    def _walk(module):
+        children = module.children() if hasattr(module, "children") else {}
+        if not isinstance(children, dict):
+            return
+        for val in children.values():
+            if isinstance(val, (LoRALinear, QLoRALinear)):
+                val.enabled = enabled
+                nonlocal count
+                count += 1
+            elif isinstance(val, nn.Module):
+                _walk(val)
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, nn.Module):
+                        _walk(item)
+
+    _walk(model)
+    return count
+
+
+class lora_disabled:
+    """Context manager: run the enclosed forward as the BASE model (LoRA off).
+
+        with lora_disabled(model):
+            base_logits, _ = model.talker(inputs_embeds)   # LoRA deltas off
+
+    Restores the previous enabled-state on exit. NOTE: this is the *base
+    pretrained* distribution, and the disabled path stays bfloat16 while the
+    enabled path upcasts to float32 — so it is NOT a valid KL reference against
+    the (float32) policy. For the GRPO reference use `lora_snapshot` +
+    `lora_swapped`, which keep both sides on the identical float32 path.
+    """
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    def __enter__(self):
+        set_lora_enabled(self.model, False)
+        return self.model
+
+    def __exit__(self, *exc):
+        set_lora_enabled(self.model, True)
+        return False
+
+
+def lora_snapshot(model: nn.Module) -> Dict[str, mx.array]:
+    """Deep-copy the current LoRA adapter weights — the frozen GRPO reference.
+
+    Take this once at GRPO start (the SFT-trained adapters) and feed it to every
+    rollout via `lora_swapped`. The KL term then measures drift from SFT, on the
+    same float32 forward the policy uses.
+    """
+    return {k: mx.array(v) for k, v in get_trainable_params(model).items()}
+
+
+def _set_lora_params(model: nn.Module, params: Dict[str, mx.array]) -> None:
+    for key, val in params.items():
+        parts = key.split(".")
+        obj = model
+        for p in parts[:-1]:
+            obj = getattr(obj, p) if not p.isdigit() else obj[int(p)]
+        setattr(obj, parts[-1], val)
+
+
+class lora_swapped:
+    """Temporarily install `snapshot` adapter weights for the enclosed forward,
+    then restore the live weights on exit.
+
+        ref_params = lora_snapshot(model)        # once, at GRPO start
+        ...
+        with lora_swapped(model, ref_params):    # per step, no grad
+            ref_logits, *_ = grpo_codec_logits(model, ...)
+
+    Both reference and policy run the identical float32 LoRA path, so their KL
+    reflects only adapter drift — not a bf16-vs-f32 precision gap (which is why
+    `lora_disabled` must not be used as the reference). At GRPO start
+    snapshot == live, so KL is exactly 0.
+    """
+
+    def __init__(self, model: nn.Module, snapshot: Dict[str, mx.array]):
+        self.model = model
+        self.snapshot = snapshot
+
+    def __enter__(self):
+        self._live = {k: v for k, v in get_trainable_params(self.model).items()}
+        _set_lora_params(self.model, self.snapshot)
+        return self.model
+
+    def __exit__(self, *exc):
+        _set_lora_params(self.model, self._live)
+        return False
 
 
 def count_params(model: nn.Module) -> Tuple[int, int]:
