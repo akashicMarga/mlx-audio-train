@@ -52,10 +52,15 @@ def make_grpo_audio_eval_fn(
     sample_rate: int = 24000,
     seed: int = 12345,
     frame_ms: float = 20.0,
+    eval_log: str = None,
 ):
     """Build an `audio_eval_fn(model, step, tb_writer, reference_only=False)`
     closure over a fixed held-out prompt set. At step 0 `reference_only=True`
-    (policy == reference → KL ≈ 0, a sanity baseline)."""
+    (policy == reference → KL ≈ 0, a sanity baseline).
+
+    `eval_log` (optional): append one JSON line per eval (the same scalars logged
+    to TensorBoard). Persisting to disk lets offline consumers — e.g. the
+    ablation runner — collect curves without parsing TB event files."""
 
     win    = max(1, int(sample_rate * frame_ms / 1000.0))
     thresh = 10.0 ** (reward_cfg.silence_rms_db / 20.0)
@@ -137,6 +142,16 @@ def make_grpo_audio_eval_fn(
             tb_writer.add_audio(f"{tag}/sample", first_audio, step, sample_rate=sample_rate)
         print(f"[grpo-eval] step={step} cer={cer_m:.3f} dur={dur_m:.2f}s "
               f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}")
+
+        if eval_log:
+            import json, os
+            os.makedirs(os.path.dirname(eval_log) or ".", exist_ok=True)
+            with open(eval_log, "a") as fh:
+                fh.write(json.dumps({
+                    "step": step, "reference_only": reference_only,
+                    "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
+                    "speaking_rate": rate_m, "kl": kl_m,
+                }) + "\n")
 
         # Restore stochasticity for the training rollouts that follow.
         mx.random.seed(int(time.time() * 1000) & 0xFFFFFFFF)

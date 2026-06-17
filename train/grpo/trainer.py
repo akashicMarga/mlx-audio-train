@@ -246,6 +246,7 @@ class GRPOTrainer(Trainer):
                 layout=layout, lang_code=lang_code, group_size=eval_group_size,
                 max_new_tokens=max_new_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, sample_rate=sample_rate,
+                eval_log=str(self.output_dir / "grpo_eval.jsonl"),
             )
             print(f"[grpo] in-loop eval on {len(eval_prompts)} fixed prompts "
                   f"every {self.cfg.eval_every_n_steps} steps")

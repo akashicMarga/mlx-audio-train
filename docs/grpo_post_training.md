@@ -321,10 +321,23 @@ ablation (4).
    rough relative proxy for Hindi naturalness, not a native MOS; a Hindi-tuned MOS
    or human listening is the real check.
 
-4. **Controlled ablation** (small scale, ~100–150 steps each, audio snapshots
-   every 25–50 steps): interleaved vs concatenated × token- vs sequence-norm PG
-   × `sft_lambda` 0 vs 0.1. We have partial evidence on axis 1 (v1 vs v3) but
-   nothing controlled, and zero data on the other two axes.
+4. 🟡 **Controlled ablation** — *runner built (`scripts/grpo_ablation.py`), sweep
+   not yet executed.* Small scale (~100–150 steps each, audio every 25–50 steps):
+   interleaved vs concatenated × token- vs sequence-norm PG × `sft_lambda` 0 vs
+   0.1 (the three switches from #1–#3). The runner generates one config per cell,
+   runs each as a clean `scripts/train.py` subprocess (no cross-run state), and
+   collects each run's `grpo_eval.jsonl` into one table (final + best CER, KL,
+   speaking-rate, duration). Runs land OUTSIDE the repo by default.
+
+   ```bash
+   python scripts/grpo_ablation.py --base-config configs/qwen3_tts_hindi_grpo.yaml --dry-run
+   python scripts/grpo_ablation.py --base-config configs/qwen3_tts_hindi_grpo.yaml \
+       --out-root ~/grpo_ablation --steps 120
+   python scripts/grpo_ablation.py --out-root ~/grpo_ablation --collect-only
+   ```
+
+   We have partial evidence on axis 1 (v1 vs v3) but nothing controlled, and zero
+   data on the other two axes — running the sweep is the open item.
 
 5. **Richer reward for a bigger gain.** CER alone plateaued (~step 200). Adding
    a naturalness/MOS term (or speaker-similarity for Pipeline 2) alongside CER is
