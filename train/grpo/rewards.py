@@ -89,6 +89,15 @@ class RewardConfig:
     silence_penalty:   float = 0.5
     silence_rms_db:    float = -40.0 # frame considered silent below this
 
+    # speaking-rate guard (anti reward-hacking): CER rewards ASR-friendly speech,
+    # which can degenerate into slow/over-enunciated audio that still transcribes
+    # well. Penalise voiced speech below `speaking_rate_min_cps` chars/sec, graded
+    # by the shortfall. Disabled by default (min_cps=0) — it is a run-dependent
+    # defence; set ~8–10 for Hindi. Measured over VOICED duration (trailing
+    # silence excluded so it doesn't double-count the silence penalty).
+    speaking_rate_min_cps: float = 0.0   # 0 = off
+    speaking_rate_penalty: float = 0.5   # magnitude when fully below the floor
+
     eps: float = 1e-4               # advantage std floor
 
 
@@ -162,15 +171,22 @@ def length_reward(
     cfg: RewardConfig,
     *,
     sample_rate: int,
+    texts: Optional[List[str]] = None,
     frame_ms: float = 20.0,
 ) -> Dict[str, List[float]]:
-    """Degeneracy guard: penalise (a) hitting the token cap without EOS, and
-    (b) excessive trailing silence (a common reward-hacking failure mode where
-    the model pads with quiet to game the ASR). Reward ≤ 0 (it is a penalty)."""
-    rewards, sil_fracs = [], []
+    """Degeneracy guard: penalise (a) hitting the token cap without EOS,
+    (b) excessive trailing silence (padding with quiet to game the ASR), and
+    (c) speech slower than `speaking_rate_min_cps` chars/sec (over-enunciation
+    that keeps CER low while degrading naturalness). Reward ≤ 0 (it is a penalty).
+
+    `texts` (the reference transcript per rollout) is required only for the
+    speaking-rate term; without it that term is skipped.
+    """
+    rewards, sil_fracs, cps_list = [], [], []
     win = max(1, int(sample_rate * frame_ms / 1000.0))
     thresh = 10.0 ** (cfg.silence_rms_db / 20.0)
-    for audio, glen in zip(audios, gen_lengths):
+    texts = texts if texts is not None else [None] * len(audios)
+    for audio, glen, text in zip(audios, gen_lengths, texts):
         pen = 0.0
         if int(glen) >= max_new_tokens:
             pen -= cfg.no_eos_penalty
@@ -178,8 +194,21 @@ def length_reward(
         sil = _trailing_silence_frac(wav, win, thresh)
         if sil > cfg.silence_frac_max:
             pen -= cfg.silence_penalty
-        rewards.append(pen); sil_fracs.append(sil)
-    return {"reward": rewards, "silence_frac": sil_fracs}
+
+        # Speaking rate over VOICED duration (total minus the trailing-silence
+        # tail, so this targets slow articulation, not the padding the silence
+        # term already covers). cps = chars / voiced_seconds.
+        cps = 0.0
+        if cfg.speaking_rate_min_cps > 0 and text:
+            n_chars = len(normalize_text(text).replace(" ", ""))
+            voiced_s = max((len(wav) / sample_rate) * (1.0 - sil), 1e-3)
+            if n_chars > 0:
+                cps = n_chars / voiced_s
+                shortfall = (cfg.speaking_rate_min_cps - cps) / cfg.speaking_rate_min_cps
+                if shortfall > 0:
+                    pen -= cfg.speaking_rate_penalty * min(1.0, shortfall)
+        rewards.append(pen); sil_fracs.append(sil); cps_list.append(cps)
+    return {"reward": rewards, "silence_frac": sil_fracs, "speaking_rate": cps_list}
 
 
 def _trailing_silence_frac(wav: np.ndarray, win: int, thresh: float) -> float:
@@ -267,9 +296,11 @@ def combine_rewards(
         info["r_intel"] = r["reward"]
 
     if cfg.w_length > 0:
-        r = length_reward(audios, gen_lengths, max_new_tokens, cfg, sample_rate=sample_rate)
+        r = length_reward(audios, gen_lengths, max_new_tokens, cfg,
+                          sample_rate=sample_rate, texts=texts)
         total += cfg.w_length * np.asarray(r["reward"], dtype=np.float32)
         info["silence_frac"] = r["silence_frac"]; info["r_length"] = r["reward"]
+        info["speaking_rate"] = r["speaking_rate"]
 
     if cfg.w_speaker > 0:
         r = speaker_similarity_reward(model, audios, ref_mel, sample_rate=sample_rate)

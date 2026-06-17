@@ -253,21 +253,25 @@ def load_model(cfg: dict):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def build_grpo_prompts(cfg: dict, model) -> list:
+def build_grpo_prompts(cfg: dict, model, jsonl_override: str = None,
+                       max_samples_override: int = None) -> list:
     """Build the GRPO prompt list from the train jsonl.
 
     GRPO only needs prompt TEXT (codec labels are unused unless sft_lambda>0).
     Text is tokenised via the SAME Qwen3TTSProcessor.encode_text the SFT used,
     so rollouts run in the regime the SFT adapter was trained on.
+
+    `jsonl_override` / `max_samples_override` let the caller build a separate
+    fixed set (e.g. the held-out in-loop eval prompts) without touching cfg.
     """
     import mlx.core as mx
     from data.processors.qwen3_tts import Qwen3TTSProcessor, Qwen3TTSProcessorConfig
 
     data_cfg  = cfg.get("data", {})
     proc_cfg  = cfg.get("processor", {})
-    jsonl_path = data_cfg.get("train_jsonl")
+    jsonl_path = jsonl_override or data_cfg.get("train_jsonl")
     if not jsonl_path or not Path(jsonl_path).exists():
-        raise FileNotFoundError(f"[grpo] train_jsonl not found: {jsonl_path}")
+        raise FileNotFoundError(f"[grpo] jsonl not found: {jsonl_path}")
 
     lang_code = cfg["trainer"].get("lang_code", "auto")
     processor = Qwen3TTSProcessor(Qwen3TTSProcessorConfig(
@@ -299,7 +303,8 @@ def build_grpo_prompts(cfg: dict, model) -> list:
         # interleaved-layout prefix (generate() re-extracts the speaker from it).
         return {"spk_embeds": spk, "ref_mel": ref_mel, "ref_audio": ref_audio}
 
-    max_samples = data_cfg.get("max_samples", None)
+    max_samples = max_samples_override if max_samples_override is not None \
+        else data_cfg.get("max_samples", None)
     prompts, skipped = [], 0
     with open(jsonl_path) as f:
         for line in f:
@@ -327,6 +332,23 @@ def build_grpo_prompts(cfg: dict, model) -> list:
     note = f" ({skipped} skipped: missing ref_audio)" if skipped else ""
     print(f"[grpo] built {len(prompts)} prompts from {jsonl_path}{note}")
     return prompts
+
+
+def build_grpo_eval_prompts(cfg: dict, model, prompts: list) -> list:
+    """Fixed prompt set for the in-loop held-out eval.
+
+    Prefers a dedicated `grpo.eval.jsonl` (truly held out); otherwise falls back
+    to a deterministic slice of the training prompts (legibility tracking only —
+    these overlap training, so treat the curve as a learning signal, not a
+    generalisation measure).
+    """
+    ev = cfg.get("grpo", {}).get("eval", {})
+    n  = ev.get("num_prompts", 8)
+    eval_jsonl = ev.get("jsonl")
+    if eval_jsonl:
+        return build_grpo_prompts(cfg, model, jsonl_override=eval_jsonl,
+                                  max_samples_override=n)
+    return prompts[:n]
 
 
 def build_loss_fn(cfg: dict):
@@ -616,6 +638,9 @@ def run_grpo(model, cfg: dict, args):
         print("[grpo] ERROR: no prompts built. Check data.train_jsonl.")
         sys.exit(1)
 
+    # Fixed prompt set for the in-loop held-out eval (legibility).
+    eval_prompts = build_grpo_eval_prompts(cfg, model, prompts)
+
     # Reward config from the YAML rewards block.
     rw = g.get("rewards", {})
     intel = rw.get("intelligibility", {})
@@ -630,6 +655,8 @@ def run_grpo(model, cfg: dict, args):
         metric    = intel.get("metric",    "cer"),
         no_eos_penalty = length.get("no_eos_penalty", 1.0),
         silence_penalty = length.get("silence_penalty", 0.5),
+        speaking_rate_min_cps = length.get("speaking_rate_min_cps", 0.0),
+        speaking_rate_penalty = length.get("speaking_rate_penalty", 0.5),
     )
 
     trainer_config = TrainerConfig(
@@ -647,6 +674,7 @@ def run_grpo(model, cfg: dict, args):
         save_every_n_epochs = t.get("save_every_n_epochs", 999999),
         keep_last_n         = t.get("keep_last_n",         3),
         log_every_n_steps   = t.get("log_every_n_steps",   1),
+        eval_every_n_steps  = t.get("eval_every_n_steps",  25),
         log_file            = t.get("log_file",            None),
         tensorboard_dir     = t.get("tensorboard_dir",     None),
     )
@@ -679,9 +707,12 @@ def run_grpo(model, cfg: dict, args):
         kl_beta        = g.get("kl_beta",          0.05),
         kl_clip        = g.get("kl_clip",          10.0),
         sub_pg_weight  = g.get("sub_pg_weight",    0.0),
+        pg_norm        = g.get("pg_norm",          "token"),
         sft_lambda     = sft_lambda,
         sft_loader     = sft_loader,
         skip_zero_variance = g.get("skip_zero_variance", True),
+        eval_prompts   = eval_prompts,
+        eval_group_size = g.get("eval", {}).get("group_size", 2),
     )
 
 
