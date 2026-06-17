@@ -684,6 +684,9 @@ def run_grpo(model, cfg: dict, args):
     sft_lambda = g.get("sft_lambda", 0.0)
     sft_loader = None
     if sft_lambda > 0:
+        # GRPO configs size batches by group_size/prompts_per_step, not batch_size,
+        # but build_dataset needs one for the mixin loader — default it small.
+        cfg["trainer"].setdefault("batch_size", g.get("sft_batch_size", 1))
         _, sft_loader = build_dataset(cfg, "train", model=model)
         if sft_loader is None:
             print("[grpo] WARNING: sft_lambda>0 but no SFT loader built; mixin disabled.")
