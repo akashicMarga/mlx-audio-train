@@ -170,6 +170,8 @@ class GRPORolloutLoader:
         info = scored["info"]
         cer_mean = float(np.mean(info["cer"])) if "cer" in info else 0.0
         mos_mean = float(np.mean(info["mos"])) if "mos" in info else 0.0
+        # r_speaker IS the cosine similarity per rollout → its mean is the curve.
+        spk_mean = float(np.mean(info["r_speaker"])) if "r_speaker" in info else 0.0
 
         batch = {
             "codec_ids":    out["codec_ids"],
@@ -179,6 +181,7 @@ class GRPORolloutLoader:
             "reward_mean":  float(np.mean(scored["reward"])),
             "cer_mean":     cer_mean,
             "mos_mean":     mos_mean,
+            "spk_sim_mean": spk_mean,
         }
         if self.layout == "interleaved":
             batch["tf_input_embeds"] = out["tf_input_embeds"]
