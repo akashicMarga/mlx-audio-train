@@ -372,5 +372,22 @@ ablation (4).
    real check is still a Hindi-tuned MOS or human listening. Open: tune `w_mos` vs
    `w_intel` on a real run — start ~0.3–0.5 so CER stays the primary signal.
 
-6. **Pipeline 2 (speaker cloning) interleaved.** Wired but only validated on the
-   concatenated path; exercise it end-to-end on the (proven) interleaved layout.
+6. ✅ **Pipeline 2 (speaker cloning) interleaved** — *validated end-to-end.*
+   Config: `configs/qwen3_tts_speaker_grpo.yaml` (`layout: interleaved`,
+   `speaker_similarity.weight > 0`, a `train_jsonl` with `ref_audio` per record).
+   The real fix: the interleaved rollout clones the voice via the generate() path,
+   which calls `extract_speaker_embedding(ref_audio)` expecting a **24 kHz waveform**
+   — but the loader was handing it the ref_audio **path string** (the bug that kept
+   Pipeline 2 concatenated-only). Now `build_grpo_prompts` loads the waveform once
+   (`ref_audio_wav`) and the loader/eval thread it through. Observability:
+   `spk_sim_mean` in training metrics, `grpo_eval/spk_sim` in the in-loop eval.
+   Validated by a 40-step interleaved run (CER + speaker-sim reward, sequence-norm
+   PG): trains cleanly, KL anchors, checkpoint saves. **Finding:** with a strong
+   base model the speaker-sim **saturates (~0.995 cosine)** — it already clones
+   near-perfectly from ref_audio — so the term acts as a *guard*, not the learning
+   driver; CER does the driving. Open: held-out eval doesn't yet score speaker-sim
+   (it generates without ref_audio); add a Pipeline-2 mode there for a real verdict.
+
+Also fixed in passing: the base `Trainer` only broke its inner batch loop on
+`max_steps`, so leftover epochs each pulled one extra batch — cheap for SFT, but an
+expensive wasted rollout for GRPO. It now breaks the epoch loop too.

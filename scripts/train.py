@@ -299,9 +299,11 @@ def build_grpo_prompts(cfg: dict, model, jsonl_override: str = None,
         wav, _ = load_audio(ref_audio, target_sr=sr)
         ref_mel = mx.array(mel_spectrogram(wav, sr=sr))[None, ...]   # [1, T, 128]
         spk = mx.stop_gradient(model.speaker_encoder(ref_mel))        # [1, D]
-        # ref_mel → reward; spk_embeds → concatenated-layout prefix; ref_audio →
-        # interleaved-layout prefix (generate() re-extracts the speaker from it).
-        return {"spk_embeds": spk, "ref_mel": ref_mel, "ref_audio": ref_audio}
+        # ref_mel → reward; spk_embeds → concatenated-layout prefix; ref_audio_wav →
+        # interleaved-layout prefix (generate() re-extracts the speaker from the
+        # WAVEFORM, not the path — extract_speaker_embedding wants a 24 kHz array).
+        return {"spk_embeds": spk, "ref_mel": ref_mel,
+                "ref_audio": ref_audio, "ref_audio_wav": mx.array(wav)}
 
     max_samples = max_samples_override if max_samples_override is not None \
         else data_cfg.get("max_samples", None)

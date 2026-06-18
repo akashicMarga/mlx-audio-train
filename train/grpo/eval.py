@@ -35,7 +35,8 @@ from train.grpo.rollout import (
     _cb0_logits_from_tf_input,
 )
 from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
-                                _trailing_silence_frac, normalize_text)
+                                speaker_similarity_reward, _trailing_silence_frac,
+                                normalize_text)
 
 
 def make_grpo_audio_eval_fn(
@@ -72,7 +73,7 @@ def make_grpo_audio_eval_fn(
             out = sample_rollouts_interleaved(
                 model, prompt["text"], lang_code=lang, group_size=group_size,
                 max_new_tokens=max_new_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, ref_audio=prompt.get("ref_audio"),
+                top_p=top_p, top_k=top_k, ref_audio=prompt.get("ref_audio_wav"),
                 compute_ref=True, ref_params=ref_params,
             )
             T = out["codec_ids"].shape[1]
@@ -96,10 +97,11 @@ def make_grpo_audio_eval_fn(
             policy_logp = gather_token_logprobs(logits, out["codec_ids"])
         return out, policy_logp
 
-    log_mos = getattr(reward_cfg, "w_mos", 0.0) > 0     # only when MOS is a reward
+    log_mos = getattr(reward_cfg, "w_mos", 0.0) > 0       # only when MOS is a reward
+    log_spk = getattr(reward_cfg, "w_speaker", 0.0) > 0   # Pipeline 2: speaker-sim
 
     def _eval(model, step, tb_writer, reference_only: bool = False):
-        cers, durs, sils, kls, rates, moss = [], [], [], [], [], []
+        cers, durs, sils, kls, rates, moss, spks = [], [], [], [], [], [], []
         first_audio = None
 
         for pi, prompt in enumerate(prompts):
@@ -112,6 +114,9 @@ def make_grpo_audio_eval_fn(
             cers.extend(r["cer"])
             if log_mos:
                 moss.extend(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"])
+            if log_spk and prompt.get("ref_mel") is not None:
+                spks.extend(speaker_similarity_reward(
+                    model, audios, prompt["ref_mel"], sample_rate=sample_rate)["reward"])
 
             # k3 KL(π_θ ‖ π_ref), per rollout, averaged over valid cb0 tokens.
             mask = out["codec_mask"].astype(mx.float32)
@@ -146,11 +151,15 @@ def make_grpo_audio_eval_fn(
         mos_m = float(np.mean(moss)) if moss else None
         if mos_m is not None:
             tb_writer.add_scalar(f"{tag}/dnsmos_ovrl", mos_m, step)
+        spk_m = float(np.mean(spks)) if spks else None
+        if spk_m is not None:
+            tb_writer.add_scalar(f"{tag}/spk_sim", spk_m, step)
         if first_audio is not None:
             tb_writer.add_audio(f"{tag}/sample", first_audio, step, sample_rate=sample_rate)
         print(f"[grpo-eval] step={step} cer={cer_m:.3f} dur={dur_m:.2f}s "
               f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}"
-              + (f" mos={mos_m:.2f}" if mos_m is not None else ""))
+              + (f" mos={mos_m:.2f}" if mos_m is not None else "")
+              + (f" spk={spk_m:.3f}" if spk_m is not None else ""))
 
         if eval_log:
             import json, os
@@ -162,6 +171,8 @@ def make_grpo_audio_eval_fn(
             }
             if mos_m is not None:
                 rec["dnsmos_ovrl"] = mos_m
+            if spk_m is not None:
+                rec["spk_sim"] = spk_m
             with open(eval_log, "a") as fh:
                 fh.write(json.dumps(rec) + "\n")
 
