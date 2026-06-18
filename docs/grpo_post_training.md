@@ -385,8 +385,12 @@ ablation (4).
    PG): trains cleanly, KL anchors, checkpoint saves. **Finding:** with a strong
    base model the speaker-sim **saturates (~0.995 cosine)** — it already clones
    near-perfectly from ref_audio — so the term acts as a *guard*, not the learning
-   driver; CER does the driving. Open: held-out eval doesn't yet score speaker-sim
-   (it generates without ref_audio); add a Pipeline-2 mode there for a real verdict.
+   driver; CER does the driving. `scripts/grpo_heldout_eval.py` auto-detects
+   Pipeline 2 (held-out prompts carrying `ref_mel`): it clones from `ref_audio` and
+   adds a `spk_sim` column next to CER/MOS, so cells can be ranked on voice match
+   too. The saturation means the held-out speaker-sim gap between SFT and GRPO is
+   small — to make speaker-sim the *driver* you'd need a harder cloning setup
+   (unseen target voices, or a weaker init) where it isn't already ~1.0.
 
 Also fixed in passing: the base `Trainer` only broke its inner batch loop on
 `max_steps`, so leftover epochs each pulled one extra batch — cheap for SFT, but an
