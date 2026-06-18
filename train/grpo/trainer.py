@@ -169,6 +169,7 @@ class GRPORolloutLoader:
         adv = group_advantages(reward, group_size=G, eps=self.reward_cfg.eps)
         info = scored["info"]
         cer_mean = float(np.mean(info["cer"])) if "cer" in info else 0.0
+        mos_mean = float(np.mean(info["mos"])) if "mos" in info else 0.0
 
         batch = {
             "codec_ids":    out["codec_ids"],
@@ -177,6 +178,7 @@ class GRPORolloutLoader:
             "ref_logprobs": out["ref_logprobs"],
             "reward_mean":  float(np.mean(scored["reward"])),
             "cer_mean":     cer_mean,
+            "mos_mean":     mos_mean,
         }
         if self.layout == "interleaved":
             batch["tf_input_embeds"] = out["tf_input_embeds"]

@@ -646,13 +646,16 @@ def run_grpo(model, cfg: dict, args):
     intel = rw.get("intelligibility", {})
     length = rw.get("length_penalty", {})
     speaker = rw.get("speaker_similarity", {})
+    naturalness = rw.get("naturalness", {})
     reward_cfg = RewardConfig(
         w_intel   = intel.get("weight",   1.0),
         w_length  = length.get("weight",  0.5),
         w_speaker = speaker.get("weight", 0.0),
+        w_mos     = naturalness.get("weight", 0.0),
         asr_model = intel.get("asr_model", "mlx-community/whisper-large-v3-turbo"),
         language  = intel.get("language",  cfg["trainer"].get("lang_code", "auto")),
         metric    = intel.get("metric",    "cer"),
+        mos_metric = naturalness.get("metric", "ovrl"),
         no_eos_penalty = length.get("no_eos_penalty", 1.0),
         silence_penalty = length.get("silence_penalty", 0.5),
         speaking_rate_min_cps = length.get("speaking_rate_min_cps", 0.0),

@@ -77,11 +77,17 @@ class RewardConfig:
     w_intel:   float = 1.0
     w_length:  float = 0.5
     w_speaker: float = 0.0          # Pipeline 2 only; >0 enables speaker-sim
+    w_mos:     float = 0.0          # >0 enables naturalness/MOS (DNSMOS); needs speechmos
 
     # intelligibility / ASR
     asr_model: str = "mlx-community/whisper-large-v3-turbo"
     language:  str = "hi"
     metric:    str = "cer"          # "cer" or "wer"
+
+    # naturalness / MOS (the lever beyond CER-only: CER rewards legibility, not
+    # quality). Reference-free DNSMOS P.835; English-trained → a rough RELATIVE
+    # proxy for Hindi naturalness, not a native MOS (see docs). 0 = off.
+    mos_metric: str = "ovrl"        # ovrl | sig | bak (DNSMOS sub-score)
 
     # length / degeneracy guard
     no_eos_penalty:    float = 1.0   # subtracted if generation hit the token cap
@@ -267,6 +273,59 @@ def speaker_similarity_reward(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Naturalness / MOS (DNSMOS) — reference-free quality, the lever beyond CER
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DNSMOS = None
+
+
+def _get_dnsmos():
+    """Lazy-load DNSMOS (speechmos + onnxruntime). Cached; raises a clear error if
+    the optional backend is missing so `w_mos>0` fails loudly, not silently."""
+    global _DNSMOS
+    if _DNSMOS is None:
+        try:
+            from speechmos import dnsmos
+        except ImportError as e:
+            raise RuntimeError(
+                "naturalness reward (w_mos>0) needs DNSMOS: pip install speechmos onnxruntime"
+            ) from e
+        _DNSMOS = dnsmos
+    return _DNSMOS
+
+
+def naturalness_reward(
+    audios: List[mx.array],
+    cfg:    RewardConfig,
+    *,
+    sample_rate: int,
+) -> Dict[str, List[float]]:
+    """r_nat = (DNSMOS − 1) / 4 ∈ [0, 1] per rollout (P.835 MOS ~[1,5] rescaled).
+
+    CER rewards legibility but is blind to quality (a robotic but transcribable
+    clip scores well); DNSMOS adds the naturalness axis. It is English-trained, so
+    treat it as a RELATIVE proxy for Hindi, not an absolute MOS. Degenerate/short
+    rollouts score 0 (worst) rather than poisoning the group with a NaN.
+
+    Returns {"reward": [...0..1...], "mos": [...raw OVRL...]}.
+    """
+    dnsmos = _get_dnsmos()
+    key = f"{cfg.mos_metric}_mos"                       # ovrl_mos | sig_mos | bak_mos
+    rewards, mos = [], []
+    for audio in audios:
+        wav = _to_whisper_audio(audio, sample_rate)     # DNSMOS wants 16 kHz
+        if wav.shape[0] < 256 or not np.all(np.isfinite(wav)):
+            rewards.append(0.0); mos.append(1.0); continue
+        try:
+            score = float(dnsmos.run(wav, sr=WHISPER_SR)[key])
+        except Exception:
+            rewards.append(0.0); mos.append(1.0); continue
+        rewards.append(min(1.0, max(0.0, (score - 1.0) / 4.0)))
+        mos.append(score)
+    return {"reward": rewards, "mos": mos}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Orchestration + advantages
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -283,7 +342,7 @@ def combine_rewards(
 ) -> Dict[str, object]:
     """Run the enabled rewards, return total per-rollout reward + a metrics dict.
 
-    total_i = w_intel·r_intel + w_length·r_length + w_speaker·r_spk
+    total_i = w_intel·r_intel + w_length·r_length + w_speaker·r_spk + w_mos·r_mos
     """
     n = len(audios)
     total = np.zeros(n, dtype=np.float32)
@@ -306,6 +365,11 @@ def combine_rewards(
         r = speaker_similarity_reward(model, audios, ref_mel, sample_rate=sample_rate)
         total += cfg.w_speaker * np.asarray(r["reward"], dtype=np.float32)
         info["r_speaker"] = r["reward"]
+
+    if cfg.w_mos > 0:
+        r = naturalness_reward(audios, cfg, sample_rate=sample_rate)
+        total += cfg.w_mos * np.asarray(r["reward"], dtype=np.float32)
+        info["mos"] = r["mos"]; info["r_mos"] = r["reward"]
 
     info["reward_total"] = total.tolist()
     return {"reward": total, "info": info}

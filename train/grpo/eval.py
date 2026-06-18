@@ -34,7 +34,8 @@ from train.grpo.rollout import (
     gather_token_logprobs,
     _cb0_logits_from_tf_input,
 )
-from train.grpo.rewards import intelligibility_reward, _trailing_silence_frac, normalize_text
+from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
+                                _trailing_silence_frac, normalize_text)
 
 
 def make_grpo_audio_eval_fn(
@@ -95,8 +96,10 @@ def make_grpo_audio_eval_fn(
             policy_logp = gather_token_logprobs(logits, out["codec_ids"])
         return out, policy_logp
 
+    log_mos = getattr(reward_cfg, "w_mos", 0.0) > 0     # only when MOS is a reward
+
     def _eval(model, step, tb_writer, reference_only: bool = False):
-        cers, durs, sils, kls, rates = [], [], [], [], []
+        cers, durs, sils, kls, rates, moss = [], [], [], [], [], []
         first_audio = None
 
         for pi, prompt in enumerate(prompts):
@@ -107,6 +110,8 @@ def make_grpo_audio_eval_fn(
             r = intelligibility_reward(
                 audios, [prompt["text"]] * group_size, reward_cfg, sample_rate=sample_rate)
             cers.extend(r["cer"])
+            if log_mos:
+                moss.extend(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"])
 
             # k3 KL(π_θ ‖ π_ref), per rollout, averaged over valid cb0 tokens.
             mask = out["codec_mask"].astype(mx.float32)
@@ -138,20 +143,27 @@ def make_grpo_audio_eval_fn(
         tb_writer.add_scalar(f"{tag}/trailing_silence", sil_m, step)
         tb_writer.add_scalar(f"{tag}/speaking_rate",    rate_m, step)
         tb_writer.add_scalar(f"{tag}/kl",               kl_m,  step)
+        mos_m = float(np.mean(moss)) if moss else None
+        if mos_m is not None:
+            tb_writer.add_scalar(f"{tag}/dnsmos_ovrl", mos_m, step)
         if first_audio is not None:
             tb_writer.add_audio(f"{tag}/sample", first_audio, step, sample_rate=sample_rate)
         print(f"[grpo-eval] step={step} cer={cer_m:.3f} dur={dur_m:.2f}s "
-              f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}")
+              f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}"
+              + (f" mos={mos_m:.2f}" if mos_m is not None else ""))
 
         if eval_log:
             import json, os
             os.makedirs(os.path.dirname(eval_log) or ".", exist_ok=True)
+            rec = {
+                "step": step, "reference_only": reference_only,
+                "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
+                "speaking_rate": rate_m, "kl": kl_m,
+            }
+            if mos_m is not None:
+                rec["dnsmos_ovrl"] = mos_m
             with open(eval_log, "a") as fh:
-                fh.write(json.dumps({
-                    "step": step, "reference_only": reference_only,
-                    "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
-                    "speaking_rate": rate_m, "kl": kl_m,
-                }) + "\n")
+                fh.write(json.dumps(rec) + "\n")
 
         # Restore stochasticity for the training rollouts that follow.
         mx.random.seed(int(time.time() * 1000) & 0xFFFFFFFF)
