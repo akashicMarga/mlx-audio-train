@@ -321,23 +321,43 @@ ablation (4).
    rough relative proxy for Hindi naturalness, not a native MOS; a Hindi-tuned MOS
    or human listening is the real check.
 
-4. 🟡 **Controlled ablation** — *runner built (`scripts/grpo_ablation.py`), sweep
-   not yet executed.* Small scale (~100–150 steps each, audio every 25–50 steps):
-   interleaved vs concatenated × token- vs sequence-norm PG × `sft_lambda` 0 vs
-   0.1 (the three switches from #1–#3). The runner generates one config per cell,
-   runs each as a clean `scripts/train.py` subprocess (no cross-run state), and
-   collects each run's `grpo_eval.jsonl` into one table (final + best CER, KL,
-   speaking-rate, duration). Runs land OUTSIDE the repo by default.
+4. ✅ **Controlled ablation** — *first cheap sweep run; directional, not yet
+   significant.* Tooling: `scripts/grpo_ablation.py` (one config per cell → clean
+   `scripts/train.py` subprocess → collects each run's `grpo_eval.jsonl`) +
+   `scripts/grpo_heldout_eval.py` (post-hoc held-out CER, the real verdict the
+   noisy 6-prompt in-loop eval can't give). Runs land OUTSIDE the repo.
 
    ```bash
-   python scripts/grpo_ablation.py --base-config configs/qwen3_tts_hindi_grpo.yaml --dry-run
-   python scripts/grpo_ablation.py --base-config configs/qwen3_tts_hindi_grpo.yaml \
-       --out-root ~/grpo_ablation --steps 120
-   python scripts/grpo_ablation.py --out-root ~/grpo_ablation --collect-only
+   python scripts/grpo_ablation.py --base-config <grpo>.yaml --out-root ~/grpo_ablation --steps 100
+   python scripts/grpo_heldout_eval.py --config <grpo>.yaml --ablation-root ~/grpo_ablation \
+       --heldout-jsonl <val>.jsonl --num-sentences 100 --seeds 2
    ```
 
-   We have partial evidence on axis 1 (v1 vs v3) but nothing controlled, and zero
-   data on the other two axes — running the sweep is the open item.
+   **First sweep** (focused: layout fixed = interleaved, the proven winner;
+   `pg_norm` × `sft_lambda`; group_size 2, 100 steps — deliberately cheap to
+   compare axes, *not* a full validated run). Held-out CER (100 sentences × 2
+   seeds, capped at 1.0; from the SFT adapter):
+
+   | cell | CER ↓ | Δ vs SFT | median | cps | wilcoxon p |
+   |---|---|---|---|---|---|
+   | SFT baseline | 0.146 | — | 0.128 | 8.3 | — |
+   | **sequence + sft 0.1** | **0.136** | **−0.010** | 0.120 | 7.6 | 0.10 |
+   | sequence + sft 0 | 0.163 | +0.017 | 0.127 | 7.5 | 0.17 |
+   | token + sft 0 | 0.184 | +0.039 | 0.126 | 8.4 | 0.25 |
+   | token + sft 0.1 | 0.214 | +0.068 | 0.133 | 8.1 | 0.18 |
+
+   Reading it honestly: **nothing is significant** (all p > 0.10 at this scale).
+   But two directional findings: (a) **sequence-norm PG beats token-norm in both
+   `sft` settings** — the clearest axis signal, consistent with the #2 length-bias
+   argument; (b) **only `sequence + sft 0.1` beat SFT** (−6.7% rel, median also
+   down), i.e. the two new switches help *in combination*. token cells degraded —
+   `token+sft0.1`'s mean is outlier-inflated (its median, 0.133, is near baseline),
+   so the damage is a few degenerate rollouts, not a uniform shift. No reward
+   hacking anywhere (cps 7.5–8.4 vs 8.3, no rate collapse — the #3 guard wasn't
+   needed). This does **not** overturn the validated result (gs4, 863 prompts, 400
+   steps, −11%); its job is config guidance for the next full run: **sequence-norm
+   PG + `sft_lambda` 0.1**. Open: re-run at gs4 / longer / more seeds to move from
+   directional to significant, and add the concatenated-layout arm.
 
 5. **Richer reward for a bigger gain.** CER alone plateaued (~step 200). Adding
    a naturalness/MOS term (or speaker-similarity for Pipeline 2) alongside CER is
