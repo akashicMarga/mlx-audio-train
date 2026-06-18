@@ -87,9 +87,32 @@ class GRPORolloutLoader:
         self._sft_iter = iter(sft_loader) if sft_loader is not None else None
         self._rng = random.Random(seed)
         self._n_skipped = 0
+        # Per-logging-window counters drained by the base Trainer via
+        # pop_window_metrics() — surfaces the skip RATE per window, not just a
+        # single end-of-run total (a high rate = sparse PG signal even when the
+        # run "looks alive").
+        self._window_skipped = 0
+        self._window_built   = 0
 
     def __len__(self) -> int:
         return len(self.prompts)
+
+    def pop_window_metrics(self) -> Dict[str, float]:
+        """Return + reset this window's rollout-group accounting.
+
+        skip_ratio = skipped / (skipped + built) over the window. Called by the
+        base Trainer at each `log_every_n_steps` boundary, so the window aligns
+        with the logging cadence.
+        """
+        s, b = self._window_skipped, self._window_built
+        self._window_skipped = 0
+        self._window_built   = 0
+        total = s + b
+        return {
+            "skip_ratio": (s / total) if total else 0.0,
+            "skipped":    float(s),
+            "built":      float(b),
+        }
 
     def _next_sft_batch(self):
         if self._sft_iter is None:
@@ -140,6 +163,7 @@ class GRPORolloutLoader:
         # Phase-B forward/backward and avoid diluting the effective batch.
         if self.skip_zero_variance and float(reward.std()) < self.zero_var_eps:
             self._n_skipped += 1
+            self._window_skipped += 1
             return None
 
         adv = group_advantages(reward, group_size=G, eps=self.reward_cfg.eps)
@@ -164,6 +188,7 @@ class GRPORolloutLoader:
                 batch["spk_embeds"] = spk_batched
         if self.sft_lambda > 0:
             batch["sft_batch"] = self._next_sft_batch()
+        self._window_built += 1
         return batch
 
     def __iter__(self):
@@ -199,15 +224,34 @@ class GRPOTrainer(Trainer):
         kl_beta: float = 0.05,
         kl_clip: float = 10.0,
         sub_pg_weight: float = 0.0,
+        pg_norm: str = "token",
         sft_lambda: float = 0.0,
         sft_loader=None,
         skip_zero_variance: bool = True,
         sample_rate: int = 24000,
+        eval_prompts: Optional[List[Dict]] = None,
+        eval_group_size: int = 2,
         seed: int = 0,
     ):
         # Freeze the reference = current (SFT) adapter, once. KL anchors to this.
         ref_params = lora_snapshot(model)
         print(f"[grpo] snapshotted reference adapter ({len(ref_params)} tensors)  layout={layout}")
+
+        # In-loop fixed-prompt held-out eval (legibility). Needs TensorBoard for
+        # the scalar/audio sink; fires on the base Trainer's eval_every_n_steps.
+        if eval_prompts and self._tb_writer is not None:
+            from train.grpo.eval import make_grpo_audio_eval_fn
+            self._audio_eval_fn = make_grpo_audio_eval_fn(
+                eval_prompts, ref_params, reward_cfg,
+                layout=layout, lang_code=lang_code, group_size=eval_group_size,
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, sample_rate=sample_rate,
+                eval_log=str(self.output_dir / "grpo_eval.jsonl"),
+            )
+            print(f"[grpo] in-loop eval on {len(eval_prompts)} fixed prompts "
+                  f"every {self.cfg.eval_every_n_steps} steps")
+        elif eval_prompts:
+            print("[grpo] eval_prompts set but no tensorboard_dir — in-loop eval disabled")
 
         loader = GRPORolloutLoader(
             model, prompts, ref_params, reward_cfg,
@@ -220,7 +264,7 @@ class GRPOTrainer(Trainer):
         loss_fn: Callable = partial(
             qwen3_tts_grpo_loss,
             kl_beta=kl_beta, kl_clip=kl_clip, sub_pg_weight=sub_pg_weight,
-            sft_lambda=sft_lambda, lang_code=lang_code,
+            pg_norm=pg_norm, sft_lambda=sft_lambda, lang_code=lang_code,
         )
 
         # Reuse the whole base loop (grad accum = prompts_per_step, logging, ckpt).

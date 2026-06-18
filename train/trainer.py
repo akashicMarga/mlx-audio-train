@@ -375,6 +375,13 @@ class Trainer:
                         "elapsed": round(elapsed, 1),
                     }
                     log.update({k: round(v, 5) for k, v in step_metrics.items() if k != "loss"})
+                    # Loaders may expose per-window counters that never reach the
+                    # loss (e.g. GRPO's zero-variance skips, which return no batch).
+                    # Drain them here so they log on the same window cadence.
+                    window_metrics: Dict[str, float] = {}
+                    if hasattr(train_loader, "pop_window_metrics"):
+                        window_metrics = train_loader.pop_window_metrics()
+                        log.update({k: round(v, 5) for k, v in window_metrics.items()})
                     self._log(log)
                     if self._tb_writer:
                         self._tb_writer.add_scalar("train/loss", step_loss, self._step)
@@ -382,6 +389,8 @@ class Trainer:
                         for k, v in step_metrics.items():
                             if k != "loss":
                                 self._tb_writer.add_scalar(f"train/{k}", v, self._step)
+                        for k, v in window_metrics.items():
+                            self._tb_writer.add_scalar(f"train/{k}", v, self._step)
                         self._tb_writer.flush()
 
                 # ── Eval ───────────────────────────────────────────────────
@@ -394,13 +403,17 @@ class Trainer:
                     if val_loss < self._best_val:
                         self._best_val = val_loss
                         self._save_checkpoint(model, tag="best")
-                    # Audio eval: generate + log sample audio to TensorBoard
-                    if self._audio_eval_fn and self._tb_writer:
-                        try:
-                            self._audio_eval_fn(model, self._step, self._tb_writer)
-                            self._tb_writer.flush()
-                        except Exception as e:
-                            print(f"[trainer] audio_eval_fn failed at step {self._step}: {e}")
+
+                # Audio eval: generate + log sample audio/metrics to TensorBoard.
+                # Independent of val_loader so loss-free pipelines (e.g. GRPO) can
+                # run a periodic fixed-prompt held-out eval on the same schedule.
+                if (self._audio_eval_fn and self._tb_writer
+                        and self._step % cfg.eval_every_n_steps == 0):
+                    try:
+                        self._audio_eval_fn(model, self._step, self._tb_writer)
+                        self._tb_writer.flush()
+                    except Exception as e:
+                        print(f"[trainer] audio_eval_fn failed at step {self._step}: {e}")
 
                 # ── Checkpoint ─────────────────────────────────────────────
                 if self._step % cfg.save_every_n_steps == 0:

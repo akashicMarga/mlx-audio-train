@@ -37,6 +37,30 @@ from train.grpo.rollout import grpo_codec_logits, gather_token_logprobs
 from train.losses.codec_loss import qwen3_tts_loss
 
 
+def _masked_reduce(
+    values:  mx.array,    # [G, T] per-token quantity
+    mask:    mx.array,    # [G, T] float
+    n_valid: mx.array,    # scalar: total valid tokens
+    pg_norm: str,
+) -> mx.array:
+    """Reduce a per-token quantity to a scalar under one of two conventions:
+
+      "token"    — Σ values / Σ tokens  (global token mean). Longer rollouts
+                   carry proportionally more weight: the known GRPO length bias.
+      "sequence" — mean over rollouts of each rollout's per-token mean. Every
+                   rollout contributes equally regardless of length, removing the
+                   length bias (Dr. GRPO / DAPO).
+
+    Applied identically to the PG (main + sub) and KL terms so `kl_beta` keeps
+    the same meaning across modes.
+    """
+    if pg_norm == "sequence":
+        tok_per_seq = mx.maximum(mask.sum(axis=1), 1.0)          # [G]
+        per_seq     = (values * mask).sum(axis=1) / tok_per_seq  # [G]
+        return per_seq.mean()
+    return (values * mask).sum() / n_valid
+
+
 def qwen3_tts_grpo_loss(
     model,
     batch: Dict[str, mx.array],
@@ -44,6 +68,7 @@ def qwen3_tts_grpo_loss(
     kl_beta:        float = 0.05,
     kl_clip:        float = 10.0,   # clamp |logπ_ref − logπ_θ| before exp (k3 stability)
     sub_pg_weight:  float = 0.0,
+    pg_norm:        str   = "token",  # "token" (length-weighted) | "sequence" (length-neutral)
     sft_lambda:     float = 0.0,
     label_smoothing: float = 0.0,   # only applied to the SFT-mixin term
     lang_code:      str   = "auto",
@@ -77,14 +102,14 @@ def qwen3_tts_grpo_loss(
     logp = gather_token_logprobs(logits, codec_ids)   # [G, T] = logπ_θ(sampled)
 
     # ── Policy-gradient term (advantage-weighted NLL, no smoothing) ──────────
-    pg = -(adv * logp * mask).sum() / n_valid
+    pg = _masked_reduce(-(adv * logp), mask, n_valid, pg_norm)
 
     # ── k3 KL(π_θ ‖ π_ref): exp(d) − d − 1,  d = logπ_ref − logπ_θ  (≥0) ─────
     # Clamp d before exp: a sampled token deep in the tail can make d large and
     # blow exp(d) up (and the gradient with it). The clamp bounds that without
     # changing behaviour in the normal small-drift regime.
     d  = mx.clip(mx.stop_gradient(ref_logprobs) - logp, -kl_clip, kl_clip)
-    kl = ((mx.exp(d) - d - 1.0) * mask).sum() / n_valid
+    kl = _masked_reduce(mx.exp(d) - d - 1.0, mask, n_valid, pg_norm)
 
     loss = pg + kl_beta * kl
 
@@ -95,7 +120,7 @@ def qwen3_tts_grpo_loss(
         sub_out    = talker.code_predictor(codec_hidden)
         sub_logits = sub_out[0] if isinstance(sub_out, tuple) else sub_out
         sub_logp   = gather_token_logprobs(sub_logits, codec_ids)
-        sub_pg     = -(adv * sub_logp * mask).sum() / n_valid
+        sub_pg     = _masked_reduce(-(adv * sub_logp), mask, n_valid, pg_norm)
         loss       = loss + sub_pg_weight * sub_pg
 
     # ── Optional SFT-mixin (CE anchor on real data) ─────────────────────────

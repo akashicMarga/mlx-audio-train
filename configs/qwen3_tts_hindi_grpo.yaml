@@ -42,6 +42,8 @@ grpo:
   kl_beta:        0.05        # KL(π_θ ‖ π_ref_SFT) weight (k3 estimator)
   kl_clip:        10.0        # clamp |logπ_ref − logπ_θ| before exp (k3 stability)
   sub_pg_weight:  0.0         # advantage-weight the code_predictor head too (0 = off)
+  pg_norm:        token       # token = Σ/Σtokens (length-weighted; GRPO default) |
+                              # sequence = mean of per-rollout means (length-neutral, Dr.GRPO/DAPO)
   sft_lambda:     0.1         # optional CE anchor on real SFT batches (0 = off)
   skip_zero_variance: true    # drop groups where all rollouts get the same reward (no PG signal)
 
@@ -55,8 +57,21 @@ grpo:
       weight:        0.5
       no_eos_penalty:  1.0     # hit max_new_tokens without EOS
       silence_penalty: 0.5     # excessive trailing silence (degeneracy guard)
+      # Anti reward-hacking: penalise voiced speech slower than min_cps chars/sec
+      # (over-enunciation that keeps CER low). 0 = off; ~8–10 is a sane Hindi floor.
+      speaking_rate_min_cps: 0.0
+      speaking_rate_penalty: 0.5
     # speaker_similarity:      # Pipeline 2 only (needs include_ref_mel + ref audio)
     #   weight: 1.0
+
+  # In-loop held-out eval (TensorBoard only): every trainer.eval_every_n_steps,
+  # roll out a FIXED prompt set with a fixed seed and log cer / duration_s /
+  # trailing_silence / kl (+ a sample waveform). Makes a run self-documenting.
+  eval:
+    num_prompts: 8            # how many fixed prompts to score
+    group_size:  2            # rollouts per prompt (averaged)
+    # jsonl: "./data/hindi/heldout.jsonl"   # optional: a TRULY held-out set;
+    #                                       # omitted → first num_prompts of train
 
 trainer:
   output_dir: "./checkpoints/qwen3-hindi-grpo"
@@ -75,7 +90,7 @@ trainer:
 
   log_every_n_steps:  1
   save_every_n_steps: 50
-  eval_every_n_steps: 999999  # GRPO has no held-out loss; reward_mean is the signal
+  eval_every_n_steps: 25      # in-loop fixed-prompt eval cadence (needs tensorboard_dir)
   save_every_n_epochs: 999999
 
-  # tensorboard_dir: "/tmp/tb/qwen3-hindi-grpo"   # reward_mean/cer_mean/kl curves
+  # tensorboard_dir: "/tmp/tb/qwen3-hindi-grpo"   # reward_mean/cer_mean/kl + grpo_eval/* + train/skip_ratio
