@@ -495,7 +495,7 @@ class IndicParlerTTS(nn.Module):
             f"AR={_t_ar:.2f}s ({last_step} steps, {_sps:.0f} step/s) | "
             f"DAC={_t_dac:.2f}s"
         )
-        return np.array(audio, dtype=np.float32)
+        return np.array(audio.astype(mx.float32), dtype=np.float32)
 
 
     def stream_generate(
@@ -607,7 +607,7 @@ class IndicParlerTTS(nn.Module):
                 # trim the context prefix — only yield the new portion
                 trim = len(_dac_ctx_frames) * 512
                 _dac_ctx_frames = new_frames[-_DAC_CTX:]
-                return np.array(audio, dtype=np.float32)[trim:]
+                return np.array(audio.astype(mx.float32), dtype=np.float32)[trim:]
 
             for step in range(1, max_steps):
                 last_step = step
