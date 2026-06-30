@@ -60,23 +60,30 @@ def discover_adapters(cfg: dict, ablation_root: Path):
     return out
 
 
-def load_heldout(train_mod, cfg: dict, jsonl: str, n: int):
-    """Reuse build_grpo_prompts (text-only) for the held-out set."""
-    prompts = train_mod.build_grpo_prompts(cfg, None, jsonl_override=jsonl,
+def load_heldout(train_mod, cfg: dict, model, jsonl: str, n: int):
+    """Reuse build_grpo_prompts for the held-out set. `model` lets it build the
+    Pipeline-2 ref fields (ref_audio_wav / ref_mel) when speaker_similarity is on;
+    for Pipeline 1 it stays text-only."""
+    prompts = train_mod.build_grpo_prompts(cfg, model, jsonl_override=jsonl,
                                            max_samples_override=n)
     return prompts
 
 
 def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
-                 max_new_tokens, temperature, top_p, top_k, sample_rate):
-    """Generate + CER-score the held-out set over `seeds` seeds. Returns dict."""
+                 max_new_tokens, temperature, top_p, top_k, sample_rate, compute_mos):
+    """Generate + CER-score the held-out set over `seeds` seeds. Returns dict.
+
+    `compute_mos` also scores DNSMOS OVRL (the doc's quality metric) when the
+    speechmos backend is available."""
     import mlx.core as mx
     from train.grpo.rollout import sample_rollouts_interleaved, decode_codes_to_audio
-    from train.grpo.rewards import intelligibility_reward, _trailing_silence_frac, normalize_text
+    from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
+                                    speaker_similarity_reward, _trailing_silence_frac,
+                                    normalize_text)
 
     win    = max(1, int(sample_rate * 20.0 / 1000.0))
     thresh = 10.0 ** (reward_cfg.silence_rms_db / 20.0)
-    cers, durs, cpss = [], [], []      # one entry per (sentence, seed)
+    cers, durs, cpss, moss, spks = [], [], [], [], []   # one entry per (sentence, seed)
     for si in range(seeds):
         for pi, prompt in enumerate(prompts):
             mx.random.seed(1000 * si + pi)
@@ -84,10 +91,16 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
                 model, prompt["text"], lang_code=prompt.get("lang_code", lang_code),
                 group_size=1, max_new_tokens=max_new_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, compute_ref=False, ref_params=None,
+                ref_audio=prompt.get("ref_audio_wav"),   # Pipeline 2: clone the voice
             )
             audios = decode_codes_to_audio(model, out["full_codes"], out["codec_mask"])
             r = intelligibility_reward(audios, [prompt["text"]], reward_cfg, sample_rate=sample_rate)
             cers.append(min(1.0, float(r["cer"][0])))    # capped at 1.0
+            if compute_mos:
+                moss.append(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"][0])
+            if prompt.get("ref_mel") is not None:        # Pipeline 2: speaker similarity
+                spks.append(speaker_similarity_reward(
+                    model, audios, prompt["ref_mel"], sample_rate=sample_rate)["reward"][0])
             wav = np.asarray(audios[0], dtype=np.float32)
             dur = len(wav) / sample_rate
             sil = _trailing_silence_frac(wav, win, thresh)
@@ -99,6 +112,8 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
     return {
         "n": int(cers.size),
         "cer_mean": float(cers.mean()), "cer_median": float(np.median(cers)),
+        "dnsmos_ovrl_mean": float(np.mean(moss)) if moss else None,
+        "spk_sim_mean": float(np.mean(spks)) if spks else None,
         "duration_s_mean": float(np.mean(durs)), "speaking_rate_mean": float(np.mean(cpss)),
         "_cer_per_item": cers.tolist(),     # kept for paired stats; dropped from summary
     }
@@ -145,8 +160,10 @@ def main():
     if getattr(model, "speech_tokenizer", None) is None:
         print("[heldout] ERROR: speech_tokenizer required for decode."); sys.exit(1)
 
-    prompts = load_heldout(train_mod, cfg, args.heldout_jsonl, args.num_sentences)
-    print(f"[heldout] {len(prompts)} held-out sentences × {args.seeds} seeds\n")
+    prompts = load_heldout(train_mod, cfg, model, args.heldout_jsonl, args.num_sentences)
+    is_p2 = bool(prompts) and prompts[0].get("ref_mel") is not None
+    print(f"[heldout] {len(prompts)} held-out sentences × {args.seeds} seeds"
+          f"{'  (Pipeline 2: cloning + speaker-sim)' if is_p2 else ''}\n")
 
     g  = cfg.get("grpo", {})
     rw = g.get("rewards", {}).get("intelligibility", {})
@@ -156,11 +173,20 @@ def main():
         language=rw.get("language", t.get("lang_code", "auto")),
         metric=rw.get("metric", "cer"),
     )
+    try:
+        import speechmos  # noqa: F401
+        compute_mos = True
+    except ImportError:
+        compute_mos = False
+        print("[heldout] speechmos not installed → skipping DNSMOS column "
+              "(pip install speechmos onnxruntime to enable)")
+
     common = dict(
         lang_code=t.get("lang_code", "auto"), seeds=args.seeds,
         max_new_tokens=g.get("max_new_tokens", 240), temperature=g.get("temperature", 0.9),
         top_p=g.get("top_p", 0.95), top_k=g.get("top_k", 50),
         sample_rate=cfg.get("data", {}).get("target_sr", 24000),
+        compute_mos=compute_mos,
     )
 
     results = {}
@@ -169,7 +195,9 @@ def main():
         load_adapters(model, path)
         results[label] = eval_adapter(model, train_mod, prompts, reward_cfg, **common)
         r = results[label]
-        print(f"  cer_mean={r['cer_mean']:.4f}  cer_median={r['cer_median']:.4f}  "
+        mos = f"  mos={r['dnsmos_ovrl_mean']:.3f}" if r["dnsmos_ovrl_mean"] is not None else ""
+        spk = f"  spk={r['spk_sim_mean']:.4f}" if r["spk_sim_mean"] is not None else ""
+        print(f"  cer_mean={r['cer_mean']:.4f}  cer_median={r['cer_median']:.4f}{mos}{spk}  "
               f"dur={r['duration_s_mean']:.2f}s  cps={r['speaking_rate_mean']:.1f}\n")
 
     # ── Table + paired stats vs SFT baseline ────────────────────────────────
@@ -177,10 +205,16 @@ def main():
     print("\n" + "=" * 92)
     print(f"  GRPO held-out eval  ({len(prompts)} sentences × {args.seeds} seeds, CER capped at 1.0)")
     print("=" * 92)
-    print(f"{'adapter':<38}{'cer_mean':>9}{'Δ vs SFT':>10}{'cer_med':>9}{'dur_s':>7}{'cps':>6}{'wilcoxon_p':>12}")
-    print("-" * 92)
+    has_spk = any(r["spk_sim_mean"] is not None for r in results.values())
+    spk_hdr = f"{'spk_sim':>9}" if has_spk else ""
+    print(f"{'adapter':<38}{'cer_mean':>9}{'Δ vs SFT':>10}{'cer_med':>9}{'mos':>7}"
+          f"{spk_hdr}{'cps':>6}{'wilcoxon_p':>12}")
+    print("-" * (92 + (9 if has_spk else 0)))
     for label, r in results.items():
         dcer = (r["cer_mean"] - base["cer_mean"]) if base else 0.0
+        mos = f"{r['dnsmos_ovrl_mean']:.3f}" if r["dnsmos_ovrl_mean"] is not None else "-"
+        spk = (f"{r['spk_sim_mean']:>9.4f}" if r["spk_sim_mean"] is not None
+               else (f"{'-':>9}" if has_spk else ""))
         p = ""
         if base and label != "SFT-baseline":
             try:
@@ -191,8 +225,8 @@ def main():
             except Exception:
                 p = "n/a"
         print(f"{label:<38}{r['cer_mean']:>9.4f}{dcer:>+10.4f}{r['cer_median']:>9.4f}"
-              f"{r['duration_s_mean']:>7.2f}{r['speaking_rate_mean']:>6.1f}{p:>12}")
-    print("=" * 92)
+              f"{mos:>7}{spk}{r['speaking_rate_mean']:>6.1f}{p:>12}")
+    print("=" * (92 + (9 if has_spk else 0)))
 
     out = ablation_root / "heldout_eval.json"
     slim = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in results.items()}

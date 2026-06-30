@@ -299,9 +299,11 @@ def build_grpo_prompts(cfg: dict, model, jsonl_override: str = None,
         wav, _ = load_audio(ref_audio, target_sr=sr)
         ref_mel = mx.array(mel_spectrogram(wav, sr=sr))[None, ...]   # [1, T, 128]
         spk = mx.stop_gradient(model.speaker_encoder(ref_mel))        # [1, D]
-        # ref_mel → reward; spk_embeds → concatenated-layout prefix; ref_audio →
-        # interleaved-layout prefix (generate() re-extracts the speaker from it).
-        return {"spk_embeds": spk, "ref_mel": ref_mel, "ref_audio": ref_audio}
+        # ref_mel → reward; spk_embeds → concatenated-layout prefix; ref_audio_wav →
+        # interleaved-layout prefix (generate() re-extracts the speaker from the
+        # WAVEFORM, not the path — extract_speaker_embedding wants a 24 kHz array).
+        return {"spk_embeds": spk, "ref_mel": ref_mel,
+                "ref_audio": ref_audio, "ref_audio_wav": mx.array(wav)}
 
     max_samples = max_samples_override if max_samples_override is not None \
         else data_cfg.get("max_samples", None)
@@ -646,13 +648,16 @@ def run_grpo(model, cfg: dict, args):
     intel = rw.get("intelligibility", {})
     length = rw.get("length_penalty", {})
     speaker = rw.get("speaker_similarity", {})
+    naturalness = rw.get("naturalness", {})
     reward_cfg = RewardConfig(
         w_intel   = intel.get("weight",   1.0),
         w_length  = length.get("weight",  0.5),
         w_speaker = speaker.get("weight", 0.0),
+        w_mos     = naturalness.get("weight", 0.0),
         asr_model = intel.get("asr_model", "mlx-community/whisper-large-v3-turbo"),
         language  = intel.get("language",  cfg["trainer"].get("lang_code", "auto")),
         metric    = intel.get("metric",    "cer"),
+        mos_metric = naturalness.get("metric", "ovrl"),
         no_eos_penalty = length.get("no_eos_penalty", 1.0),
         silence_penalty = length.get("silence_penalty", 0.5),
         speaking_rate_min_cps = length.get("speaking_rate_min_cps", 0.0),

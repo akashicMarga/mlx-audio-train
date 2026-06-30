@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen3-TTS 0.6B — Hindi Pipeline-2 (speaker cloning) GRPO Post-Training
+# Refines an SFT adapter on the INTERLEAVED (deployment) layout with a combined
+# intelligibility (CER) + speaker-similarity reward. Each prompt carries a
+# ref_audio; the rollout clones the voice from it (generate() path) and the
+# speaker-sim reward scores how close the clone is. See docs/grpo_post_training.md.
+#
+# Note: with a strong base model the speaker-sim term saturates (~0.99 cosine) and
+# acts as a GUARD, not the learning driver — CER does the driving. Keep w_intel>0.
+# ─────────────────────────────────────────────────────────────────────────────
+
+pipeline: grpo
+
+model:
+  model_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+  tokenizer_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  model_type: "qwen3_tts"
+  custom_lang_ids:
+    hi: 2051
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+data:
+  # Pipeline 2 needs ref_audio per record (the voice to clone + score against).
+  train_jsonl: "./data/hindi/train_codes_speaker.jsonl"
+  target_sr: 24000
+  max_samples: null
+
+grpo:
+  init_adapters: "./checkpoints/qwen3-hindi/checkpoint-best/adapters.safetensors"
+
+  layout:          interleaved  # REQUIRED for Pipeline 2 here: clones from ref_audio
+                                # via the generate() path (concatenated uses spk_embeds)
+  group_size:      4
+  prompts_per_step: 4
+  max_new_tokens:  240
+  temperature:     0.9
+  top_p:           0.95
+  top_k:           50
+
+  kl_beta:        0.05
+  kl_clip:        10.0
+  sub_pg_weight:  0.0
+  pg_norm:        sequence      # ablation-recommended (length-neutral)
+  sft_lambda:     0.0
+  skip_zero_variance: true
+
+  rewards:
+    intelligibility:
+      weight:    1.0            # keep CER as the driver
+      asr_model: "mlx-community/whisper-large-v3-turbo"
+      metric:    cer
+      language:  hi
+    length_penalty:
+      weight:        0.5
+      no_eos_penalty:  1.0
+      silence_penalty: 0.5
+    speaker_similarity:
+      weight: 1.0               # cosine(speaker_encoder(gen), speaker_encoder(ref_mel))
+
+  eval:
+    num_prompts: 6
+    group_size:  2
+
+trainer:
+  output_dir: "./checkpoints/qwen3-hindi-speaker-grpo"
+  run_name:   "qwen3-0.6b-hindi-speaker-grpo"
+  lang_code:  "hi"
+
+  num_epochs: 100
+  max_steps:  300
+  grad_accumulation: 4
+
+  learning_rate: 5.0e-6
+  weight_decay:  0.01
+  grad_clip:     1.0
+  warmup_steps:  10
+  lr_schedule:   "constant"
+
+  log_every_n_steps:  1
+  save_every_n_steps: 50
+  eval_every_n_steps: 25        # in-loop eval logs spk_sim too (needs tensorboard_dir)
+  save_every_n_epochs: 999999
+
+  # tensorboard_dir: "/tmp/tb/qwen3-hindi-speaker-grpo"   # spk_sim_mean / grpo_eval/spk_sim

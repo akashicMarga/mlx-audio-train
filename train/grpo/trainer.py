@@ -120,8 +120,18 @@ class GRPORolloutLoader:
         try:
             return next(self._sft_iter)
         except StopIteration:
+            # Loader exhausted → restart for the next epoch. If the restarted
+            # loader is ALSO empty, swallow the second StopIteration (it would
+            # otherwise escape this generator-called method as a cryptic
+            # RuntimeError, PEP 479) and disable the mixin instead.
             self._sft_iter = iter(self.sft_loader)
-            return next(self._sft_iter)
+            try:
+                return next(self._sft_iter)
+            except StopIteration:
+                print("[grpo] WARNING: SFT-mixin loader is empty → disabling mixin "
+                      "(check sft batch_size vs dataset size).")
+                self._sft_iter = None
+                return None
 
     def _build_batch(self, prompt: Dict) -> Dict:
         G = self.G
@@ -132,7 +142,8 @@ class GRPORolloutLoader:
             out = sample_rollouts_interleaved(
                 self.model, prompt["text"], lang_code=lang, group_size=G,
                 max_new_tokens=self.max_new_tokens, temperature=self.temperature,
-                top_p=self.top_p, top_k=self.top_k, ref_audio=prompt.get("ref_audio"),
+                top_p=self.top_p, top_k=self.top_k,
+                ref_audio=prompt.get("ref_audio_wav"),   # waveform for speaker extraction
                 compute_ref=True, ref_params=self.ref_params,
             )
             spk_batched = None
@@ -169,6 +180,9 @@ class GRPORolloutLoader:
         adv = group_advantages(reward, group_size=G, eps=self.reward_cfg.eps)
         info = scored["info"]
         cer_mean = float(np.mean(info["cer"])) if "cer" in info else 0.0
+        mos_mean = float(np.mean(info["mos"])) if "mos" in info else 0.0
+        # r_speaker IS the cosine similarity per rollout → its mean is the curve.
+        spk_mean = float(np.mean(info["r_speaker"])) if "r_speaker" in info else 0.0
 
         batch = {
             "codec_ids":    out["codec_ids"],
@@ -177,6 +191,8 @@ class GRPORolloutLoader:
             "ref_logprobs": out["ref_logprobs"],
             "reward_mean":  float(np.mean(scored["reward"])),
             "cer_mean":     cer_mean,
+            "mos_mean":     mos_mean,
+            "spk_sim_mean": spk_mean,
         }
         if self.layout == "interleaved":
             batch["tf_input_embeds"] = out["tf_input_embeds"]

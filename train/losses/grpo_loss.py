@@ -140,6 +140,8 @@ def qwen3_tts_grpo_loss(
         "sft":         float(sft_ce),
         "reward_mean": float(batch.get("reward_mean", 0.0)),
         "cer_mean":    float(batch.get("cer_mean", 0.0)),
+        "mos_mean":    float(batch.get("mos_mean", 0.0)),
+        "spk_sim_mean": float(batch.get("spk_sim_mean", 0.0)),
         "adv_abs":     float(mx.abs(advantages).mean()),
         "logp_mean":   float((logp * mask).sum() / n_valid),
     }

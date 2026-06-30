@@ -63,6 +63,9 @@ grpo:
       speaking_rate_penalty: 0.5
     # speaker_similarity:      # Pipeline 2 only (needs include_ref_mel + ref audio)
     #   weight: 1.0
+    # naturalness:             # DNSMOS quality term — the lever beyond CER-only.
+    #   weight: 0.5            #   needs `pip install speechmos onnxruntime`. 0/absent = off.
+    #   metric: ovrl           #   ovrl | sig | bak (DNSMOS P.835 sub-score)
 
   # In-loop held-out eval (TensorBoard only): every trainer.eval_every_n_steps,
   # roll out a FIXED prompt set with a fixed seed and log cer / duration_s /

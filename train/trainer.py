@@ -430,6 +430,12 @@ class Trainer:
             if (epoch + 1) % cfg.save_every_n_epochs == 0:
                 self._save_checkpoint(model, tag=f"epoch_{epoch+1:04d}")
 
+            # Stop once max_steps is hit — the inner break only exits the batch
+            # loop, so without this the remaining epochs would each pull (and, for
+            # GRPO, expensively roll out) one batch before breaking again.
+            if cfg.max_steps and self._step >= cfg.max_steps:
+                break
+
         # Final checkpoint
         self._save_checkpoint(model, tag="final")
         print(f"\n✅ Training complete. Checkpoints at: {self.output_dir}")

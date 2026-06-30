@@ -359,9 +359,39 @@ ablation (4).
    PG + `sft_lambda` 0.1**. Open: re-run at gs4 / longer / more seeds to move from
    directional to significant, and add the concatenated-layout arm.
 
-5. **Richer reward for a bigger gain.** CER alone plateaued (~step 200). Adding
-   a naturalness/MOS term (or speaker-similarity for Pipeline 2) alongside CER is
-   the lever for further improvement beyond the modest CER-only result.
+5. ✅ **Richer reward for a bigger gain** — *wired, off by default.* CER rewards
+   legibility, not quality (a robotic but transcribable clip still scores well), so
+   CER-only plateaus (~step 200). `train/grpo/rewards.py:naturalness_reward` adds a
+   **reference-free DNSMOS (P.835)** term behind `w_mos`: `r_nat = (OVRL−1)/4 ∈
+   [0,1]`, combined as `… + w_mos·r_nat`. Enable with a `rewards.naturalness`
+   block (`weight`, `metric: ovrl|sig|bak`); needs `pip install speechmos
+   onnxruntime`. Logged as `mos_mean` in training and `grpo_eval/dnsmos_ovrl` in the
+   in-loop eval; `scripts/grpo_heldout_eval.py` now reports a DNSMOS column matching
+   the validated-result table. DNSMOS is English-trained → a **relative** proxy for
+   Hindi, not a native MOS; pair the CER term with it (don't drop CER), and the
+   real check is still a Hindi-tuned MOS or human listening. Open: tune `w_mos` vs
+   `w_intel` on a real run — start ~0.3–0.5 so CER stays the primary signal.
 
-6. **Pipeline 2 (speaker cloning) interleaved.** Wired but only validated on the
-   concatenated path; exercise it end-to-end on the (proven) interleaved layout.
+6. ✅ **Pipeline 2 (speaker cloning) interleaved** — *validated end-to-end.*
+   Config: `configs/qwen3_tts_speaker_grpo.yaml` (`layout: interleaved`,
+   `speaker_similarity.weight > 0`, a `train_jsonl` with `ref_audio` per record).
+   The real fix: the interleaved rollout clones the voice via the generate() path,
+   which calls `extract_speaker_embedding(ref_audio)` expecting a **24 kHz waveform**
+   — but the loader was handing it the ref_audio **path string** (the bug that kept
+   Pipeline 2 concatenated-only). Now `build_grpo_prompts` loads the waveform once
+   (`ref_audio_wav`) and the loader/eval thread it through. Observability:
+   `spk_sim_mean` in training metrics, `grpo_eval/spk_sim` in the in-loop eval.
+   Validated by a 40-step interleaved run (CER + speaker-sim reward, sequence-norm
+   PG): trains cleanly, KL anchors, checkpoint saves. **Finding:** with a strong
+   base model the speaker-sim **saturates (~0.995 cosine)** — it already clones
+   near-perfectly from ref_audio — so the term acts as a *guard*, not the learning
+   driver; CER does the driving. `scripts/grpo_heldout_eval.py` auto-detects
+   Pipeline 2 (held-out prompts carrying `ref_mel`): it clones from `ref_audio` and
+   adds a `spk_sim` column next to CER/MOS, so cells can be ranked on voice match
+   too. The saturation means the held-out speaker-sim gap between SFT and GRPO is
+   small — to make speaker-sim the *driver* you'd need a harder cloning setup
+   (unseen target voices, or a weaker init) where it isn't already ~1.0.
+
+Also fixed in passing: the base `Trainer` only broke its inner batch loop on
+`max_steps`, so leftover epochs each pulled one extra batch — cheap for SFT, but an
+expensive wasted rollout for GRPO. It now breaks the epoch loop too.

@@ -34,7 +34,9 @@ from train.grpo.rollout import (
     gather_token_logprobs,
     _cb0_logits_from_tf_input,
 )
-from train.grpo.rewards import intelligibility_reward, _trailing_silence_frac, normalize_text
+from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
+                                speaker_similarity_reward, _trailing_silence_frac,
+                                normalize_text)
 
 
 def make_grpo_audio_eval_fn(
@@ -71,7 +73,7 @@ def make_grpo_audio_eval_fn(
             out = sample_rollouts_interleaved(
                 model, prompt["text"], lang_code=lang, group_size=group_size,
                 max_new_tokens=max_new_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k, ref_audio=prompt.get("ref_audio"),
+                top_p=top_p, top_k=top_k, ref_audio=prompt.get("ref_audio_wav"),
                 compute_ref=True, ref_params=ref_params,
             )
             T = out["codec_ids"].shape[1]
@@ -95,8 +97,11 @@ def make_grpo_audio_eval_fn(
             policy_logp = gather_token_logprobs(logits, out["codec_ids"])
         return out, policy_logp
 
+    log_mos = getattr(reward_cfg, "w_mos", 0.0) > 0       # only when MOS is a reward
+    log_spk = getattr(reward_cfg, "w_speaker", 0.0) > 0   # Pipeline 2: speaker-sim
+
     def _eval(model, step, tb_writer, reference_only: bool = False):
-        cers, durs, sils, kls, rates = [], [], [], [], []
+        cers, durs, sils, kls, rates, moss, spks = [], [], [], [], [], [], []
         first_audio = None
 
         for pi, prompt in enumerate(prompts):
@@ -107,6 +112,11 @@ def make_grpo_audio_eval_fn(
             r = intelligibility_reward(
                 audios, [prompt["text"]] * group_size, reward_cfg, sample_rate=sample_rate)
             cers.extend(r["cer"])
+            if log_mos:
+                moss.extend(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"])
+            if log_spk and prompt.get("ref_mel") is not None:
+                spks.extend(speaker_similarity_reward(
+                    model, audios, prompt["ref_mel"], sample_rate=sample_rate)["reward"])
 
             # k3 KL(π_θ ‖ π_ref), per rollout, averaged over valid cb0 tokens.
             mask = out["codec_mask"].astype(mx.float32)
@@ -138,20 +148,33 @@ def make_grpo_audio_eval_fn(
         tb_writer.add_scalar(f"{tag}/trailing_silence", sil_m, step)
         tb_writer.add_scalar(f"{tag}/speaking_rate",    rate_m, step)
         tb_writer.add_scalar(f"{tag}/kl",               kl_m,  step)
+        mos_m = float(np.mean(moss)) if moss else None
+        if mos_m is not None:
+            tb_writer.add_scalar(f"{tag}/dnsmos_ovrl", mos_m, step)
+        spk_m = float(np.mean(spks)) if spks else None
+        if spk_m is not None:
+            tb_writer.add_scalar(f"{tag}/spk_sim", spk_m, step)
         if first_audio is not None:
             tb_writer.add_audio(f"{tag}/sample", first_audio, step, sample_rate=sample_rate)
         print(f"[grpo-eval] step={step} cer={cer_m:.3f} dur={dur_m:.2f}s "
-              f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}")
+              f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}"
+              + (f" mos={mos_m:.2f}" if mos_m is not None else "")
+              + (f" spk={spk_m:.3f}" if spk_m is not None else ""))
 
         if eval_log:
             import json, os
             os.makedirs(os.path.dirname(eval_log) or ".", exist_ok=True)
+            rec = {
+                "step": step, "reference_only": reference_only,
+                "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
+                "speaking_rate": rate_m, "kl": kl_m,
+            }
+            if mos_m is not None:
+                rec["dnsmos_ovrl"] = mos_m
+            if spk_m is not None:
+                rec["spk_sim"] = spk_m
             with open(eval_log, "a") as fh:
-                fh.write(json.dumps({
-                    "step": step, "reference_only": reference_only,
-                    "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
-                    "speaking_rate": rate_m, "kl": kl_m,
-                }) + "\n")
+                fh.write(json.dumps(rec) + "\n")
 
         # Restore stochasticity for the training rollouts that follow.
         mx.random.seed(int(time.time() * 1000) & 0xFFFFFFFF)
