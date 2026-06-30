@@ -51,6 +51,9 @@ def load_model(
     *,
     strict_load: bool = True,
     audit_load: bool = True,
+    quantize: int = None,
+    q_group_size: int = 64,
+    bf16: bool = False,
 ):
     """
     Downloads and loads the model + both tokenizers.
@@ -69,6 +72,38 @@ def load_model(
         audit=audit_load,
     )
     model.eval()
+
+    # Optional decoder quantization (8-bit recommended). Only the AR decoder's
+    # Linear layers are quantized — it is ~89% of inference time — giving ~3x
+    # speedup. Embeddings are skipped because decoder.embed_positions.weight is
+    # sliced directly (packing it breaks the forward pass); the T5 encoder and
+    # DAC are left in fp32 (small, and the encoder reads weights directly too).
+    if quantize:
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        def _decoder_linear(path, module):
+            return (
+                path.startswith("decoder.")
+                and isinstance(module, nn.Linear)
+                and module.weight.shape[-1] % q_group_size == 0
+            )
+
+        nn.quantize(model, group_size=q_group_size, bits=quantize,
+                    class_predicate=_decoder_linear)
+        mx.eval(model.parameters())
+        print(f"[indic-parler-tts] Quantized decoder Linear layers to {quantize}-bit "
+              f"(group_size={q_group_size})")
+
+    # bf16 halves activation + KV-cache memory traffic in the AR loop. Best paired
+    # with 8-bit quantization (small weights + light activations) — q8+bf16 measured
+    # ~1.28x realtime vs ~0.97x for q8 alone on M4. bf16 alone is slower than q8
+    # because bf16 weights (2B) move more than 8-bit weights (1B).
+    if bf16:
+        import mlx.core as mx
+        model.set_dtype(mx.bfloat16)
+        mx.eval(model.parameters())
+        print("[indic-parler-tts] Cast model to bfloat16 (activations + KV cache)")
 
     # AutoTokenizer reads the Parler config and emits a harmless model_type
     # warning for the prompt tokenizer; keep script output focused.
