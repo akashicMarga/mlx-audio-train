@@ -199,6 +199,15 @@ def main():
         spk = f"  spk={r['spk_sim_mean']:.4f}" if r["spk_sim_mean"] is not None else ""
         print(f"  cer_mean={r['cer_mean']:.4f}  cer_median={r['cer_median']:.4f}{mos}{spk}  "
               f"dur={r['duration_s_mean']:.2f}s  cps={r['speaking_rate_mean']:.1f}\n")
+        # Free MLX's buffer cache between adapters — it grows unbounded across the
+        # ~n_sentences×seeds generations and OOM-kills the process on later adapters.
+        import gc
+        import mlx.core as mx
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass
 
     # ── Table + paired stats vs SFT baseline ────────────────────────────────
     base = results.get("SFT-baseline")
