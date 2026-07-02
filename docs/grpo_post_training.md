@@ -359,6 +359,31 @@ ablation (4).
    PG + `sft_lambda` 0.1**. Open: re-run at gs4 / longer / more seeds to move from
    directional to significant, and add the concatenated-layout arm.
 
+   **Follow-up sweep at gs4** (group_size 4, prompts_per_step 4, kl_beta 0.08,
+   200 steps; interleaved layout, same `pg_norm` × `sft_lambda` grid). Held-out CER
+   (100 sentences × 3 seeds, capped at 1.0; from the SFT adapter):
+
+   | cell | CER ↓ | Δ vs SFT | rel. | median | DNSMOS | cps | wilcoxon p |
+   |---|---|---|---|---|---|---|---|
+   | SFT baseline | 0.163 | — | — | 0.126 | 3.28 | 7.9 | — |
+   | sequence + sft 0.1 | 0.122 | −0.041 | −25.4% | 0.110 | 3.33 | 7.7 | 2.5e-05 |
+   | sequence + sft 0 | 0.120 | −0.043 | −26.2% | 0.107 | 3.31 | 7.8 | 2.1e-09 |
+   | token + sft 0.1 | 0.119 | −0.045 | −27.2% | 0.102 | 3.29 | 8.2 | 6.7e-10 |
+   | **token + sft 0** | **0.114** | **−0.049** | **−29.8%** | 0.103 | 3.30 | 7.9 | 5.7e-09 |
+
+   Now it's significant and the story flips clean: **every GRPO cell beats SFT by
+   25–30% relative CER, all p ≪ 1e-4** (down to 5.7e-9). DNSMOS is flat-to-up
+   everywhere (3.28 → 3.29–3.33) and cps stays 7.7–8.2 vs 7.9 → **no reward
+   hacking**. The config axis, significant at last, is a **near-tie with a mild
+   gradient toward token-norm** (best cell `token + sft 0`) — it does *not*
+   reproduce gs2's `sequence + sft 0.1` edge. Takeaway: at gs4 the knob choice is
+   second-order; the first-order, robust, reproducible effect is **GRPO ≫ SFT**.
+   gs2's directional ranking was small-sample noise, not a real config preference.
+   `scripts/grpo_heldout_eval.py` now checkpoints per-adapter (`heldout_partial.json`)
+   and resumes, so an interrupted eval only redoes the in-flight cell. Open:
+   concatenated-layout arm still unrun; a Hindi-native MOS to confirm the
+   DNSMOS-flat quality read.
+
 5. ✅ **Richer reward for a bigger gain** — *wired, off by default.* CER rewards
    legibility, not quality (a robotic but transcribable clip still scores well), so
    CER-only plateaus (~step 200). `train/grpo/rewards.py:naturalness_reward` adds a
