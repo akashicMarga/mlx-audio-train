@@ -189,8 +189,23 @@ def main():
         compute_mos=compute_mos,
     )
 
+    # Resume support: a partial file (full results incl. _cer_per_item) is
+    # rewritten after every adapter, so an interrupted run picks up where it left
+    # off instead of redoing all ~300 gens/adapter from scratch.
+    partial_path = ablation_root / "heldout_partial.json"
     results = {}
+    if partial_path.exists():
+        try:
+            results = json.loads(partial_path.read_text())
+            print(f"[heldout] resuming — {len(results)} adapter(s) already scored: "
+                  f"{', '.join(results)}\n")
+        except (json.JSONDecodeError, OSError):
+            print(f"[heldout] partial file unreadable → starting fresh\n")
+
     for label, path in adapters:
+        if label in results:
+            print(f"=== {label} (cached — skipping) ===\n")
+            continue
         print(f"=== {label} ===")
         load_adapters(model, path)
         results[label] = eval_adapter(model, train_mod, prompts, reward_cfg, **common)
@@ -199,6 +214,8 @@ def main():
         spk = f"  spk={r['spk_sim_mean']:.4f}" if r["spk_sim_mean"] is not None else ""
         print(f"  cer_mean={r['cer_mean']:.4f}  cer_median={r['cer_median']:.4f}{mos}{spk}  "
               f"dur={r['duration_s_mean']:.2f}s  cps={r['speaking_rate_mean']:.1f}\n")
+        # Persist after each adapter so a crash/teardown never loses completed work.
+        partial_path.write_text(json.dumps(results, indent=2))
         # Free MLX's buffer cache between adapters — it grows unbounded across the
         # ~n_sentences×seeds generations and OOM-kills the process on later adapters.
         import gc
@@ -240,6 +257,8 @@ def main():
     out = ablation_root / "heldout_eval.json"
     slim = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in results.items()}
     out.write_text(json.dumps(slim, indent=2))
+    if partial_path.exists():
+        partial_path.unlink()   # final written → drop the resume checkpoint
     print(f"\nWrote {out}")
 
 
