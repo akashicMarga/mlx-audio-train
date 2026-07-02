@@ -116,6 +116,9 @@ def main():
                     help="Dir of REAL speech wavs; a random subset is copied to <out-root>/reference_real")
     ap.add_argument("--ref-n", type=int, default=200, help="How many real wavs to sample for the reference")
     ap.add_argument("--dry-run", action="store_true", help="List adapters + held-out count, load nothing")
+    ap.add_argument("--only", default=None,
+                    help="Substring filter: generate only adapters whose label contains this "
+                         "(e.g. 'pg-token__sft-0' for one cell; 'SFT' also matches the baseline)")
     args = ap.parse_args()
 
     he = _load_heldout_eval_module()
@@ -124,6 +127,8 @@ def main():
     ablation_root = Path(os.path.expanduser(args.ablation_root)).resolve()
     out_root = Path(os.path.expanduser(args.out_root)).resolve()
     adapters = he.discover_adapters(cfg, ablation_root)
+    if args.only:
+        adapters = [(l, p) for l, p in adapters if args.only in l]
 
     print(f"Adapters to generate ({len(adapters)}):")
     for label, path in adapters:
