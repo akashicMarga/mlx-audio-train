@@ -420,3 +420,81 @@ ablation (4).
 Also fixed in passing: the base `Trainer` only broke its inner batch loop on
 `max_steps`, so leftover epochs each pulled one extra batch — cheap for SFT, but an
 expensive wasted rollout for GRPO. It now breaks the epoch loop too.
+
+## TTSDS2 naturalness eval (multilingual, Hindi)
+
+Closes the open item from #4/#5 — *"a Hindi-native MOS to confirm the DNSMOS-flat
+quality read."* [TTSDS2](https://arxiv.org/abs/2506.19441) (Minixhofer et al.) is a
+**distributional** TTS benchmark: instead of regressing an (English/JP-trained) MOS
+head like DNSMOS/UTMOS, it measures how close the synth feature *distribution* sits
+to real speech across four factors (Generic, Speaker, Prosody, Intelligibility) — so
+its multilingual factors (mHuBERT-147, XLSR, multilingual Whisper, Allosaurus) give a
+Hindi-usable signal DNSMOS can't.
+
+### How it runs in code (two decoupled halves)
+
+TTSDS2 only needs *directories of wavs* (content need not match the reference), so
+generation and scoring share nothing but files — which lets scoring live in an
+isolated env (it pins `numpy<2` / Py 3.10–3.12 + a heavy torch stack that conflicts
+with mlx).
+
+- **`scripts/ttsds2_eval.py`** (generation, mlx env) — reuses
+  `grpo_heldout_eval.py`'s adapter discovery + interleaved (deployment-path) rollout
+  to dump per-adapter held-out wavs, plus a sampled real-speech reference dir.
+  `--only <substr>` regenerates a single cell.
+- **`scripts/ttsds2_score.py`** (scoring, isolated env) — runs `BenchmarkSuite`
+  (`multilingual=True`) and prints a factor×adapter pivot + weighted OVERALL.
+
+```bash
+# 1. generate (mlx env): SFT + the gs4 token cells vs a 200-wav IndicVoices-R ref
+python scripts/ttsds2_eval.py --config ~/grpo_ablation/base_hindi_grpo.gs4.yaml \
+  --ablation-root ~/grpo_ablation/gs4 \
+  --heldout-jsonl ~/Documents/exps/hindi/val_codes.abs.jsonl \
+  --out-root ~/ttsds2_out --num-sentences 50 --seeds 1 \
+  --ref-audio-dir ~/Documents/exps/hindi/audio --ref-n 200 --only pg-token
+
+# 2. score (isolated env — uv resolves the pinned stack):
+uv run --python 3.12 --with "numpy<2" --with ttsds --with onnxruntime \
+  python scripts/ttsds2_score.py --reference ~/ttsds2_out/reference_real \
+    --synth real=~/ttsds2_out/real_holdout --synth SFT=~/ttsds2_out/SFT-baseline \
+    --synth GRPO=~/ttsds2_out/L-interleaved__pg-token__sft-0 \
+    --multilingual --out ~/ttsds2_out/ttsds2.csv
+```
+
+Apple-Silicon gotchas baked into the scorer (else it silently drops a benchmark or
+hangs): `--n-workers` defaults to **1** (TTSDS2's `cpu_count()` default OOMs — leaving
+a truncated `.npy` that poisons the cache — and deadlocks the ThreadPoolExecutor
+distance path); `_purge_corrupt_cache()` drops unreadable cache entries up front; two
+shims cover pyannote-3.4 vs the new stack (`hf_hub_download(use_auth_token=)`,
+`torch.load(weights_only=True)`).
+
+### Result (gs4 `token+sft0`, 50 held-out sentences, 0–100, higher = closer to real)
+
+| factor | real (IndicVoices-R) | SFT | GRPO |
+|---|---|---|---|
+| GENERIC | 99.3 | 90.7 | **92.7** |
+| SPEAKER¹ | 97.9 | 55.1 | 56.1 |
+| PROSODY | 97.9 | 82.2 | 81.6 |
+| INTELLIGIBILITY | 82.8 | 79.8 | 81.0 |
+| **OVERALL** | **94.5** | 77.0 | **77.9** |
+
+Two things it shows (and one it doesn't):
+
+1. **It discriminates real vs synthetic Hindi** — real sits ~17 pts above both TTS
+   systems on OVERALL, and the gap holds on every genuinely-multilingual factor. So
+   the signal doesn't collapse the way an English-trained MOS regressor does on Indic.
+2. **GRPO preserves naturalness** — GRPO ≈ SFT (slightly up: GENERIC 90.7→92.7,
+   OVERALL 77.0→77.9), a **Hindi-capable corroboration of the DNSMOS-flat read**
+   (DNSMOS 3.28→3.30 ↑, TTSDS2 GENERIC ↑ too — two independent metrics agree). The
+   −30% CER win is *orthogonal*: it lives in CER, not in the TTSDS2 intelligibility
+   factor (79.8→81.0, ~flat).
+3. **What it does *not* show:** that these scores track *Hindi human MOS*. TTSDS2 was
+   not validated on Indic (author's own note in the source thread), and the only
+   Hindi-grounded checks here are the real≫synth ordering and a weak TTSDS2-intel-vs-CER
+   agreement (ρ≈0.4). Earning "validated for Hindi" needs correlating TTSDS2 against
+   IndicMOS / human ratings — the real open item.
+
+¹ SPEAKER uses VoxCeleb WeSpeaker/d-vector and is **not** swapped by `multilingual=True`
+(English-trained) — read it as relative-only; here it mostly reflects "same speaker
+pool as the reference" (Pipeline 1 has no voice cloning), so it's uninformative for
+SFT-vs-GRPO.
