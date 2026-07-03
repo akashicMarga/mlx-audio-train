@@ -461,6 +461,24 @@ uv run --python 3.12 --with "numpy<2" --with ttsds --with onnxruntime \
     --multilingual --out ~/ttsds2_out/ttsds2.csv
 ```
 
+Multi-language: per-language paths (config/adapters/held-out/reference) live in a
+registry outside the repo (`$TTSDS2_LANG_REGISTRY` or `~/.config/ttsds2_langs.json`),
+so `--lang hindi` fills them and a new language is one flag — explicit flags still
+override. Note OVERALL scores are **not** comparable across languages (each has its own
+real reference); compare systems only *within* a language.
+
+```jsonc
+// ~/.config/ttsds2_langs.json
+{ "hindi": { "config": "~/grpo_ablation/base_hindi_grpo.gs4.yaml",
+             "ablation_root": "~/grpo_ablation/gs4",
+             "heldout_jsonl": "~/Documents/exps/hindi/val_codes.abs.jsonl",
+             "ref_audio_dir": "~/Documents/exps/hindi/audio", "lang_code": "hi",
+             "out_root": "~/Documents/exps/ttsds2_out/hindi" } }
+```
+```bash
+python scripts/ttsds2_eval.py --lang hindi --num-sentences 50 --seeds 1 --only pg-token
+```
+
 Apple-Silicon gotchas baked into the scorer (else it silently drops a benchmark or
 hangs): `--n-workers` defaults to **1** (TTSDS2's `cpu_count()` default OOMs — leaving
 a truncated `.npy` that poisons the cache — and deadlocks the ThreadPoolExecutor
