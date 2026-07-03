@@ -39,6 +39,7 @@ Usage (generation):
 
 import argparse
 import importlib.util
+import json
 import os
 import random
 import shutil
@@ -50,6 +51,46 @@ import soundfile as sf
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+
+# Per-language input paths (config / adapters / held-out text / real reference) are
+# machine-specific, so they live in a registry file OUTSIDE the repo — not hardcoded
+# here. `--lang NAME` looks NAME up and fills any flag you did not pass explicitly, so
+# a new language is one flag instead of five. Default registry:
+# $TTSDS2_LANG_REGISTRY or ~/.config/ttsds2_langs.json, shaped like:
+#   { "hindi": { "config": "...", "ablation_root": "...", "heldout_jsonl": "...",
+#                "ref_audio_dir": "...", "lang_code": "hi", "out_root": "..." } }
+_LANG_FIELDS = ("config", "ablation_root", "heldout_jsonl", "ref_audio_dir",
+                "lang_code", "out_root")
+
+
+def _apply_lang_registry(args):
+    """Fill unset args from the registry entry for args.lang. Explicit CLI flags win
+    (registry only fills fields still None). No-op when --lang is absent."""
+    if not args.lang:
+        return
+    reg_path = Path(os.path.expanduser(
+        args.lang_registry or os.environ.get("TTSDS2_LANG_REGISTRY",
+                                             "~/.config/ttsds2_langs.json")))
+    if not reg_path.exists():
+        sys.exit(f"[ttsds2] --lang {args.lang} given but no registry at {reg_path}. "
+                 f"Create it: {{\"{args.lang}\": {{\"config\": ..., \"ablation_root\": ..., "
+                 f"\"heldout_jsonl\": ..., \"ref_audio_dir\": ..., \"lang_code\": ...}}}}")
+    try:
+        registry = json.loads(reg_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(f"[ttsds2] cannot read registry {reg_path}: {e}")
+    if args.lang not in registry:
+        sys.exit(f"[ttsds2] '{args.lang}' not in {reg_path}; have: {', '.join(registry) or '(none)'}")
+    entry = registry[args.lang]
+    for field in _LANG_FIELDS:
+        if getattr(args, field, None) is None and field in entry:
+            val = entry[field]
+            if field != "lang_code":          # path fields: expand ~ (registry isn't shell-expanded)
+                val = os.path.expanduser(val)
+            setattr(args, field, val)
+    print(f"[ttsds2] --lang {args.lang}: filled {', '.join(f for f in _LANG_FIELDS if f in entry)} "
+          f"from {reg_path}")
 
 
 def _load_heldout_eval_module():
@@ -106,10 +147,16 @@ def generate_adapter_wavs(model, train_mod, prompts, out_dir: Path, *, lang_code
 
 def main():
     ap = argparse.ArgumentParser(description="Generate held-out audio for TTSDS2 scoring")
-    ap.add_argument("--config", required=True, help="Model/GRPO YAML (base model + init_adapters)")
-    ap.add_argument("--ablation-root", required=True, help="Sweep out-root (L-*/checkpoint-final)")
-    ap.add_argument("--heldout-jsonl", required=True, help="Held-out sentences (text used; not trained on)")
-    ap.add_argument("--out-root", required=True, help="Where per-adapter wav dirs are written")
+    ap.add_argument("--lang", default=None,
+                    help="Language key in the registry; fills config/ablation-root/heldout-jsonl/"
+                         "ref-audio-dir/lang-code/out-root you don't pass explicitly (one flag per language)")
+    ap.add_argument("--lang-registry", default=None,
+                    help="Registry JSON (default: $TTSDS2_LANG_REGISTRY or ~/.config/ttsds2_langs.json)")
+    ap.add_argument("--config", default=None, help="Model/GRPO YAML (base model + init_adapters)")
+    ap.add_argument("--ablation-root", default=None, help="Sweep out-root (L-*/checkpoint-final)")
+    ap.add_argument("--heldout-jsonl", default=None, help="Held-out sentences (text used; not trained on)")
+    ap.add_argument("--out-root", default=None, help="Where per-adapter wav dirs are written")
+    ap.add_argument("--lang-code", default=None, help="Override the config's lang_code for generation")
     ap.add_argument("--num-sentences", type=int, default=100)
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--ref-audio-dir", default=None,
@@ -120,6 +167,13 @@ def main():
                     help="Substring filter: generate only adapters whose label contains this "
                          "(e.g. 'pg-token__sft-0' for one cell; 'SFT' also matches the baseline)")
     args = ap.parse_args()
+
+    _apply_lang_registry(args)
+    missing = [f"--{f.replace('_', '-')}" for f in ("config", "ablation_root", "heldout_jsonl", "out_root")
+               if getattr(args, f) is None]
+    if missing:
+        sys.exit(f"[ttsds2] missing required: {', '.join(missing)} "
+                 f"(pass them, or use --lang to fill from the registry)")
 
     he = _load_heldout_eval_module()
     train_mod = he._load_train_module()
@@ -166,8 +220,9 @@ def main():
 
     g = cfg.get("grpo", {})
     t = cfg.get("trainer", {})
+    lang_code = args.lang_code or t.get("lang_code", "auto")   # CLI/registry overrides config
     common = dict(
-        lang_code=t.get("lang_code", "auto"), seeds=args.seeds,
+        lang_code=lang_code, seeds=args.seeds,
         max_new_tokens=g.get("max_new_tokens", 240), temperature=g.get("temperature", 0.9),
         top_p=g.get("top_p", 0.95), top_k=g.get("top_k", 50),
         sample_rate=cfg.get("data", {}).get("target_sr", 24000),
