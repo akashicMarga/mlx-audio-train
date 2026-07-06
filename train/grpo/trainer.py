@@ -177,7 +177,8 @@ class GRPORolloutLoader:
             self._window_skipped += 1
             return None
 
-        adv = group_advantages(reward, group_size=G, eps=self.reward_cfg.eps)
+        adv = group_advantages(reward, group_size=G, eps=self.reward_cfg.eps,
+                               adv_norm=self.reward_cfg.adv_norm)
         info = scored["info"]
         cer_mean = float(np.mean(info["cer"])) if "cer" in info else 0.0
         mos_mean = float(np.mean(info["mos"])) if "mos" in info else 0.0

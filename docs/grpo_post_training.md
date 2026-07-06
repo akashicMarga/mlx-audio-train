@@ -417,6 +417,33 @@ ablation (4).
    small — to make speaker-sim the *driver* you'd need a harder cloning setup
    (unseen target voices, or a weaker init) where it isn't already ~1.0.
 
+7. ✅ **Reward shaping × advantage norm (2×2)** — *ran + concluded; shipped in the
+   default config.* Two switches from the reward backlog, ablated together because
+   `/std` partially cancels reward shaping: `adv_norm: std|none`
+   (`train/grpo/rewards.py:group_advantages` — `none` drops the `/std`, the Dr. GRPO
+   argument) × `reward_shape: linear|tanh` (`intelligibility_reward`, `1 − tanh(k·CER)`,
+   ~2.6× wider within-group spread at CER≈0.12). Driver: `scripts/grpo_reward_ablation.py`
+   (resume-safe, auto LR bump on `none` cells). gs4, 150 steps/cell:
+
+   | cell | LR | cer_best | cer_final | KL |
+   |------|----|---------:|----------:|----:|
+   | `std + linear`  | 5e-6   | 0.081 | 0.081 | 0.019 |
+   | **`std + tanh`** | 5e-6   | **0.078** | 0.078 | 0.011 |
+   | `none + linear` | 1.5e-5 | 0.109 | 0.341 | 0.99 |
+   | `none + tanh`   | 1.5e-5 | 0.090 | 0.183 | 0.40 |
+
+   **Finding:** the intuition that dropping `/std` shrinks advantages ~10× → "just
+   raise LR 5–10×" is the **wrong diagnosis**. `none` doesn't need a bigger step — it
+   suffers a **late KL cliff**: both `none` cells run stable ~100–125 steps (KL ~0.01,
+   like `std`; `none+tanh`'s CER even *improved* to 0.090), then KL blows up to 0.4–1.1
+   in the final ~25 steps and CER degrades. Reproduced at **both** 8× and 3× LR → it's
+   systematic to the drop-std regime, not a seed fluke or step-size problem. Within
+   `none`, tanh > linear (lower CER, stayed stable ~25 steps longer).
+   **Shipped:** `adv_norm: std` + `reward_shape: tanh` (k=3) are now the defaults in
+   `configs/qwen3_tts_hindi_grpo.yaml` — a small but real, fully-stable win
+   (0.081→0.078 at lower KL). Dr. GRPO drop-std is **parked** — it needs trust-region
+   control (higher `kl_beta` / early-stop at cer_best / LR decay), not more LR.
+
 Also fixed in passing: the base `Trainer` only broke its inner batch loop on
 `max_steps`, so leftover epochs each pulled one extra batch — cheap for SFT, but an
 expensive wasted rollout for GRPO. It now breaks the epoch loop too.
