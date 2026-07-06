@@ -662,6 +662,13 @@ def run_grpo(model, cfg: dict, args):
         silence_penalty = length.get("silence_penalty", 0.5),
         speaking_rate_min_cps = length.get("speaking_rate_min_cps", 0.0),
         speaking_rate_penalty = length.get("speaking_rate_penalty", 0.5),
+        # reward-shaping / advantage-norm knobs (grpo-reward-todo 2×2 ablation).
+        # reward_shape/reward_k live on the intelligibility reward; adv_norm on the
+        # advantage step. All read from the top-level grpo block so the ablation
+        # driver can set them per cell (see scripts/grpo_reward_ablation.py).
+        reward_shape = intel.get("reward_shape", g.get("reward_shape", "linear")),
+        reward_k     = intel.get("reward_k",     g.get("reward_k", 3.0)),
+        adv_norm     = g.get("adv_norm", "std"),
     )
 
     trainer_config = TrainerConfig(

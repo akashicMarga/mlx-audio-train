@@ -44,6 +44,9 @@ grpo:
   sub_pg_weight:  0.0         # advantage-weight the code_predictor head too (0 = off)
   pg_norm:        token       # token = Σ/Σtokens (length-weighted; GRPO default) |
                               # sequence = mean of per-rollout means (length-neutral, Dr.GRPO/DAPO)
+  adv_norm:       std         # std = (r−mean)/std (DeepSeek default) | none = r−mean (Dr. GRPO).
+                              # KEEP std: the 2×2 ablation (see docs) showed drop-std diverges
+                              # (late KL cliff) at both 8× and 3× LR with no CER win.
   sft_lambda:     0.1         # optional CE anchor on real SFT batches (0 = off)
   skip_zero_variance: true    # drop groups where all rollouts get the same reward (no PG signal)
 
@@ -53,6 +56,9 @@ grpo:
       asr_model: "mlx-community/whisper-large-v3-turbo"
       metric:    cer          # CER > WER for Devanagari robustness
       language:  hi
+      reward_shape: tanh      # 1 − tanh(k·CER): ~2.6× wider within-group spread at
+      reward_k:     3         # CER≈0.12 vs linear. 2×2 ablation: 0.081→0.078 CER at
+                              # lower KL, fully stable. (linear = 1 − min(1,CER))
     length_penalty:
       weight:        0.5
       no_eos_penalty:  1.0     # hit max_new_tokens without EOS

@@ -84,6 +84,14 @@ class RewardConfig:
     language:  str = "hi"
     metric:    str = "cer"          # "cer" or "wer"
 
+    # intelligibility reward shaping (the lever from the reward-todo backlog):
+    #   linear = 1 − min(1, err)          (flat sensitivity everywhere)
+    #   tanh   = 1 − tanh(reward_k · err) (dense contrast near low err, saturates high)
+    # tanh stretches within-group reward spread ~2.6× at CER≈0.12 (break-even ≈0.38:
+    # below→amplify, above→compress) → sharper policy-gradient signal on live groups.
+    reward_shape: str = "linear"    # "linear" or "tanh"
+    reward_k:     float = 3.0       # tanh steepness
+
     # naturalness / MOS (the lever beyond CER-only: CER rewards legibility, not
     # quality). Reference-free DNSMOS P.835; English-trained → a rough RELATIVE
     # proxy for Hindi naturalness, not a native MOS (see docs). 0 = off.
@@ -104,6 +112,13 @@ class RewardConfig:
     speaking_rate_min_cps: float = 0.0   # 0 = off
     speaking_rate_penalty: float = 0.5   # magnitude when fully below the floor
 
+    # advantage normalisation (Dr. GRPO argument, Liu et al. "Understanding
+    # R1-Zero-Like Training"): "std" = group-relative + /std (DeepSeek default);
+    # "none" drops the /std, which is a bias that up-weights low-variance (low-info)
+    # groups. TRAP: "none" shrinks advantages ~10× → must raise LR ~5–10× to match
+    # effective step size (see scripts/grpo_reward_ablation.py).
+    adv_norm: str = "std"           # "std" or "none"
+
     eps: float = 1e-4               # advantage std floor
 
 
@@ -116,6 +131,18 @@ def _to_whisper_audio(audio: mx.array, src_sr: int) -> np.ndarray:
     if src_sr != WHISPER_SR:
         wav = _resample(wav, src_sr, WHISPER_SR)
     return wav
+
+
+def _shape_intel_reward(err: float, cfg: RewardConfig) -> float:
+    """Map an error rate (CER/WER, ∈[0, ∞)) to a reward ∈(0, 1].
+
+    linear: 1 − min(1, err) — flat sensitivity, hard-clamped at err≥1.
+    tanh:   1 − tanh(k·err) — dense contrast near err→0, smooth saturation for
+            large err (no clamp needed; tanh handles insertions err>1 gracefully).
+    """
+    if cfg.reward_shape == "tanh":
+        return float(1.0 - np.tanh(cfg.reward_k * err))
+    return 1.0 - min(1.0, err)
 
 
 def intelligibility_reward(
@@ -154,7 +181,7 @@ def intelligibility_reward(
         )
         hyp = result.get("text", "")
         err = char_error_rate(hyp, text) if cfg.metric == "cer" else _wer(hyp, text)
-        rewards.append(1.0 - min(1.0, err))
+        rewards.append(_shape_intel_reward(err, cfg))
         errs.append(err); hyps.append(hyp)
     return {"reward": rewards, "cer": errs, "hyp": hyps}
 
@@ -375,14 +402,27 @@ def combine_rewards(
     return {"reward": total, "info": info}
 
 
-def group_advantages(reward: np.ndarray, group_size: int, eps: float = 1e-4) -> np.ndarray:
-    """Group-relative, std-normalised advantages. `reward` is laid out as
-    contiguous groups of `group_size` (all rollouts of prompt 0, then prompt 1…).
-    Returns advantages of the same shape."""
+def group_advantages(
+    reward: np.ndarray,
+    group_size: int,
+    eps: float = 1e-4,
+    adv_norm: str = "std",
+) -> np.ndarray:
+    """Group-relative advantages. `reward` is laid out as contiguous groups of
+    `group_size` (all rollouts of prompt 0, then prompt 1…). Returns advantages of
+    the same shape.
+
+    adv_norm="std":  A_i = (r_i − mean_group) / (std_group + eps)  (DeepSeek default)
+    adv_norm="none": A_i =  r_i − mean_group                       (Dr. GRPO; drops
+                     the /std bias, but shrinks |A| ~10× → retune LR up ~5–10×)
+    """
     reward = np.asarray(reward, dtype=np.float32)
     assert reward.shape[0] % group_size == 0, "reward length must be a multiple of group_size"
     groups = reward.reshape(-1, group_size)
     mean = groups.mean(axis=1, keepdims=True)
-    std = groups.std(axis=1, keepdims=True)
-    adv = (groups - mean) / (std + eps)
+    adv = groups - mean
+    if adv_norm == "std":
+        adv = adv / (groups.std(axis=1, keepdims=True) + eps)
+    elif adv_norm != "none":
+        raise ValueError(f"adv_norm must be 'std' or 'none', got {adv_norm!r}")
     return adv.reshape(-1)
