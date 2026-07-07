@@ -82,7 +82,7 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
 
     win    = max(1, int(sample_rate * 20.0 / 1000.0))
     thresh = 10.0 ** (reward_cfg.param("length_penalty", "silence_rms_db", -40.0) / 20.0)
-    cers, durs, cpss, moss, spks = [], [], [], [], []   # one entry per (sentence, seed)
+    cers, wers, durs, cpss, moss, spks = [], [], [], [], [], []   # one entry per (sentence, seed)
     for si in range(seeds):
         for pi, prompt in enumerate(prompts):
             mx.random.seed(1000 * si + pi)
@@ -96,7 +96,9 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
             ctx = RewardContext(audios=audios, texts=[prompt["text"]],
                                 sample_rate=sample_rate, model=model,
                                 ref_mel=prompt.get("ref_mel"))
-            cers.append(min(1.0, float(score("intelligibility", ctx, reward_cfg)["cer"][0])))
+            intel = score("intelligibility", ctx, reward_cfg)
+            cers.append(min(1.0, float(intel["cer"][0])))    # capped at 1.0
+            wers.append(min(1.0, float(intel["wer"][0])))
             if compute_mos:
                 moss.append(score("naturalness", ctx, reward_cfg)["mos"][0])
             if prompt.get("ref_mel") is not None:        # Pipeline 2: speaker similarity
@@ -109,9 +111,11 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
             if n_chars > 0:
                 cpss.append(n_chars / max(dur * (1.0 - sil), 1e-3))
     cers = np.asarray(cers)
+    wers = np.asarray(wers)
     return {
         "n": int(cers.size),
         "cer_mean": float(cers.mean()), "cer_median": float(np.median(cers)),
+        "wer_mean": float(wers.mean()), "wer_median": float(np.median(wers)),
         "dnsmos_ovrl_mean": float(np.mean(moss)) if moss else None,
         "spk_sim_mean": float(np.mean(spks)) if spks else None,
         "duration_s_mean": float(np.mean(durs)), "speaking_rate_mean": float(np.mean(cpss)),

@@ -219,9 +219,14 @@ def intelligibility_reward(
     reward_shape: str = "linear",    # "linear" or "tanh" (see _shape_intel_reward)
     reward_k:     float = 3.0,       # tanh steepness
 ) -> Dict[str, List[float]]:
-    """r_intel = shaped(1 − error_rate(ASR(audio), text)) per rollout.
+    """r_intel = shaped(1 − error_rate(ASR(audio), text)) per rollout, where
+    error_rate is CER or WER per `metric`.
 
-    Returns {"reward": [...], "cer": [...], "hyp": [...]} (hyp kept for logging).
+    Returns {"reward": [...], "cer": [...], "wer": [...], "hyp": [...]}. BOTH cer
+    and wer are always computed (cheap string ops next to the ASR that dominates
+    step time) so a run can watch them diverge — WER penalises harder (a partial-
+    word error fails the whole word; for Devanagari a wrong matra flips a word). Only
+    `metric` selects which one drives the reward; the other rides along as a metric.
 
     Uses the canonical `mlx_whisper.transcribe` per rollout. (A batched
     `decode()` path was tried — ~3× faster ASR — but ASR is only ~3% of step
@@ -230,11 +235,11 @@ def intelligibility_reward(
     """
     import mlx_whisper
 
-    rewards, errs, hyps = [], [], []
+    rewards, cers, wers, hyps = [], [], [], []
     for audio, text in zip(ctx.audios, ctx.texts):
         wav = _to_whisper_audio(audio, ctx.sample_rate)
         if wav.shape[0] < WHISPER_SR // 10:        # <100 ms → treat as empty
-            rewards.append(0.0); errs.append(1.0); hyps.append("")
+            rewards.append(0.0); cers.append(1.0); wers.append(1.0); hyps.append("")
             continue
         # temperature=0.0 (scalar) disables the 6-way temperature fallback, which
         # otherwise re-decodes degenerate/gibberish rollouts up to 6× (and can
@@ -247,10 +252,12 @@ def intelligibility_reward(
             temperature=0.0, condition_on_previous_text=False,
         )
         hyp = result.get("text", "")
-        err = char_error_rate(hyp, text) if metric == "cer" else _wer(hyp, text)
+        cer_v = char_error_rate(hyp, text)
+        wer_v = _wer(hyp, text)
+        err = cer_v if metric == "cer" else wer_v      # metric drives the reward
         rewards.append(_shape_intel_reward(err, reward_shape, reward_k))
-        errs.append(err); hyps.append(hyp)
-    return {"reward": rewards, "cer": errs, "hyp": hyps}
+        cers.append(cer_v); wers.append(wer_v); hyps.append(hyp)
+    return {"reward": rewards, "cer": cers, "wer": wers, "hyp": hyps}
 
 
 def _wer(hyp: str, ref: str) -> float:

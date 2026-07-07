@@ -100,7 +100,7 @@ def make_grpo_audio_eval_fn(
     log_spk = reward_cfg.weight("speaker_similarity") > 0 # Pipeline 2: speaker-sim
 
     def _eval(model, step, tb_writer, reference_only: bool = False):
-        cers, durs, sils, kls, rates, moss, spks = [], [], [], [], [], [], []
+        cers, wers, durs, sils, kls, rates, moss, spks = [], [], [], [], [], [], [], []
         first_audio = None
 
         for pi, prompt in enumerate(prompts):
@@ -111,7 +111,8 @@ def make_grpo_audio_eval_fn(
             ctx = RewardContext(
                 audios=audios, texts=[prompt["text"]] * group_size,
                 sample_rate=sample_rate, model=model, ref_mel=prompt.get("ref_mel"))
-            cers.extend(score("intelligibility", ctx, reward_cfg)["cer"])
+            intel = score("intelligibility", ctx, reward_cfg)
+            cers.extend(intel["cer"]); wers.extend(intel["wer"])
             if log_mos:
                 moss.extend(score("naturalness", ctx, reward_cfg)["mos"])
             if log_spk and prompt.get("ref_mel") is not None:
@@ -140,9 +141,11 @@ def make_grpo_audio_eval_fn(
 
         tag = "grpo_eval_ref" if reference_only else "grpo_eval"
         cer_m, dur_m = float(np.mean(cers)), float(np.mean(durs))
+        wer_m        = float(np.mean(wers)) if wers else 0.0
         sil_m, kl_m  = float(np.mean(sils)), float(np.mean(kls))
         rate_m       = float(np.mean(rates)) if rates else 0.0
         tb_writer.add_scalar(f"{tag}/cer",              cer_m, step)
+        tb_writer.add_scalar(f"{tag}/wer",              wer_m, step)
         tb_writer.add_scalar(f"{tag}/duration_s",       dur_m, step)
         tb_writer.add_scalar(f"{tag}/trailing_silence", sil_m, step)
         tb_writer.add_scalar(f"{tag}/speaking_rate",    rate_m, step)
@@ -155,7 +158,7 @@ def make_grpo_audio_eval_fn(
             tb_writer.add_scalar(f"{tag}/spk_sim", spk_m, step)
         if first_audio is not None:
             tb_writer.add_audio(f"{tag}/sample", first_audio, step, sample_rate=sample_rate)
-        print(f"[grpo-eval] step={step} cer={cer_m:.3f} dur={dur_m:.2f}s "
+        print(f"[grpo-eval] step={step} cer={cer_m:.3f} wer={wer_m:.3f} dur={dur_m:.2f}s "
               f"sil={sil_m:.2f} cps={rate_m:.1f} kl={kl_m:.4f}"
               + (f" mos={mos_m:.2f}" if mos_m is not None else "")
               + (f" spk={spk_m:.3f}" if spk_m is not None else ""))
@@ -165,8 +168,8 @@ def make_grpo_audio_eval_fn(
             os.makedirs(os.path.dirname(eval_log) or ".", exist_ok=True)
             rec = {
                 "step": step, "reference_only": reference_only,
-                "cer": cer_m, "duration_s": dur_m, "trailing_silence": sil_m,
-                "speaking_rate": rate_m, "kl": kl_m,
+                "cer": cer_m, "wer": wer_m, "duration_s": dur_m,
+                "trailing_silence": sil_m, "speaking_rate": rate_m, "kl": kl_m,
             }
             if mos_m is not None:
                 rec["dnsmos_ovrl"] = mos_m

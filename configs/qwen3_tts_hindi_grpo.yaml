@@ -54,7 +54,10 @@ grpo:
     intelligibility:
       weight:    1.0
       asr_model: "mlx-community/whisper-large-v3-turbo"
-      metric:    cer          # CER > WER for Devanagari robustness
+      metric:    cer          # cer | wer — which drives the reward. BOTH are always
+                              # logged (grpo_eval/{cer,wer}), so you can watch them
+                              # diverge. CER > WER for Devanagari (a wrong matra flips
+                              # a whole word under WER; Indic word boundaries are noisy).
       language:  hi
       reward_shape: tanh      # 1 − tanh(k·CER): ~2.6× wider within-group spread at
       reward_k:     3         # CER≈0.12 vs linear. 2×2 ablation: 0.081→0.078 CER at
