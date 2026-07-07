@@ -320,6 +320,15 @@ ablation (4).
    Keep `kl_beta` up and the length guard on. Note DNSMOS is English-trained → a
    rough relative proxy for Hindi naturalness, not a native MOS; a Hindi-tuned MOS
    or human listening is the real check.
+   *Graded over-length guard (added 2026-07-06):* the binary `no_eos_penalty` cliff
+   gives every non-terminating rollout the same −1, so within a group it carries no
+   gradient about *how much* too long. `length_target_cps > 0` adds a term that
+   penalises voiced duration beyond `length_overrun_tol × (chars / target_cps)`,
+   graded ∝ overrun (saturates at `overrun_penalty` at 2×tol×expected) — a dense
+   gradient toward terminating that the cliff lacks. Opt-in (off by default); set
+   `no_eos_penalty: 0` to fully replace the cliff. True EOS-*confidence* grading was
+   considered but needs the EOS logprob surfaced from the rollout hot loop, so the
+   cheaper proportional-overrun form ships first.
 
 4. ✅ **Controlled ablation** — *first cheap sweep run; directional, not yet
    significant.* Tooling: `scripts/grpo_ablation.py` (one config per cell → clean

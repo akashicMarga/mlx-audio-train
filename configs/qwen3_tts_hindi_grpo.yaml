@@ -67,6 +67,14 @@ grpo:
       # (over-enunciation that keeps CER low). 0 = off; ~8–10 is a sane Hindi floor.
       speaking_rate_min_cps: 0.0
       speaking_rate_penalty: 0.5
+      # Graded over-length guard: dense gradient the binary no_eos_penalty cliff
+      # lacks. Penalise voiced speech beyond tol×expected (expected = chars /
+      # target_cps), ramping to overrun_penalty at 2×tol×expected. 0 = off;
+      # ~13–15 is a natural Hindi rate. Set no_eos_penalty: 0 to fully replace
+      # the cliff with this graded term.
+      length_target_cps:  0.0
+      length_overrun_tol: 1.5
+      overrun_penalty:    0.5
     # speaker_similarity:      # Pipeline 2 only (needs include_ref_mel + ref audio)
     #   weight: 1.0
     # naturalness:             # DNSMOS quality term — the lever beyond CER-only.

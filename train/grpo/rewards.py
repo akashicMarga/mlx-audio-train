@@ -14,10 +14,11 @@ Reward → advantage:
 group = the `group_size` rollouts of one prompt (DeepSeek-style, critic-free).
 """
 
+import copy
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import mlx.core as mx
@@ -71,55 +72,117 @@ def _levenshtein(a: Sequence, b: Sequence) -> int:
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Reward registry
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Each reward is a named component: a function `(ctx, **params) -> {"reward": [...],
+# ...extra info...}` registered under the same key the YAML `rewards:` block uses.
+# `combine_rewards` iterates the config's `rewards` dict, so adding / toggling /
+# reweighting a reward is a YAML edit — no change to combine_rewards or train.py.
+# To add a new reward: write the function, decorate it with @register_reward("name",
+# default_weight=…), and reference "name" in a config's `rewards:` block. `params`
+# is the reward's YAML block minus `weight` (splatted in), so a config typo raises
+# TypeError rather than silently no-op'ing.
+
+@dataclass
+class _Reward:
+    fn: Callable
+    default_weight: float
+
+
+_REWARD_REGISTRY: Dict[str, _Reward] = {}
+
+
+def register_reward(name: str, *, default_weight: float = 0.0):
+    """Decorator: register `fn` as the reward named `name`. `default_weight` is used
+    when a config lists the reward but omits `weight`."""
+    def deco(fn: Callable) -> Callable:
+        if name in _REWARD_REGISTRY:
+            raise ValueError(f"reward '{name}' already registered")
+        _REWARD_REGISTRY[name] = _Reward(fn=fn, default_weight=default_weight)
+        return fn
+    return deco
+
+
+def registered_rewards() -> List[str]:
+    return sorted(_REWARD_REGISTRY)
+
+
+@dataclass
+class RewardContext:
+    """Per-call inputs shared by every reward. Rewards read only the fields they
+    need (e.g. intelligibility uses audios/texts; length also uses gen_lengths/
+    max_new_tokens; speaker uses model/ref_mel)."""
+    audios:         List[mx.array]
+    texts:          List[str]
+    sample_rate:    int
+    gen_lengths:    Optional[Sequence[int]] = None
+    max_new_tokens: Optional[int]           = None
+    model:          object                  = None
+    ref_mel:        Optional[mx.array]       = None
+
+
+def _invoke(name: str, ctx: RewardContext, spec: dict) -> Dict[str, List[float]]:
+    """Call a registered reward with its params (the spec block minus `weight`)."""
+    if name not in _REWARD_REGISTRY:
+        raise KeyError(f"unknown reward '{name}'; registered: {registered_rewards()}")
+    params = {k: v for k, v in spec.items() if k != "weight"}
+    return _REWARD_REGISTRY[name].fn(ctx, **params)
+
+
+def score(name: str, ctx: RewardContext, cfg: "RewardConfig") -> Dict[str, List[float]]:
+    """Run one registered reward with this cfg's params and return its RAW info dict
+    (unweighted). For eval/logging that wants a metric (cer/mos/spk), not the
+    weighted policy-gradient reward."""
+    return _invoke(name, ctx, cfg.spec(name))
+
+
 @dataclass
 class RewardConfig:
-    # weights (a reward absent from the run contributes 0)
-    w_intel:   float = 1.0
-    w_length:  float = 0.5
-    w_speaker: float = 0.0          # Pipeline 2 only; >0 enables speaker-sim
-    w_mos:     float = 0.0          # >0 enables naturalness/MOS (DNSMOS); needs speechmos
-
-    # intelligibility / ASR
-    asr_model: str = "mlx-community/whisper-large-v3-turbo"
-    language:  str = "hi"
-    metric:    str = "cer"          # "cer" or "wer"
-
-    # intelligibility reward shaping (the lever from the reward-todo backlog):
-    #   linear = 1 − min(1, err)          (flat sensitivity everywhere)
-    #   tanh   = 1 − tanh(reward_k · err) (dense contrast near low err, saturates high)
-    # tanh stretches within-group reward spread ~2.6× at CER≈0.12 (break-even ≈0.38:
-    # below→amplify, above→compress) → sharper policy-gradient signal on live groups.
-    reward_shape: str = "linear"    # "linear" or "tanh"
-    reward_k:     float = 3.0       # tanh steepness
-
-    # naturalness / MOS (the lever beyond CER-only: CER rewards legibility, not
-    # quality). Reference-free DNSMOS P.835; English-trained → a rough RELATIVE
-    # proxy for Hindi naturalness, not a native MOS (see docs). 0 = off.
-    mos_metric: str = "ovrl"        # ovrl | sig | bak (DNSMOS sub-score)
-
-    # length / degeneracy guard
-    no_eos_penalty:    float = 1.0   # subtracted if generation hit the token cap
-    silence_frac_max:  float = 0.6   # >this fraction of low-energy tail → penalty
-    silence_penalty:   float = 0.5
-    silence_rms_db:    float = -40.0 # frame considered silent below this
-
-    # speaking-rate guard (anti reward-hacking): CER rewards ASR-friendly speech,
-    # which can degenerate into slow/over-enunciated audio that still transcribes
-    # well. Penalise voiced speech below `speaking_rate_min_cps` chars/sec, graded
-    # by the shortfall. Disabled by default (min_cps=0) — it is a run-dependent
-    # defence; set ~8–10 for Hindi. Measured over VOICED duration (trailing
-    # silence excluded so it doesn't double-count the silence penalty).
-    speaking_rate_min_cps: float = 0.0   # 0 = off
-    speaking_rate_penalty: float = 0.5   # magnitude when fully below the floor
+    """Config for the reward stack. `rewards` maps reward-name → its YAML block
+    (`{weight, ...params}`); everything else is a global read by the trainer."""
+    rewards:  Dict[str, dict] = field(default_factory=dict)
 
     # advantage normalisation (Dr. GRPO argument, Liu et al. "Understanding
     # R1-Zero-Like Training"): "std" = group-relative + /std (DeepSeek default);
-    # "none" drops the /std, which is a bias that up-weights low-variance (low-info)
-    # groups. TRAP: "none" shrinks advantages ~10× → must raise LR ~5–10× to match
-    # effective step size (see scripts/grpo_reward_ablation.py).
+    # "none" drops the /std, which up-weights low-variance (low-info) groups.
+    # TRAP: "none" shrinks advantages ~10× (see scripts/grpo_reward_ablation.py).
     adv_norm: str = "std"           # "std" or "none"
+    eps:      float = 1e-4          # advantage std floor
 
-    eps: float = 1e-4               # advantage std floor
+    def spec(self, name: str) -> dict:
+        return self.rewards.get(name, {})
+
+    def weight(self, name: str) -> float:
+        """Effective weight: the block's `weight`, else the reward's registered
+        default; 0 if the reward isn't in the config at all (→ inactive)."""
+        if name not in self.rewards:
+            return 0.0
+        default = _REWARD_REGISTRY[name].default_weight if name in _REWARD_REGISTRY else 0.0
+        return float(self.rewards[name].get("weight", default))
+
+    def param(self, name: str, key: str, default=None):
+        return self.rewards.get(name, {}).get(key, default)
+
+    @classmethod
+    def from_config(cls, grpo_block: dict, *, default_language: str = "auto") -> "RewardConfig":
+        """Build from a config's `grpo` block. The `rewards:` sub-block drives the
+        stack directly. Two conveniences: the intelligibility `language` defaults to
+        the trainer's lang_code, and a top-level `grpo.reward_shape`/`reward_k`
+        (written by the ablation driver) is promoted onto the intelligibility reward
+        for back-compat."""
+        rewards = copy.deepcopy(dict(grpo_block.get("rewards", {}) or {}))
+        intel = rewards.setdefault("intelligibility", {})
+        intel.setdefault("language", default_language)
+        for k in ("reward_shape", "reward_k"):
+            if k in grpo_block and k not in intel:
+                intel[k] = grpo_block[k]
+        return cls(
+            rewards=rewards,
+            adv_norm=grpo_block.get("adv_norm", "std"),
+            eps=float(grpo_block.get("eps", 1e-4)),
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,26 +196,30 @@ def _to_whisper_audio(audio: mx.array, src_sr: int) -> np.ndarray:
     return wav
 
 
-def _shape_intel_reward(err: float, cfg: RewardConfig) -> float:
+def _shape_intel_reward(err: float, reward_shape: str, reward_k: float) -> float:
     """Map an error rate (CER/WER, ∈[0, ∞)) to a reward ∈(0, 1].
 
     linear: 1 − min(1, err) — flat sensitivity, hard-clamped at err≥1.
     tanh:   1 − tanh(k·err) — dense contrast near err→0, smooth saturation for
             large err (no clamp needed; tanh handles insertions err>1 gracefully).
+            Stretches within-group spread ~2.6× at CER≈0.12 (break-even ≈0.38).
     """
-    if cfg.reward_shape == "tanh":
-        return float(1.0 - np.tanh(cfg.reward_k * err))
+    if reward_shape == "tanh":
+        return float(1.0 - np.tanh(reward_k * err))
     return 1.0 - min(1.0, err)
 
 
+@register_reward("intelligibility", default_weight=1.0)
 def intelligibility_reward(
-    audios: List[mx.array],
-    texts:  List[str],
-    cfg:    RewardConfig,
+    ctx: RewardContext,
     *,
-    sample_rate: int,
+    asr_model:    str = "mlx-community/whisper-large-v3-turbo",
+    language:     str = "hi",
+    metric:       str = "cer",       # "cer" or "wer"
+    reward_shape: str = "linear",    # "linear" or "tanh" (see _shape_intel_reward)
+    reward_k:     float = 3.0,       # tanh steepness
 ) -> Dict[str, List[float]]:
-    """r_intel = 1 − min(1, error_rate(ASR(audio), text)) per rollout.
+    """r_intel = shaped(1 − error_rate(ASR(audio), text)) per rollout.
 
     Returns {"reward": [...], "cer": [...], "hyp": [...]} (hyp kept for logging).
 
@@ -164,8 +231,8 @@ def intelligibility_reward(
     import mlx_whisper
 
     rewards, errs, hyps = [], [], []
-    for audio, text in zip(audios, texts):
-        wav = _to_whisper_audio(audio, sample_rate)
+    for audio, text in zip(ctx.audios, ctx.texts):
+        wav = _to_whisper_audio(audio, ctx.sample_rate)
         if wav.shape[0] < WHISPER_SR // 10:        # <100 ms → treat as empty
             rewards.append(0.0); errs.append(1.0); hyps.append("")
             continue
@@ -176,12 +243,12 @@ def intelligibility_reward(
         # makes the reward deterministic. condition_on_previous_text=False avoids
         # cross-segment drift on the short clips we score.
         result = mlx_whisper.transcribe(
-            wav, path_or_hf_repo=cfg.asr_model, language=cfg.language, verbose=False,
+            wav, path_or_hf_repo=asr_model, language=language, verbose=False,
             temperature=0.0, condition_on_previous_text=False,
         )
         hyp = result.get("text", "")
-        err = char_error_rate(hyp, text) if cfg.metric == "cer" else _wer(hyp, text)
-        rewards.append(_shape_intel_reward(err, cfg))
+        err = char_error_rate(hyp, text) if metric == "cer" else _wer(hyp, text)
+        rewards.append(_shape_intel_reward(err, reward_shape, reward_k))
         errs.append(err); hyps.append(hyp)
     return {"reward": rewards, "cer": errs, "hyp": hyps}
 
@@ -197,49 +264,76 @@ def _wer(hyp: str, ref: str) -> float:
         return _levenshtein(hyp_n, ref_n) / len(ref_n)
 
 
+@register_reward("length_penalty", default_weight=0.5)
 def length_reward(
-    audios:      List[mx.array],
-    gen_lengths: Sequence[int],
-    max_new_tokens: int,
-    cfg: RewardConfig,
+    ctx: RewardContext,
     *,
-    sample_rate: int,
-    texts: Optional[List[str]] = None,
+    no_eos_penalty:    float = 1.0,   # subtracted if generation hit the token cap
+    silence_penalty:   float = 0.5,
+    silence_frac_max:  float = 0.6,   # >this fraction of low-energy tail → penalty
+    silence_rms_db:    float = -40.0, # frame considered silent below this
+    # speaking-rate guard (anti reward-hacking): penalise VOICED speech below
+    # `speaking_rate_min_cps` chars/sec, graded by the shortfall. 0 = off; ~8–10
+    # for Hindi. Measured over voiced duration (trailing silence excluded).
+    speaking_rate_min_cps: float = 0.0,
+    speaking_rate_penalty: float = 0.5,
+    # graded over-length guard: the dense gradient the binary no_eos cliff lacks.
+    # Penalise voiced duration beyond `length_overrun_tol × expected` (expected =
+    # chars / length_target_cps), graded ∝ overrun, saturating at `overrun_penalty`
+    # at 2×tol×expected. 0 = off; set no_eos_penalty:0 to fully replace the cliff.
+    length_target_cps:  float = 0.0,
+    length_overrun_tol: float = 1.5,
+    overrun_penalty:    float = 0.5,
     frame_ms: float = 20.0,
 ) -> Dict[str, List[float]]:
     """Degeneracy guard: penalise (a) hitting the token cap without EOS,
-    (b) excessive trailing silence (padding with quiet to game the ASR), and
+    (b) excessive trailing silence (padding with quiet to game the ASR),
     (c) speech slower than `speaking_rate_min_cps` chars/sec (over-enunciation
-    that keeps CER low while degrading naturalness). Reward ≤ 0 (it is a penalty).
+    that keeps CER low while degrading naturalness), and (d) speech much longer
+    than the text warrants — a graded over-length penalty that gives the dense
+    gradient the binary cap cliff (a) lacks. Reward ≤ 0 (it is a penalty).
 
-    `texts` (the reference transcript per rollout) is required only for the
-    speaking-rate term; without it that term is skipped.
+    `ctx.texts` is required only for the speaking-rate and over-length terms;
+    without it those terms are skipped.
     """
+    audios, gen_lengths = ctx.audios, ctx.gen_lengths
+    max_new_tokens, sample_rate = ctx.max_new_tokens, ctx.sample_rate
     rewards, sil_fracs, cps_list = [], [], []
     win = max(1, int(sample_rate * frame_ms / 1000.0))
-    thresh = 10.0 ** (cfg.silence_rms_db / 20.0)
-    texts = texts if texts is not None else [None] * len(audios)
+    thresh = 10.0 ** (silence_rms_db / 20.0)
+    texts = ctx.texts if ctx.texts is not None else [None] * len(audios)
     for audio, glen, text in zip(audios, gen_lengths, texts):
         pen = 0.0
         if int(glen) >= max_new_tokens:
-            pen -= cfg.no_eos_penalty
+            pen -= no_eos_penalty
         wav = np.asarray(audio, dtype=np.float32)
         sil = _trailing_silence_frac(wav, win, thresh)
-        if sil > cfg.silence_frac_max:
-            pen -= cfg.silence_penalty
+        if sil > silence_frac_max:
+            pen -= silence_penalty
 
-        # Speaking rate over VOICED duration (total minus the trailing-silence
-        # tail, so this targets slow articulation, not the padding the silence
-        # term already covers). cps = chars / voiced_seconds.
+        # Text-relative terms measured over VOICED duration (total minus the
+        # trailing-silence tail, so they target articulation/length, not the
+        # padding the silence term already covers). cps = chars / voiced_seconds.
         cps = 0.0
-        if cfg.speaking_rate_min_cps > 0 and text:
+        need_text_terms = (speaking_rate_min_cps > 0 or length_target_cps > 0)
+        if need_text_terms and text:
             n_chars = len(normalize_text(text).replace(" ", ""))
             voiced_s = max((len(wav) / sample_rate) * (1.0 - sil), 1e-3)
             if n_chars > 0:
                 cps = n_chars / voiced_s
-                shortfall = (cfg.speaking_rate_min_cps - cps) / cfg.speaking_rate_min_cps
-                if shortfall > 0:
-                    pen -= cfg.speaking_rate_penalty * min(1.0, shortfall)
+                # (c) speaking-rate floor: penalise over-enunciation (too slow).
+                if speaking_rate_min_cps > 0:
+                    shortfall = (speaking_rate_min_cps - cps) / speaking_rate_min_cps
+                    if shortfall > 0:
+                        pen -= speaking_rate_penalty * min(1.0, shortfall)
+                # (d) graded over-length: penalise voiced duration beyond
+                # tol×expected, ramping to `overrun_penalty` at 2×tol×expected.
+                if length_target_cps > 0:
+                    expected_s = n_chars / length_target_cps
+                    # overrun = 1.0 exactly at the tolerance edge, >1 past it.
+                    overrun = voiced_s / (expected_s * length_overrun_tol)
+                    if overrun > 1.0:
+                        pen -= overrun_penalty * min(1.0, overrun - 1.0)
         rewards.append(pen); sil_fracs.append(sil); cps_list.append(cps)
     return {"reward": rewards, "silence_frac": sil_fracs, "speaking_rate": cps_list}
 
@@ -261,26 +355,25 @@ def _trailing_silence_frac(wav: np.ndarray, win: int, thresh: float) -> float:
     return trailing / n
 
 
-def speaker_similarity_reward(
-    model,
-    audios: List[mx.array],
-    ref_mel: mx.array,
-    *,
-    sample_rate: int,
-) -> Dict[str, List[float]]:
+@register_reward("speaker_similarity", default_weight=0.0)
+def speaker_similarity_reward(ctx: RewardContext) -> Dict[str, List[float]]:
     """r_spk = cosine(speaker_encoder(mel(audio)), speaker_encoder(ref_mel)),
-    Pipeline 2 only. Reuses the frozen speaker_encoder already loaded for SFT."""
+    Pipeline 2 only. Reuses the frozen speaker_encoder already loaded for SFT.
+    Reads `ctx.model` (must have `speaker_encoder`) and `ctx.ref_mel`."""
     from data.audio_utils import mel_spectrogram  # repo's 24k mel for Qwen3-TTS
 
+    model, ref_mel, sample_rate = ctx.model, ctx.ref_mel, ctx.sample_rate
     if getattr(model, "speaker_encoder", None) is None:
         raise RuntimeError("speaker_similarity_reward needs model.speaker_encoder (Pipeline 2).")
+    if ref_mel is None:
+        raise RuntimeError("speaker_similarity_reward needs ctx.ref_mel (Pipeline 2).")
     if ref_mel.ndim == 2:                                           # [T,128] → [1,T,128]
         ref_mel = ref_mel[None, ...]
     ref_vec = mx.stop_gradient(model.speaker_encoder(ref_mel))      # [1, D]
     ref_vec = ref_vec / (mx.linalg.norm(ref_vec, axis=-1, keepdims=True) + 1e-8)
 
     rewards = []
-    for audio in audios:
+    for audio in ctx.audios:
         wav = np.asarray(audio, dtype=np.float32)
         # Degenerate rollouts (near-silent) can make mel_spectrogram overflow →
         # NaN embedding → NaN cosine, which would poison the whole group's
@@ -296,7 +389,7 @@ def speaker_similarity_reward(
         vec = vec / (mx.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
         sim = float((vec * ref_vec).sum())
         rewards.append(sim if np.isfinite(sim) else -1.0)
-    return {"reward": rewards}
+    return {"reward": rewards, "spk_sim": rewards}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -321,11 +414,11 @@ def _get_dnsmos():
     return _DNSMOS
 
 
+@register_reward("naturalness", default_weight=0.0)
 def naturalness_reward(
-    audios: List[mx.array],
-    cfg:    RewardConfig,
+    ctx: RewardContext,
     *,
-    sample_rate: int,
+    metric: str = "ovrl",           # ovrl | sig | bak (DNSMOS P.835 sub-score)
 ) -> Dict[str, List[float]]:
     """r_nat = (DNSMOS − 1) / 4 ∈ [0, 1] per rollout (P.835 MOS ~[1,5] rescaled).
 
@@ -337,18 +430,18 @@ def naturalness_reward(
     Returns {"reward": [...0..1...], "mos": [...raw OVRL...]}.
     """
     dnsmos = _get_dnsmos()
-    key = f"{cfg.mos_metric}_mos"                       # ovrl_mos | sig_mos | bak_mos
+    key = f"{metric}_mos"                               # ovrl_mos | sig_mos | bak_mos
     rewards, mos = [], []
-    for audio in audios:
-        wav = _to_whisper_audio(audio, sample_rate)     # DNSMOS wants 16 kHz
+    for audio in ctx.audios:
+        wav = _to_whisper_audio(audio, ctx.sample_rate)  # DNSMOS wants 16 kHz
         if wav.shape[0] < 256 or not np.all(np.isfinite(wav)):
             rewards.append(0.0); mos.append(1.0); continue
         try:
-            score = float(dnsmos.run(wav, sr=WHISPER_SR)[key])
+            mos_score = float(dnsmos.run(wav, sr=WHISPER_SR)[key])
         except Exception:
             rewards.append(0.0); mos.append(1.0); continue
-        rewards.append(min(1.0, max(0.0, (score - 1.0) / 4.0)))
-        mos.append(score)
+        rewards.append(min(1.0, max(0.0, (mos_score - 1.0) / 4.0)))
+        mos.append(mos_score)
     return {"reward": rewards, "mos": mos}
 
 
@@ -367,36 +460,34 @@ def combine_rewards(
     model=None,
     ref_mel: Optional[mx.array] = None,
 ) -> Dict[str, object]:
-    """Run the enabled rewards, return total per-rollout reward + a metrics dict.
+    """Run every reward listed (with weight != 0) in `cfg.rewards`, return the
+    weighted per-rollout total + a metrics dict.
 
-    total_i = w_intel·r_intel + w_length·r_length + w_speaker·r_spk + w_mos·r_mos
+    total_i = Σ_name  weight(name) · r_name,i    (over active registered rewards)
+
+    Each active reward contributes `r_<name>` (its per-rollout reward) plus any
+    extra info it emits (e.g. intelligibility → `cer`/`hyp`, naturalness → `mos`,
+    length → `silence_frac`/`speaking_rate`, speaker → `spk_sim`) into `info`.
     """
+    ctx = RewardContext(
+        audios=audios, texts=texts, sample_rate=sample_rate,
+        gen_lengths=gen_lengths, max_new_tokens=max_new_tokens,
+        model=model, ref_mel=ref_mel,
+    )
     n = len(audios)
     total = np.zeros(n, dtype=np.float32)
     info: Dict[str, object] = {}
 
-    if cfg.w_intel > 0:
-        r = intelligibility_reward(audios, texts, cfg, sample_rate=sample_rate)
-        total += cfg.w_intel * np.asarray(r["reward"], dtype=np.float32)
-        info["cer"] = r["cer"]; info["hyp"] = r["hyp"]
-        info["r_intel"] = r["reward"]
-
-    if cfg.w_length > 0:
-        r = length_reward(audios, gen_lengths, max_new_tokens, cfg,
-                          sample_rate=sample_rate, texts=texts)
-        total += cfg.w_length * np.asarray(r["reward"], dtype=np.float32)
-        info["silence_frac"] = r["silence_frac"]; info["r_length"] = r["reward"]
-        info["speaking_rate"] = r["speaking_rate"]
-
-    if cfg.w_speaker > 0:
-        r = speaker_similarity_reward(model, audios, ref_mel, sample_rate=sample_rate)
-        total += cfg.w_speaker * np.asarray(r["reward"], dtype=np.float32)
-        info["r_speaker"] = r["reward"]
-
-    if cfg.w_mos > 0:
-        r = naturalness_reward(audios, cfg, sample_rate=sample_rate)
-        total += cfg.w_mos * np.asarray(r["reward"], dtype=np.float32)
-        info["mos"] = r["mos"]; info["r_mos"] = r["reward"]
+    for name in cfg.rewards:
+        w = cfg.weight(name)
+        if w == 0:
+            continue
+        r = _invoke(name, ctx, cfg.spec(name))
+        total += w * np.asarray(r["reward"], dtype=np.float32)
+        info[f"r_{name}"] = r["reward"]
+        for k, v in r.items():
+            if k != "reward":
+                info[k] = v
 
     info["reward_total"] = total.tolist()
     return {"reward": total, "info": info}

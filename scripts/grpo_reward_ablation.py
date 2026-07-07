@@ -90,9 +90,12 @@ def materialize_config(base_cfg: dict, adv_norm, reward_shape, *, base_lr, nostd
     cfg.setdefault("grpo", {})
     cfg.setdefault("trainer", {})
 
-    cfg["grpo"]["adv_norm"]     = adv_norm
-    cfg["grpo"]["reward_shape"] = reward_shape
-    cfg["grpo"]["reward_k"]     = reward_k
+    # adv_norm is a global on the grpo block; reward_shape/reward_k are params of
+    # the intelligibility reward (registry keys), set in its rewards sub-block.
+    cfg["grpo"]["adv_norm"] = adv_norm
+    intel = cfg["grpo"].setdefault("rewards", {}).setdefault("intelligibility", {})
+    intel["reward_shape"] = reward_shape
+    intel["reward_k"]     = reward_k
 
     lr = cell_lr(adv_norm, base_lr, nostd_mult)
     cfg["trainer"]["learning_rate"] = lr
