@@ -77,12 +77,11 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
     speechmos backend is available."""
     import mlx.core as mx
     from train.grpo.rollout import sample_rollouts_interleaved, decode_codes_to_audio
-    from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
-                                    speaker_similarity_reward, _trailing_silence_frac,
+    from train.grpo.rewards import (score, RewardContext, _trailing_silence_frac,
                                     normalize_text)
 
     win    = max(1, int(sample_rate * 20.0 / 1000.0))
-    thresh = 10.0 ** (reward_cfg.silence_rms_db / 20.0)
+    thresh = 10.0 ** (reward_cfg.param("length_penalty", "silence_rms_db", -40.0) / 20.0)
     cers, durs, cpss, moss, spks = [], [], [], [], []   # one entry per (sentence, seed)
     for si in range(seeds):
         for pi, prompt in enumerate(prompts):
@@ -94,13 +93,14 @@ def eval_adapter(model, train_mod, prompts, reward_cfg, *, lang_code, seeds,
                 ref_audio=prompt.get("ref_audio_wav"),   # Pipeline 2: clone the voice
             )
             audios = decode_codes_to_audio(model, out["full_codes"], out["codec_mask"])
-            r = intelligibility_reward(audios, [prompt["text"]], reward_cfg, sample_rate=sample_rate)
-            cers.append(min(1.0, float(r["cer"][0])))    # capped at 1.0
+            ctx = RewardContext(audios=audios, texts=[prompt["text"]],
+                                sample_rate=sample_rate, model=model,
+                                ref_mel=prompt.get("ref_mel"))
+            cers.append(min(1.0, float(score("intelligibility", ctx, reward_cfg)["cer"][0])))
             if compute_mos:
-                moss.append(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"][0])
+                moss.append(score("naturalness", ctx, reward_cfg)["mos"][0])
             if prompt.get("ref_mel") is not None:        # Pipeline 2: speaker similarity
-                spks.append(speaker_similarity_reward(
-                    model, audios, prompt["ref_mel"], sample_rate=sample_rate)["reward"][0])
+                spks.append(score("speaker_similarity", ctx, reward_cfg)["reward"][0])
             wav = np.asarray(audios[0], dtype=np.float32)
             dur = len(wav) / sample_rate
             sil = _trailing_silence_frac(wav, win, thresh)
@@ -166,13 +166,8 @@ def main():
           f"{'  (Pipeline 2: cloning + speaker-sim)' if is_p2 else ''}\n")
 
     g  = cfg.get("grpo", {})
-    rw = g.get("rewards", {}).get("intelligibility", {})
     t  = cfg.get("trainer", {})
-    reward_cfg = RewardConfig(
-        asr_model=rw.get("asr_model", "mlx-community/whisper-large-v3-turbo"),
-        language=rw.get("language", t.get("lang_code", "auto")),
-        metric=rw.get("metric", "cer"),
-    )
+    reward_cfg = RewardConfig.from_config(g, default_language=t.get("lang_code", "auto"))
     try:
         import speechmos  # noqa: F401
         compute_mos = True

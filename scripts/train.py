@@ -643,33 +643,11 @@ def run_grpo(model, cfg: dict, args):
     # Fixed prompt set for the in-loop held-out eval (legibility).
     eval_prompts = build_grpo_eval_prompts(cfg, model, prompts)
 
-    # Reward config from the YAML rewards block.
-    rw = g.get("rewards", {})
-    intel = rw.get("intelligibility", {})
-    length = rw.get("length_penalty", {})
-    speaker = rw.get("speaker_similarity", {})
-    naturalness = rw.get("naturalness", {})
-    reward_cfg = RewardConfig(
-        w_intel   = intel.get("weight",   1.0),
-        w_length  = length.get("weight",  0.5),
-        w_speaker = speaker.get("weight", 0.0),
-        w_mos     = naturalness.get("weight", 0.0),
-        asr_model = intel.get("asr_model", "mlx-community/whisper-large-v3-turbo"),
-        language  = intel.get("language",  cfg["trainer"].get("lang_code", "auto")),
-        metric    = intel.get("metric",    "cer"),
-        mos_metric = naturalness.get("metric", "ovrl"),
-        no_eos_penalty = length.get("no_eos_penalty", 1.0),
-        silence_penalty = length.get("silence_penalty", 0.5),
-        speaking_rate_min_cps = length.get("speaking_rate_min_cps", 0.0),
-        speaking_rate_penalty = length.get("speaking_rate_penalty", 0.5),
-        # reward-shaping / advantage-norm knobs (grpo-reward-todo 2×2 ablation).
-        # reward_shape/reward_k live on the intelligibility reward; adv_norm on the
-        # advantage step. All read from the top-level grpo block so the ablation
-        # driver can set them per cell (see scripts/grpo_reward_ablation.py).
-        reward_shape = intel.get("reward_shape", g.get("reward_shape", "linear")),
-        reward_k     = intel.get("reward_k",     g.get("reward_k", 3.0)),
-        adv_norm     = g.get("adv_norm", "std"),
-    )
+    # Reward config: the `grpo.rewards` block drives the reward stack directly
+    # (each key = a registered reward, its sub-block = weight + params). Adding /
+    # toggling / reweighting a reward is a YAML edit — see train/grpo/rewards.py.
+    reward_cfg = RewardConfig.from_config(
+        g, default_language=cfg["trainer"].get("lang_code", "auto"))
 
     trainer_config = TrainerConfig(
         output_dir          = t.get("output_dir",          "./checkpoints/grpo"),

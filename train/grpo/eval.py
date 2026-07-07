@@ -34,8 +34,7 @@ from train.grpo.rollout import (
     gather_token_logprobs,
     _cb0_logits_from_tf_input,
 )
-from train.grpo.rewards import (intelligibility_reward, naturalness_reward,
-                                speaker_similarity_reward, _trailing_silence_frac,
+from train.grpo.rewards import (score, RewardContext, _trailing_silence_frac,
                                 normalize_text)
 
 
@@ -65,7 +64,7 @@ def make_grpo_audio_eval_fn(
     ablation runner — collect curves without parsing TB event files."""
 
     win    = max(1, int(sample_rate * frame_ms / 1000.0))
-    thresh = 10.0 ** (reward_cfg.silence_rms_db / 20.0)
+    thresh = 10.0 ** (reward_cfg.param("length_penalty", "silence_rms_db", -40.0) / 20.0)
 
     def _rollout(model, prompt):
         lang = prompt.get("lang_code", lang_code)
@@ -97,8 +96,8 @@ def make_grpo_audio_eval_fn(
             policy_logp = gather_token_logprobs(logits, out["codec_ids"])
         return out, policy_logp
 
-    log_mos = getattr(reward_cfg, "w_mos", 0.0) > 0       # only when MOS is a reward
-    log_spk = getattr(reward_cfg, "w_speaker", 0.0) > 0   # Pipeline 2: speaker-sim
+    log_mos = reward_cfg.weight("naturalness") > 0        # only when MOS is a reward
+    log_spk = reward_cfg.weight("speaker_similarity") > 0 # Pipeline 2: speaker-sim
 
     def _eval(model, step, tb_writer, reference_only: bool = False):
         cers, durs, sils, kls, rates, moss, spks = [], [], [], [], [], [], []
@@ -109,14 +108,14 @@ def make_grpo_audio_eval_fn(
             out, policy_logp = _rollout(model, prompt)
 
             audios = decode_codes_to_audio(model, out["full_codes"], out["codec_mask"])
-            r = intelligibility_reward(
-                audios, [prompt["text"]] * group_size, reward_cfg, sample_rate=sample_rate)
-            cers.extend(r["cer"])
+            ctx = RewardContext(
+                audios=audios, texts=[prompt["text"]] * group_size,
+                sample_rate=sample_rate, model=model, ref_mel=prompt.get("ref_mel"))
+            cers.extend(score("intelligibility", ctx, reward_cfg)["cer"])
             if log_mos:
-                moss.extend(naturalness_reward(audios, reward_cfg, sample_rate=sample_rate)["mos"])
+                moss.extend(score("naturalness", ctx, reward_cfg)["mos"])
             if log_spk and prompt.get("ref_mel") is not None:
-                spks.extend(speaker_similarity_reward(
-                    model, audios, prompt["ref_mel"], sample_rate=sample_rate)["reward"])
+                spks.extend(score("speaker_similarity", ctx, reward_cfg)["reward"])
 
             # k3 KL(π_θ ‖ π_ref), per rollout, averaged over valid cb0 tokens.
             mask = out["codec_mask"].astype(mx.float32)

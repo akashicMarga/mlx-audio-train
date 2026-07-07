@@ -182,8 +182,8 @@ class GRPORolloutLoader:
         info = scored["info"]
         cer_mean = float(np.mean(info["cer"])) if "cer" in info else 0.0
         mos_mean = float(np.mean(info["mos"])) if "mos" in info else 0.0
-        # r_speaker IS the cosine similarity per rollout → its mean is the curve.
-        spk_mean = float(np.mean(info["r_speaker"])) if "r_speaker" in info else 0.0
+        # r_speaker_similarity IS the cosine per rollout → its mean is the curve.
+        spk_mean = float(np.mean(info["r_speaker_similarity"])) if "r_speaker_similarity" in info else 0.0
 
         batch = {
             "codec_ids":    out["codec_ids"],
