@@ -126,7 +126,7 @@ about, plus one quality anchor to prevent degradation.
 
 | Reward | Pipeline | Signal | Weight (start) |
 |---|---|---|---|
-| `r_intel` | 1 (language) | `1 − min(1, CER(ASR(audio), prompt_text))` via mlx-whisper; CER over WER for Hindi/Devanagari robustness | 1.0 |
+| `r_intel` | 1 (language) | `shaped(1 − err(ASR(audio), prompt_text))` via mlx-whisper; `metric: cer\|wer` picks which drives the reward. **Both CER and WER are always logged** (`grpo_eval/{cer,wer}`) so you can watch them diverge. CER default for Hindi/Devanagari (a wrong matra flips a whole word under WER; Indic word boundaries are noisy) | 1.0 |
 | `r_spk` | 2 (cloning) | cosine(`speaker_encoder(mel(audio))`, `speaker_encoder(ref_mel)`) — encoder is already loaded and frozen | 1.0 |
 | `r_len` | both | penalty −1 if generation hit `max_new_tokens` without EOS; small penalty for >60% trailing-silence frames (degeneracy guard) | 0.5 |
 | `r_kl` | both | not a reward — per-token KL penalty in the loss (see below) | β = 0.02–0.1 |
