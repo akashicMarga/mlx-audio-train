@@ -123,8 +123,8 @@ class NemotronDenseModel(nn.Module):
         self.layers = [DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)]
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
 
-    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
-        h = self.embed_tokens(inputs)
+    def __call__(self, inputs: mx.array = None, cache=None, inputs_embeds: mx.array = None) -> mx.array:
+        h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(inputs)
         mask = None
         if h.shape[1] > 1:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
@@ -149,9 +149,12 @@ class NemotronDenseForCausalLM(nn.Module):
         self.model = NemotronDenseModel(cfg)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
-        h = self.model(inputs, cache=cache)
+    def __call__(self, inputs: mx.array = None, cache=None, inputs_embeds: mx.array = None) -> mx.array:
+        h = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
         return self.lm_head(h)
+
+    def embed(self, ids: mx.array) -> mx.array:
+        return self.model.embed_tokens(ids)
 
     @property
     def layers(self):

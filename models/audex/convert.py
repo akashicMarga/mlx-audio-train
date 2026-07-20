@@ -82,9 +82,30 @@ def convert_decoder(out: Path, scratch: Path, repo: str):
     print(f"[convert] wrote speech_decoder.safetensors ({len(weights)} tensors)", flush=True)
 
 
+def convert_audio(out: Path, scratch: Path, repo: str):
+    """NV-Whisper encoder + sound projector. All audio tensors live in LM shard 2."""
+    print("[convert] audio encoder + projector ...", flush=True)
+    path = _hf_get(repo, f"{FULL}/{LM_SHARDS[1]}", scratch)   # shard 2 only (~1.3 GB)
+    src = mx.load(path, format="safetensors")
+    weights = {}
+    for k, v in src.items():
+        if not (k.startswith("audio_encoder.") or k.startswith("audio_projector.")):
+            continue
+        # Conv1d: torch [out, in, k] -> mlx [out, k, in]
+        if k in ("audio_encoder.conv1.weight", "audio_encoder.conv2.weight"):
+            v = mx.swapaxes(v, 1, 2)
+        weights[k] = v.astype(mx.bfloat16)
+    mx.eval(list(weights.values()))
+    del src
+    os.remove(path)
+    mx.save_safetensors(str(out / "audio.safetensors"), weights)
+    print(f"[convert] wrote audio.safetensors ({len(weights)} tensors)", flush=True)
+
+
 def write_configs(out: Path, scratch: Path, repo: str):
     from .lm import LMConfig
     from .speech_decoder import SpeechDecoderConfig
+    from .audio_encoder import AudioEncoderConfig
     import dataclasses
 
     lm_cfg = json.loads(Path(_hf_get(repo, f"{FULL}/config.json", scratch)).read_text())
@@ -93,6 +114,8 @@ def write_configs(out: Path, scratch: Path, repo: str):
     (out / "lm_config.json").write_text(json.dumps(dataclasses.asdict(LMConfig.from_hf(lm_cfg)), indent=2))
     (out / "speech_decoder_config.json").write_text(
         json.dumps(dataclasses.asdict(SpeechDecoderConfig.from_hf(dec_cfg)), indent=2))
+    (out / "audio_config.json").write_text(
+        json.dumps(dataclasses.asdict(AudioEncoderConfig.from_hf(lm_cfg)), indent=2))
 
     for fn in TOKENIZER_FILES:
         src = _hf_get(repo, f"{FULL}/{fn}", scratch)
@@ -107,6 +130,8 @@ def main():
     ap.add_argument("--scratch", default=None, help="temp dir for shard downloads (default: <out>/.scratch)")
     ap.add_argument("--skip-lm", action="store_true")
     ap.add_argument("--skip-decoder", action="store_true")
+    ap.add_argument("--skip-audio", action="store_true")
+    ap.add_argument("--only-audio", action="store_true", help="convert just the audio tower (adds to an existing checkpoint)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -115,10 +140,15 @@ def main():
     scratch.mkdir(parents=True, exist_ok=True)
 
     write_configs(out, scratch, args.repo)
-    if not args.skip_lm:
-        convert_lm(out, scratch, args.repo)
-    if not args.skip_decoder:
-        convert_decoder(out, scratch, args.repo)
+    if args.only_audio:
+        convert_audio(out, scratch, args.repo)
+    else:
+        if not args.skip_lm:
+            convert_lm(out, scratch, args.repo)
+        if not args.skip_decoder:
+            convert_decoder(out, scratch, args.repo)
+        if not args.skip_audio:
+            convert_audio(out, scratch, args.repo)
 
     shutil.rmtree(scratch, ignore_errors=True)
     print(f"[convert] done -> {out}")

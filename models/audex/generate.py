@@ -26,6 +26,8 @@ import numpy as np
 
 from .lm import LMConfig, NemotronDenseForCausalLM
 from .speech_decoder import SpeechDecoderConfig, AudexSpeechDecoder
+from .audio_encoder import AudioEncoderConfig, AudioTower
+from . import features as feat
 
 SYSTEM_PROMPT = (
     "You are a helpful and harmless assistant.\n\n"
@@ -41,6 +43,8 @@ class AudexModel:
     speech_codec: dict          # token_id -> codec_id
     markers: dict               # name -> token_id
     eos_ids: list
+    audio_tower: object = None  # AudioTower or None (text/TTS-only checkpoint)
+    sound_token_id: int = None  # <so_embedding>
 
 
 def load_model(model_dir: str) -> AudexModel:
@@ -58,15 +62,30 @@ def load_model(model_dir: str) -> AudexModel:
     decoder.load_weights(str(model_dir / "speech_decoder.safetensors"))
     decoder.eval()
 
-    mx.eval(lm.parameters(), decoder.parameters())
+    to_eval = [lm.parameters(), decoder.parameters()]
+
+    audio_tower = None
+    audio_path = model_dir / "audio.safetensors"
+    audio_cfg_path = model_dir / "audio_config.json"
+    if audio_path.exists() and audio_cfg_path.exists():
+        aud_cfg = AudioEncoderConfig(**json.loads(audio_cfg_path.read_text()))
+        audio_tower = AudioTower(aud_cfg)
+        audio_tower.load_weights(str(audio_path))
+        audio_tower.eval()
+        to_eval.append(audio_tower.parameters())
+
+    mx.eval(*to_eval)
 
     hf_logging.set_verbosity_error()
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
     speech_codec, markers = _build_codec_maps(tokenizer)
     eos_ids = _resolve_eos(tokenizer)
-    print(f"[audex] Ready. {len(speech_codec)} speechcodec tokens, markers={markers}, eos={eos_ids}")
-    return AudexModel(lm, decoder, tokenizer, speech_codec, markers, eos_ids)
+    sound_token_id = tokenizer.convert_tokens_to_ids("<so_embedding>")
+    print(f"[audex] Ready. {len(speech_codec)} speechcodec tokens, "
+          f"audio_understanding={'on' if audio_tower else 'off'}, eos={eos_ids}")
+    return AudexModel(lm, decoder, tokenizer, speech_codec, markers, eos_ids,
+                      audio_tower=audio_tower, sound_token_id=sound_token_id)
 
 
 def _build_codec_maps(tokenizer):
@@ -221,3 +240,109 @@ def tts_generate(model: AudexModel, transcription: str, *, max_new_tokens: int =
     wav = model.decoder.decode(codes)
     mx.eval(wav)
     return np.array(wav, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# audio understanding (speech -> text) and speech-to-speech
+# ---------------------------------------------------------------------------
+def encode_audio(model: AudexModel, audio: np.ndarray) -> mx.array:
+    """audio waveform -> projected audio embeddings [num_clips*750, 2048]."""
+    if model.audio_tower is None:
+        raise RuntimeError("This checkpoint has no audio encoder (audio.safetensors missing). "
+                           "Re-run `python -m models.audex.convert` to include it.")
+    features = feat.extract_features(audio)          # (clips, 128, 3000)
+    projected = model.audio_tower(features)          # (clips, 750, 2048)
+    n = projected.shape[0] * projected.shape[1]
+    return projected.reshape(n, projected.shape[-1])
+
+
+def _understanding_embeds(model: AudexModel, audio: np.ndarray, instruction: str):
+    """Build inputs_embeds with audio injected at <so_embedding> positions."""
+    n_embed = feat.EMBEDDINGS_PER_CLIP * feat.extract_features(audio).shape[0]
+    sound = "<so_start>" + ("<so_embedding>" * n_embed) + "<so_end>"
+    text = (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{sound}\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<think></think>"
+    )
+    ids = mx.array(model.tokenizer.encode(text, add_special_tokens=False), dtype=mx.int32)
+    embeds = model.lm.embed(ids[None])[0]            # [L, 2048]
+    audio_emb = encode_audio(model, audio).astype(embeds.dtype)
+
+    mask = ids == model.sound_token_id
+    n_slots = int(mask.sum().item())
+    if n_slots != audio_emb.shape[0]:
+        raise ValueError(f"<so_embedding> slots ({n_slots}) != audio tokens ({audio_emb.shape[0]})")
+    # scatter audio embeddings into the placeholder rows (order preserved)
+    pos = mx.array(np.where(np.array(mask))[0])
+    embeds[pos] = audio_emb
+    return embeds[None]                              # [1, L, 2048]
+
+
+def _decode_from_embeds(model: AudexModel, inputs_embeds, max_new_tokens,
+                        temperature, top_k, top_p, stop_ids):
+    lm = model.lm
+    cache = lm.make_cache()
+    logits = lm(inputs_embeds=inputs_embeds, cache=cache)[:, -1, :]
+    out, stop_set = [], set(stop_ids)
+    for _ in range(max_new_tokens):
+        tok = _sample(logits[0], temperature, top_k, top_p)
+        if tok in stop_set:
+            break
+        out.append(tok)
+        logits = lm(mx.array([[tok]], dtype=mx.int32), cache=cache)[:, -1, :]
+    return out
+
+
+def audio_generate(model: AudexModel, audio, instruction: str = "", *,
+                   max_new_tokens: int = 512, temperature: float = 0.0,
+                   top_k: int = 0, top_p: float = 1.0, seed: int | None = None) -> str:
+    """Speech (+ optional text instruction) -> text response/transcription."""
+    if seed is not None:
+        mx.random.seed(seed)
+    if isinstance(audio, str):
+        audio = feat.load_audio(audio)
+    embeds = _understanding_embeds(model, audio, instruction)
+    gen = _decode_from_embeds(model, embeds, max_new_tokens, temperature, top_k, top_p, model.eos_ids)
+    text = model.tokenizer.decode(gen, skip_special_tokens=False)
+    return text.split("</think>")[-1].strip() if "</think>" in text else text.strip()
+
+
+ASR_PROMPT = "Transcribe the input speech."
+# Conversational persona for the reply turn (from NVIDIA's cascaded_s2s reference).
+S2S_TEXT_PROMPT = (
+    "You are Audex, a helpful voice assistant. Respond to the user's message "
+    "conversationally. Write in plain, unformatted prose — no markdown, bullet "
+    "points, lists, or headers — suitable for reading aloud."
+)
+
+
+def _clean_transcription(text: str) -> str:
+    """Model returns e.g. ...is 'the actual words'. -> extract the quoted span."""
+    a, b = text.find("'"), text.rfind("'")
+    return text[a + 1:b].strip() if a != -1 and b > a else text.strip()
+
+
+def transcribe(model: AudexModel, audio, *, max_new_tokens: int = 256) -> str:
+    """Speech -> text (ASR)."""
+    raw = audio_generate(model, audio, ASR_PROMPT, max_new_tokens=max_new_tokens, temperature=0.0)
+    return _clean_transcription(raw)
+
+
+def s2s_generate(model: AudexModel, audio, instruction: str = "", *,
+                 max_new_tokens: int = 512, tts_cfg_scale: float = 1.0,
+                 seed: int | None = 0, return_transcript: bool = False):
+    """Full speech-to-speech (cascaded, same model throughout):
+
+        speech --ASR--> transcript --text chat--> reply --TTS--> speech
+
+    Returns (reply_text, waveform@16kHz), or (transcript, reply_text, waveform)
+    if return_transcript=True. `instruction` prepends extra guidance to the text
+    turn (leave empty to just answer the spoken query).
+    """
+    transcript = transcribe(model, audio)
+    persona = f"{S2S_TEXT_PROMPT}\n\n{instruction}".strip() if instruction else S2S_TEXT_PROMPT
+    user_turn = f"{persona}\n\n{transcript}"
+    reply = text_generate(model, user_turn, max_new_tokens=max_new_tokens, temperature=0.7, seed=seed)
+    wav = tts_generate(model, reply, cfg_scale=tts_cfg_scale, seed=seed)
+    return (transcript, reply, wav) if return_transcript else (reply, wav)
