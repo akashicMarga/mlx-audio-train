@@ -47,7 +47,26 @@ class AudexModel:
     sound_token_id: int = None  # <so_embedding>
 
 
-def load_model(model_dir: str) -> AudexModel:
+def _quantize(module, bits: int, group_size: int):
+    """Quantize a module's Linear/Embedding layers whose in-dim divides group_size."""
+    import mlx.nn as nn
+
+    def predicate(path, m):
+        return (isinstance(m, (nn.Linear, nn.Embedding))
+                and m.weight.shape[-1] % group_size == 0)
+
+    nn.quantize(module, group_size=group_size, bits=bits, class_predicate=predicate)
+
+
+def load_model(model_dir: str, *, quantize: int = None, q_group_size: int = 64,
+               quantize_audio: bool = False, quantize_decoder: bool = False) -> AudexModel:
+    """Load the MLX Audex checkpoint.
+
+    quantize: bits (4 or 8) to quantize the LM, or None for bf16. The LM
+    dominates memory and decode time, so it is the default target. The speech
+    decoder and audio encoder stay bf16 unless quantize_decoder/quantize_audio
+    are set (they are small and quality-sensitive).
+    """
     from transformers import AutoTokenizer, logging as hf_logging
 
     model_dir = Path(model_dir)
@@ -56,10 +75,14 @@ def load_model(model_dir: str) -> AudexModel:
 
     lm = NemotronDenseForCausalLM(lm_cfg)
     lm.load_weights(str(model_dir / "lm.safetensors"))
+    if quantize:
+        _quantize(lm, quantize, q_group_size)
     lm.eval()
 
     decoder = AudexSpeechDecoder(dec_cfg)
     decoder.load_weights(str(model_dir / "speech_decoder.safetensors"))
+    if quantize and quantize_decoder:
+        _quantize(decoder, quantize, q_group_size)
     decoder.eval()
 
     to_eval = [lm.parameters(), decoder.parameters()]
@@ -71,6 +94,8 @@ def load_model(model_dir: str) -> AudexModel:
         aud_cfg = AudioEncoderConfig(**json.loads(audio_cfg_path.read_text()))
         audio_tower = AudioTower(aud_cfg)
         audio_tower.load_weights(str(audio_path))
+        if quantize and quantize_audio:
+            _quantize(audio_tower, quantize, q_group_size)
         audio_tower.eval()
         to_eval.append(audio_tower.parameters())
 
@@ -82,7 +107,10 @@ def load_model(model_dir: str) -> AudexModel:
     speech_codec, markers = _build_codec_maps(tokenizer)
     eos_ids = _resolve_eos(tokenizer)
     sound_token_id = tokenizer.convert_tokens_to_ids("<so_embedding>")
-    print(f"[audex] Ready. {len(speech_codec)} speechcodec tokens, "
+    qdesc = f"{quantize}-bit LM" if quantize else "bf16"
+    if quantize and (quantize_audio or quantize_decoder):
+        qdesc += f" (+{'audio' if quantize_audio else ''}{'/decoder' if quantize_decoder else ''})"
+    print(f"[audex] Ready [{qdesc}]. {len(speech_codec)} speechcodec tokens, "
           f"audio_understanding={'on' if audio_tower else 'off'}, eos={eos_ids}")
     return AudexModel(lm, decoder, tokenizer, speech_codec, markers, eos_ids,
                       audio_tower=audio_tower, sound_token_id=sound_token_id)

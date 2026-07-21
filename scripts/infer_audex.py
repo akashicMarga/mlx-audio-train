@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--cfg-scale", type=float, default=1.0, help="TTS classifier-free guidance (1.0=off)")
     ap.add_argument("--reasoning", action="store_true", help="text: enable <think> reasoning")
+    ap.add_argument("--quantize", type=int, default=None, choices=[4, 8], help="quantize the LM to 4 or 8 bits")
+    ap.add_argument("--q-group-size", type=int, default=64)
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -42,7 +44,7 @@ def main():
 
     from models.audex import load_model, text_generate, tts_generate
 
-    model = load_model(args.model)
+    model = load_model(args.model, quantize=args.quantize, q_group_size=args.q_group_size)
 
     if args.text:
         kw = dict(reasoning=args.reasoning)
