@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--understand-only", action="store_true", help="just print the speech->text result")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--tts-cfg-scale", type=float, default=1.0)
+    ap.add_argument("--quantize", type=int, default=None, choices=[4, 8], help="quantize the LM to 4 or 8 bits")
+    ap.add_argument("--q-group-size", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -55,7 +57,7 @@ def main():
 
     from models.audex import load_model, audio_generate, s2s_generate
 
-    model = load_model(args.model)
+    model = load_model(args.model, quantize=args.quantize, q_group_size=args.q_group_size)
     if model.audio_tower is None:
         sys.exit("This checkpoint has no audio encoder. Run: "
                  "python -m models.audex.convert --out <dir> --only-audio")
