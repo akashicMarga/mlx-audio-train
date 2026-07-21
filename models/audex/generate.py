@@ -48,10 +48,16 @@ class AudexModel:
 
 
 def _quantize(module, bits: int, group_size: int):
-    """Quantize a module's Linear/Embedding layers whose in-dim divides group_size."""
+    """Quantize a module's Linear/Embedding layers whose in-dim divides group_size.
+
+    embed_positions is excluded: it is read as a dense `.weight` in the encoder
+    forward, so a QuantizedEmbedding (packed weight) would break it.
+    """
     import mlx.nn as nn
 
     def predicate(path, m):
+        if "embed_positions" in path:
+            return False
         return (isinstance(m, (nn.Linear, nn.Embedding))
                 and m.weight.shape[-1] % group_size == 0)
 
@@ -62,10 +68,14 @@ def load_model(model_dir: str, *, quantize: int = None, q_group_size: int = 64,
                quantize_audio: bool = False, quantize_decoder: bool = False) -> AudexModel:
     """Load the MLX Audex checkpoint.
 
-    quantize: bits (4 or 8) to quantize the LM, or None for bf16. The LM
-    dominates memory and decode time, so it is the default target. The speech
-    decoder and audio encoder stay bf16 unless quantize_decoder/quantize_audio
-    are set (they are small and quality-sensitive).
+    quantize: bits (4 or 8) to quantize the LM on a bf16 checkpoint, or None.
+    The LM dominates memory and decode time so it is the default target; the
+    speech decoder and audio encoder stay bf16 unless quantize_decoder/
+    quantize_audio are set.
+
+    If the checkpoint dir contains quant.json (a pre-quantized checkpoint, e.g.
+    from scripts/quantize_audex.py), the stored quantization is applied to the
+    listed targets and the `quantize` argument is ignored.
     """
     from transformers import AutoTokenizer, logging as hf_logging
 
@@ -73,17 +83,28 @@ def load_model(model_dir: str, *, quantize: int = None, q_group_size: int = 64,
     lm_cfg = LMConfig(**json.loads((model_dir / "lm_config.json").read_text()))
     dec_cfg = SpeechDecoderConfig(**json.loads((model_dir / "speech_decoder_config.json").read_text()))
 
+    # Pre-quantized checkpoint? Apply structure before loading weights.
+    quant = None
+    qpath = model_dir / "quant.json"
+    if qpath.exists():
+        quant = json.loads(qpath.read_text())
+
+    def _load(module, path, name, runtime_q):
+        pre = quant and name in quant.get("targets", [])
+        if pre:
+            _quantize(module, quant["bits"], quant["group_size"])
+            module.load_weights(str(path))
+        else:
+            module.load_weights(str(path))
+            if not quant and runtime_q:
+                _quantize(module, quantize, q_group_size)
+        module.eval()
+
     lm = NemotronDenseForCausalLM(lm_cfg)
-    lm.load_weights(str(model_dir / "lm.safetensors"))
-    if quantize:
-        _quantize(lm, quantize, q_group_size)
-    lm.eval()
+    _load(lm, model_dir / "lm.safetensors", "lm", quantize)
 
     decoder = AudexSpeechDecoder(dec_cfg)
-    decoder.load_weights(str(model_dir / "speech_decoder.safetensors"))
-    if quantize and quantize_decoder:
-        _quantize(decoder, quantize, q_group_size)
-    decoder.eval()
+    _load(decoder, model_dir / "speech_decoder.safetensors", "decoder", quantize and quantize_decoder)
 
     to_eval = [lm.parameters(), decoder.parameters()]
 
@@ -93,10 +114,7 @@ def load_model(model_dir: str, *, quantize: int = None, q_group_size: int = 64,
     if audio_path.exists() and audio_cfg_path.exists():
         aud_cfg = AudioEncoderConfig(**json.loads(audio_cfg_path.read_text()))
         audio_tower = AudioTower(aud_cfg)
-        audio_tower.load_weights(str(audio_path))
-        if quantize and quantize_audio:
-            _quantize(audio_tower, quantize, q_group_size)
-        audio_tower.eval()
+        _load(audio_tower, audio_path, "audio", quantize and quantize_audio)
         to_eval.append(audio_tower.parameters())
 
     mx.eval(*to_eval)
@@ -107,9 +125,14 @@ def load_model(model_dir: str, *, quantize: int = None, q_group_size: int = 64,
     speech_codec, markers = _build_codec_maps(tokenizer)
     eos_ids = _resolve_eos(tokenizer)
     sound_token_id = tokenizer.convert_tokens_to_ids("<so_embedding>")
-    qdesc = f"{quantize}-bit LM" if quantize else "bf16"
-    if quantize and (quantize_audio or quantize_decoder):
-        qdesc += f" (+{'audio' if quantize_audio else ''}{'/decoder' if quantize_decoder else ''})"
+    if quant:
+        qdesc = f"{quant['bits']}-bit ({'+'.join(quant['targets'])})"
+    elif quantize:
+        qdesc = f"{quantize}-bit LM"
+        if quantize_audio or quantize_decoder:
+            qdesc += f" (+{'audio' if quantize_audio else ''}{'/decoder' if quantize_decoder else ''})"
+    else:
+        qdesc = "bf16"
     print(f"[audex] Ready [{qdesc}]. {len(speech_codec)} speechcodec tokens, "
           f"audio_understanding={'on' if audio_tower else 'off'}, eos={eos_ids}")
     return AudexModel(lm, decoder, tokenizer, speech_codec, markers, eos_ids,
