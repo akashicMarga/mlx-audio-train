@@ -1,0 +1,42 @@
+# Baseline rows for Part 4 on M5 Pro — stock mlx-audio generate(), no levers.
+# Run:  python scripts/bench_sweep.py bench/sweeps/m5pro_baseline.yaml
+#
+# Before a real run:
+#   - point `prompts` at the held-out Hindi set (the GRPO sweep's 100 sentences);
+#     hi_smoke.txt is 5 sentences for checking the pipeline only.
+#   - set BENCH_LEDGER (or `ledger:` below) to the blog's _data/qwen3tts_mlx_ledger.csv.
+
+defaults:
+  config: configs/qwen3_tts_hindi_grpo.yaml
+  prompts: bench/prompts/hi_smoke.txt
+  num_prompts: 0
+  seeds: "0,1,2"
+  min_audio_s: 10
+
+runs:
+  # Stock base has no Hindi: with Hindi prompts this row is a speed reference only;
+  # its CER is not meaningful. Swap in an English prompt set + lang_code for quality.
+  - config_id: stock-q8-base
+    variant: stock
+    lever: baseline
+    change: stock mlx-audio generate(), no adapter
+
+  - config_id: sft-q8-base
+    variant: hindi-sft
+    adapter: ~/.cache/huggingface/hub/models--akashicmarga--qwen3-tts-hindi-lora/snapshots/a8718cac15b5a40bd4926b47d0854162ff32010a/adapters.safetensors
+    lever: baseline
+    change: stock generate(), Hindi SFT LoRA unmerged
+
+  - config_id: grpo-q8-base
+    variant: hindi-grpo
+    adapter: ~/grpo_ablation/gs4/L-interleaved__pg-token__sft-0/checkpoint-final/adapters.safetensors
+    lever: baseline
+    change: stock generate(), Hindi GRPO LoRA unmerged
+
+  # Precision reference points (config-only, no lever code needed)
+  - config_id: stock-bf16
+    parent: stock-q8-base
+    variant: stock
+    model_id: mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16
+    lever: quant
+    change: q8 -> bf16 base (reference)

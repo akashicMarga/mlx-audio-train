@@ -1,0 +1,42 @@
+# Part 4 follow-up levers (after m5pro_part4.yaml): ideas from ML Drift, the MLX
+# decode-optimisation proposals and FluidInference's PocketTTS CoreML port.
+# Every run is one change on top of grpo-m8-cpc (merged q8 + compiled code predictor),
+# the best accepted configuration of the main sweep.
+#   python scripts/bench_sweep.py bench/sweeps/m5pro_part4_extra.yaml --keep-going
+
+defaults:
+  config: configs/qwen3_tts_hindi_grpo.yaml
+  prompts: bench/prompts/hi_indictts_100.jsonl
+  num_prompts: 100
+  seeds: "0,1,2"
+  speed_repeats: 1
+  ttfp_prompts: 5
+  instrument_prompts: 3
+  ledger: ~/Documents/akashicMarga.github.io/_data/qwen3tts_mlx_ledger.csv
+  variant: hindi-grpo
+  adapter: ~/grpo_ablation/gs4/L-interleaved__pg-token__sft-0/checkpoint-final/adapters.safetensors
+  parent: grpo-m8-cpc
+
+runs:
+  # A — ML Drift-style layout fusion: 7 → 4 matmul launches per layer
+  - config_id: grpo-m8-cpc-fuse
+    levers: lora-merge-q8,fuse-proj,compile-code-pred
+    lever: fuse-proj
+    change: fused QKV and gate/up projections
+
+  # B — MLX decode proposals: cheaper sampling inside the compiled frame
+  - config_id: grpo-m8-cpc-fastsamp
+    levers: lora-merge-q8,compile-code-pred,fast-cp-sampler
+    lever: fast-cp-sampler
+    change: code-predictor top-p over the top-k survivors only
+
+  # C′ — FluidInference PocketTTS / ML Drift 8/4/4: selective 4-bit, MLP body only
+  - config_id: grpo-m8-cpc-cpmlpq4
+    levers: lora-merge-q8,cp-mlp-q4,compile-code-pred
+    lever: quant
+    change: code predictor MLP 4-bit; attention and heads q8
+
+  - config_id: grpo-m8-cpc-talkermlpq4
+    levers: lora-merge-q8,talker-mlp-q4,compile-code-pred
+    lever: quant
+    change: Talker MLP 4-bit; attention and codec head q8

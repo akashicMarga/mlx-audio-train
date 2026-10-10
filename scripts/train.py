@@ -706,6 +706,7 @@ def run_grpo(model, cfg: dict, args):
         skip_zero_variance = g.get("skip_zero_variance", True),
         eval_prompts   = eval_prompts,
         eval_group_size = g.get("eval", {}).get("group_size", 2),
+        fast_code_pred = g.get("fast_code_pred", False),
     )
 
 

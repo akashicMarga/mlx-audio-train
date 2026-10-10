@@ -68,3 +68,9 @@ train_log.jsonl
 trainer_config.json
 
 evals/
+
+# Benchmark evidence (per-run summaries; ledger rows go to BENCH_LEDGER)
+bench_runs/
+# Held-out prompts derived from SPRINGLab/IndicTTS-Hindi: regenerate with
+# scripts/make_prompt_set.py --n 100 --seed 0 (dataset text not redistributed here)
+bench/prompts/hi_indictts_*.jsonl

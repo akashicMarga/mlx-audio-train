@@ -1,0 +1,129 @@
+# Part 4 ladder on M5 Pro — the post's ledger rows.
+# Held-out set: 100 IndicTTS-Hindi sentences (bench/prompts/hi_indictts_100.jsonl,
+# built by scripts/make_prompt_set.py --n 100 --seed 0), unseen by the adapters
+# (trained on IndicVoices-R). 3 seeds → 300 clips per configuration.
+#
+# Each run is one change on top of its parent; rows already in the ledger are skipped,
+# so an interrupted sweep resumes.  Run:
+#   python scripts/bench_sweep.py bench/sweeps/m5pro_part4.yaml --keep-going
+
+defaults:
+  config: configs/qwen3_tts_hindi_grpo.yaml
+  prompts: bench/prompts/hi_indictts_100.jsonl
+  num_prompts: 100
+  seeds: "0,1,2"
+  speed_repeats: 1          # 300 clips ≈ 50 min of audio per run: long enough to average noise
+  ttfp_prompts: 5
+  instrument_prompts: 3
+  ledger: ~/Documents/akashicMarga.github.io/_data/qwen3tts_mlx_ledger.csv
+
+runs:
+  # ── Baselines: stock mlx-audio generate() ──────────────────────────────────
+  - config_id: stock-q8-base
+    variant: stock
+    lever: baseline
+    change: stock generate(), no adapter (speed reference; base model has no Hindi)
+
+  - config_id: sft-q8-base
+    variant: hindi-sft
+    adapter: ~/.cache/huggingface/hub/models--akashicmarga--qwen3-tts-hindi-lora/snapshots/a8718cac15b5a40bd4926b47d0854162ff32010a/adapters.safetensors
+    lever: baseline
+    change: stock generate(), Hindi SFT LoRA unmerged
+
+  - config_id: grpo-q8-base
+    variant: hindi-grpo
+    adapter: &grpo ~/grpo_ablation/gs4/L-interleaved__pg-token__sft-0/checkpoint-final/adapters.safetensors
+    lever: baseline
+    change: stock generate(), Hindi GRPO LoRA unmerged
+
+  # ── Loop levers (§5.1–5.2) ─────────────────────────────────────────────────
+  - config_id: grpo-loop-copy
+    parent: grpo-q8-base
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: loop-copy
+    lever: loop-copy
+    change: stock decode loop copied, no switches (control)
+
+  - config_id: grpo-devpen
+    parent: grpo-loop-copy
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: loop-copy,device-rep-penalty
+    lever: device-rep-penalty
+    change: repetition penalty from a device-side mask
+
+  - config_id: grpo-async
+    parent: grpo-devpen
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: loop-copy,device-rep-penalty,async-eval
+    lever: async-eval
+    change: mx.async_eval, EOS checked one frame late
+
+  # ── LoRA merge (§5.9) ──────────────────────────────────────────────────────
+  - config_id: grpo-merge-bf16
+    parent: grpo-q8-base
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-bf16
+    lever: lora-merge
+    change: LoRA merged into base, bf16
+
+  - config_id: grpo-merge-q8
+    parent: grpo-q8-base
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8
+    lever: lora-merge
+    change: LoRA merged into base, requantized q8
+
+  # ── Compilation (§5.2–5.3), on the merged-q8 model ────────────────────────
+  - config_id: grpo-m8-cpc
+    parent: grpo-merge-q8
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,compile-code-pred
+    lever: compile-code-pred
+    change: 15-pass code-predictor frame compiled
+
+  - config_id: grpo-m8-cpc-devpen
+    parent: grpo-m8-cpc
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,compile-code-pred,device-rep-penalty
+    lever: device-rep-penalty
+    change: device-side repetition penalty (prerequisite for compile-talker)
+
+  - config_id: grpo-m8-cpc-talker
+    parent: grpo-m8-cpc-devpen
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,compile-code-pred,device-rep-penalty,compile-talker
+    lever: compile-talker
+    change: Talker decode step compiled on fixed KV slots
+
+  - config_id: grpo-m8-cpc-dec
+    parent: grpo-m8-cpc
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,compile-code-pred,decoder-compile
+    lever: decoder-compile
+    change: codec decoder compiled per 16-frame bucket
+
+  # ── Mixed precision (§5.8) ─────────────────────────────────────────────────
+  - config_id: grpo-m8-cpc-cpq4
+    parent: grpo-m8-cpc
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,cp-q4,compile-code-pred
+    lever: quant
+    change: code predictor q4 g64, Talker q8
+
+  - config_id: grpo-m8-cpc-cpq4g32
+    parent: grpo-m8-cpc
+    variant: hindi-grpo
+    adapter: *grpo
+    levers: lora-merge-q8,cp-q4-g32,compile-code-pred
+    lever: quant
+    change: code predictor q4 g32, Talker q8

@@ -67,8 +67,10 @@ class GRPORolloutLoader:
         skip_zero_variance: bool = True,
         zero_var_eps: float = 1e-6,
         seed: int = 0,
+        fast_code_pred: bool = False,
     ):
         self.model = model
+        self.fast_code_pred = fast_code_pred
         self.prompts = prompts
         self.ref_params = ref_params
         self.reward_cfg = reward_cfg
@@ -145,6 +147,7 @@ class GRPORolloutLoader:
                 top_p=self.top_p, top_k=self.top_k,
                 ref_audio=prompt.get("ref_audio_wav"),   # waveform for speaker extraction
                 compute_ref=True, ref_params=self.ref_params,
+                fast_code_pred=self.fast_code_pred,
             )
             spk_batched = None
             text_ids = None
@@ -251,6 +254,7 @@ class GRPOTrainer(Trainer):
         eval_prompts: Optional[List[Dict]] = None,
         eval_group_size: int = 2,
         seed: int = 0,
+        fast_code_pred: bool = False,
     ):
         # Freeze the reference = current (SFT) adapter, once. KL anchors to this.
         ref_params = lora_snapshot(model)
@@ -278,7 +282,11 @@ class GRPOTrainer(Trainer):
             temperature=temperature, top_p=top_p, top_k=top_k, lang_code=lang_code,
             layout=layout, sample_rate=sample_rate, sft_lambda=sft_lambda,
             sft_loader=sft_loader, skip_zero_variance=skip_zero_variance, seed=seed,
+            fast_code_pred=fast_code_pred,
         )
+        if fast_code_pred:
+            print("[grpo] fast_code_pred: compiled code-predictor frame in rollouts "
+                  "(bit-identical to the uncompiled sampler)")
 
         loss_fn: Callable = partial(
             qwen3_tts_grpo_loss,

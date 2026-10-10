@@ -37,6 +37,8 @@ grpo:
   temperature:     0.9
   top_p:           0.95
   top_k:           50
+  fast_code_pred:  false      # compile each frame's 15 code-predictor passes in rollouts
+                              # (bit-identical to the uncompiled sampler, ~1.24× Phase A at G=4)
 
   # Loss terms (see train/losses/grpo_loss.py)
   kl_beta:        0.05        # KL(π_θ ‖ π_ref_SFT) weight (k3 estimator)
