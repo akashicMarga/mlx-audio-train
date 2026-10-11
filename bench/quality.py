@@ -40,27 +40,57 @@ def score_items(model, items: List[dict], reward_cfg, sample_rate: int,
             it["spk_sim"] = float(score("speaker_similarity", ctx, reward_cfg)["reward"][0])
 
 
+def sentence_means(items: List[dict], field: str) -> Dict[int, float]:
+    """Per-sentence mean over seeds. Sentences, not clips, are the independent unit:
+    300 clips from 100 sentences × 3 seeds are not 300 independent observations, and
+    once outputs diverge, seed-matched clips are not true pairs either."""
+    acc: Dict[int, list] = {}
+    for r in items:
+        if r.get(field) is not None:
+            acc.setdefault(r["prompt_idx"], []).append(float(r[field]))
+    return {k: float(np.mean(v)) for k, v in acc.items()}
+
+
 def paired(cur: List[dict], parent: List[dict], field: str):
-    """Aligned (cur, parent) arrays over items present in both runs."""
-    p = {item_key(r["seed"], r["prompt_idx"]): r for r in parent}
-    a, b = [], []
-    for r in cur:
-        q = p.get(item_key(r["seed"], r["prompt_idx"]))
-        if q is not None and r.get(field) is not None and q.get(field) is not None:
-            a.append(r[field])
-            b.append(q[field])
-    return np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    """Aligned (cur, parent) per-sentence means over sentences present in both runs."""
+    a, b = sentence_means(cur, field), sentence_means(parent, field)
+    keys = sorted(set(a) & set(b))
+    return (np.asarray([a[k] for k in keys], dtype=float),
+            np.asarray([b[k] for k in keys], dtype=float))
 
 
 def wilcoxon_p(cur: List[dict], parent: List[dict], field: str = "cer_capped") -> Optional[float]:
+    """Paired signed-rank test on per-sentence means (two-sided)."""
     a, b = paired(cur, parent, field)
-    if a.size < 6:          # too few pairs for a meaningful signed-rank test
+    if a.size < 6:          # too few sentences for a meaningful signed-rank test
         return None
     d = a - b
     if np.allclose(d, 0):
         return 1.0
     from scipy.stats import wilcoxon
     return float(wilcoxon(a, b, zero_method="wilcox").pvalue)
+
+
+def clustered_ci(cur: List[dict], parent: List[dict], field: str, level: float = 0.95,
+                 n_boot: int = 10000, seed: int = 0):
+    """Mean per-sentence difference (cur − parent) with a bootstrap CI over sentences.
+    Returns (mean, lo, hi, n_sentences) or None if fewer than 6 sentences overlap."""
+    a, b = paired(cur, parent, field)
+    if a.size < 6:
+        return None
+    d = a - b
+    rng = np.random.default_rng(seed)
+    boots = d[rng.integers(0, d.size, (n_boot, d.size))].mean(axis=1)
+    lo, hi = np.percentile(boots, [100 * (1 - level) / 2, 100 * (1 + level) / 2])
+    return float(d.mean()), float(lo), float(hi), int(d.size)
+
+
+def _wall_speedup(cur: List[dict], parent: List[dict]) -> Optional[float]:
+    """Parent ÷ current total wall time over the sentences both runs generated."""
+    a, b = paired(cur, parent, "wall_s")
+    if a.size == 0 or a.sum() <= 0:
+        return None
+    return float(b.sum() / a.sum())
 
 
 def bit_exact(cur: List[dict], parent: List[dict]) -> Optional[bool]:
@@ -75,8 +105,10 @@ def bit_exact(cur: List[dict], parent: List[dict]) -> Optional[bool]:
 class GateConfig:
     alpha: float = 0.05
     min_speedup: float = 1.03          # below this the change is "no-benefit"
-    max_dnsmos_drop: Optional[float] = None
-    max_spk_drop: Optional[float] = None
+    max_dnsmos_drop: Optional[float] = None   # non-inferiority margin for DNSMOS OVRL (e.g. 0.05)
+    max_spk_drop: Optional[float] = None      # non-inferiority margin for speaker similarity
+    cer_margin: float = 0.02           # non-inferiority margin for capped CER (absolute)
+    len_margin: float = 0.03           # equivalence margin for per-sentence audio length (relative)
 
 
 def propose(cur_summary: Dict, parent_summary: Optional[Dict], cur_items, parent_items,
@@ -87,40 +119,60 @@ def propose(cur_summary: Dict, parent_summary: Optional[Dict], cur_items, parent
 
     speedup = (parent_summary["rtf"] / cur_summary["rtf"]
                if cur_summary.get("rtf") and parent_summary.get("rtf") else None)
+    # RTF is per second of *output*: a lever that makes the model say the same text in
+    # more audio looks faster without being faster. Judge speed on wall-clock time per
+    # sentence too, and take the smaller of the two.
+    wall_speedup = _wall_speedup(cur_items, parent_items)
+    if speedup is not None and wall_speedup is not None:
+        speedup = min(speedup, wall_speedup)
     exact = bit_exact(cur_items, parent_items)
 
     quality_ok, why = True, []
     if exact:
         why.append("bit-identical to parent")
     else:
-        a, b = paired(cur_items, parent_items, "cer_capped")
-        if a.size == 0:
+        # Outputs differ: judge quality per sentence (seeds averaged), and require
+        # non-inferiority — the CI's worst case must sit inside the margin — rather than
+        # merely "not significantly worse", which a small sample passes by default.
+        ci = clustered_ci(cur_items, parent_items, "cer_capped")
+        if ci is None:
             return "", "output differs from parent and quality was not measured — no decision"
+        m, lo, hi, n = ci
         p = wilcoxon_p(cur_items, parent_items)
-        if a.size and p is not None and a.mean() > b.mean() and p < gate.alpha:
+        desc = f"ΔCER {m:+.4f} [95% CI {lo:+.4f}, {hi:+.4f}], {n} sentences, Wilcoxon p={p:.2g}"
+        significant = lo > 0 and p is not None and p < gate.alpha
+        if hi > gate.cer_margin:
             quality_ok = False
-            why.append(f"CER worse ({b.mean():.4f}→{a.mean():.4f}, Wilcoxon p={p:.2g})")
+            why.append(f"CER worse: {desc}" if significant else
+                       f"CER non-inferiority not established (upper bound > +{gate.cer_margin}): {desc}")
         else:
-            why.append(f"CER not significantly worse (p={p})")
-        # Outputs differ, so seed-matched items are not true pairs: compare the two
-        # distributions (Mann-Whitney). A drop counts only if it exceeds the threshold
-        # AND is significant — with ~15 clips, seed-to-seed swings in mean DNSMOS
-        # (~0.1) exceed a 0.05 threshold on their own.
-        for field, limit in (("dnsmos_ovrl", gate.max_dnsmos_drop), ("spk_sim", gate.max_spk_drop)):
-            if limit is None:
-                continue
-            x = np.asarray([r[field] for r in cur_items if r.get(field) is not None], dtype=float)
-            y = np.asarray([r[field] for r in parent_items if r.get(field) is not None], dtype=float)
-            if not (x.size and y.size):
-                continue
-            drop = y.mean() - x.mean()
-            from scipy.stats import mannwhitneyu
-            p_mw = float(mannwhitneyu(x, y, alternative="less").pvalue)
-            if drop > limit and p_mw < gate.alpha:
+            why.append(f"CER non-inferior within +{gate.cer_margin}"
+                       + (" (small but significant increase)" if significant else "") + f": {desc}")
+        ci_len = clustered_ci(cur_items, parent_items, "audio_s")
+        if ci_len is not None:
+            ml, ll, hl, nl = ci_len
+            base_len = float(np.mean(list(sentence_means(parent_items, "audio_s").values())))
+            rel = (ml / base_len, ll / base_len, hl / base_len)
+            dl = (f"audio length {100 * rel[0]:+.1f}% [95% CI {100 * rel[1]:+.1f}%, {100 * rel[2]:+.1f}%] "
+                  f"per sentence")
+            if max(abs(rel[1]), abs(rel[2])) > gate.len_margin:
                 quality_ok = False
-                why.append(f"{field} dropped {drop:.3f} > {limit} (Mann-Whitney p={p_mw:.2g}, n={x.size}/{y.size})")
-            elif drop > limit:
-                why.append(f"{field} dropped {drop:.3f} > {limit} but not significant (p={p_mw:.2g}, n={x.size}/{y.size})")
+                why.append(f"{dl} — length equivalence not established (±{100 * gate.len_margin:.0f}%)")
+            else:
+                why.append(dl)
+        for field, margin in (("dnsmos_ovrl", gate.max_dnsmos_drop), ("spk_sim", gate.max_spk_drop)):
+            if margin is None:
+                continue
+            ci_f = clustered_ci(cur_items, parent_items, field)
+            if ci_f is None:
+                continue
+            m2, lo2, hi2, n2 = ci_f
+            d2 = f"Δ{field} {m2:+.3f} [95% CI {lo2:+.3f}, {hi2:+.3f}], {n2} sentences"
+            if lo2 < -margin:
+                quality_ok = False
+                why.append(f"{field} non-inferiority not established (lower bound < −{margin}): {d2}")
+            else:
+                why.append(f"{field} non-inferior within −{margin}: {d2}")
 
     if not quality_ok:
         return "rejected", "; ".join(why)
