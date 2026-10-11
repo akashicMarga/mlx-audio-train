@@ -271,10 +271,16 @@ def sample_rollouts_interleaved(
     ref_audio=None,                                      # Pipeline 2 voice cloning
     compute_ref:     bool = True,
     ref_params:      Optional[Dict[str, mx.array]] = None,
+    fast_code_pred:  bool = False,
 ) -> Dict[str, mx.array]:
     """Sample `group_size` rollouts for ONE prompt using the REAL generate()
     interleaved layout, recording the exact input-embedding sequence for a
     consistent Phase-B forward.
+
+    fast_code_pred: run each frame's 15 code-predictor passes (+ sampling and the
+    codec-embedding sum) as one mx.compile'd function (bench/fast_generate.py).
+    The weights and random state are compile inputs, so LoRA updates and dropout
+    behave as in the uncompiled loop. Off by default.
 
     Returns dict:
         codec_ids       [G, T]            sampled cb0 (pad after EOS)
@@ -327,28 +333,42 @@ def sample_rollouts_interleaved(
         )
         cb0 = mx.where(finished[:, None], eos_fill, cb0)
         newly = cb0[:, 0] == eos_id
+        if fast_code_pred:
+            # one host read of the EOS flags instead of 2·G bool() syncs mid-graph
+            newly_l, finished_l = newly.tolist(), finished.tolist()
+        else:
+            newly_l = finished_l = None
         for b in range(G):
-            if bool(newly[b]) and not bool(finished[b]):
+            n_b = newly_l[b] if newly_l is not None else bool(newly[b])
+            f_b = finished_l[b] if finished_l is not None else bool(finished[b])
+            if n_b and not f_b:
                 gen_lengths[b] = step + 1
         finished = finished | newly
 
         # frozen code_predictor: cb1..15 for this frame
-        code_tokens = [cb0]
-        code_hidden = hidden[:, -1:, :]
-        for c in code_cache:
-            c.keys = None; c.values = None; c.offset = 0
-        for code_idx in range(n_groups - 1):
-            if code_idx == 0:
-                code_input = mx.concatenate(
-                    [code_hidden, talker.get_input_embeddings()(cb0)], axis=1)
-            else:
-                code_input = talker.code_predictor.codec_embedding[code_idx - 1](
-                    code_tokens[-1])
-            code_logits, code_cache, _ = talker.code_predictor(
-                code_input, cache=code_cache, generation_step=code_idx)
-            code_tokens.append(model._sample_token_batch(
-                code_logits, temperature=temperature, top_k=top_k, top_p=top_p))
-        frame = mx.concatenate(code_tokens, axis=1)           # [G, n_groups]
+        if fast_code_pred:
+            from bench.fast_generate import _code_pred_frame_fn
+            cp_frame = _code_pred_frame_fn(model, temperature, top_k, top_p, sampler="batch")
+            rest, codec_e_fast = cp_frame(hidden[:, -1:, :], cb0)
+            frame = mx.concatenate([cb0, rest], axis=1)       # [G, n_groups]
+            code_tokens = None
+        else:
+            code_tokens = [cb0]
+            code_hidden = hidden[:, -1:, :]
+            for c in code_cache:
+                c.keys = None; c.values = None; c.offset = 0
+            for code_idx in range(n_groups - 1):
+                if code_idx == 0:
+                    code_input = mx.concatenate(
+                        [code_hidden, talker.get_input_embeddings()(cb0)], axis=1)
+                else:
+                    code_input = talker.code_predictor.codec_embedding[code_idx - 1](
+                        code_tokens[-1])
+                code_logits, code_cache, _ = talker.code_predictor(
+                    code_input, cache=code_cache, generation_step=code_idx)
+                code_tokens.append(model._sample_token_batch(
+                    code_logits, temperature=temperature, top_k=top_k, top_p=top_p))
+            frame = mx.concatenate(code_tokens, axis=1)       # [G, n_groups]
 
         cb0_steps.append(cb0); frame_steps.append(frame)
 
@@ -358,9 +378,12 @@ def sample_rollouts_interleaved(
         exhausted = clamped >= max_tr - 1
         text_e  = mx.where(exhausted[:, None, None], pad_b, text_e)
         trail_idx = trail_idx + (~finished).astype(mx.int32)
-        codec_e = talker.get_input_embeddings()(cb0)
-        for j, code in enumerate(code_tokens[1:]):
-            codec_e = codec_e + talker.code_predictor.codec_embedding[j](code)
+        if fast_code_pred:
+            codec_e = codec_e_fast
+        else:
+            codec_e = talker.get_input_embeddings()(cb0)
+            for j, code in enumerate(code_tokens[1:]):
+                codec_e = codec_e + talker.code_predictor.codec_embedding[j](code)
         next_input = text_e + codec_e                          # [G, 1, D]
         rec_inputs.append(next_input)
         step_input = next_input
