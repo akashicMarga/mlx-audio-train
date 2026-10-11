@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from bench import ledger, levers  # noqa: E402
 from bench.instrument import instrument  # noqa: E402
-from bench.quality import GateConfig, audio_hash, bit_exact, propose, wilcoxon_p  # noqa: E402
+from bench.quality import GateConfig, audio_hash, bit_exact, clustered_ci, propose, wilcoxon_p  # noqa: E402
 
 BLOG_LEDGER = Path(os.path.expanduser(
     "~/Documents/akashicMarga.github.io/_data/qwen3tts_mlx_ledger.csv"))
@@ -75,7 +75,15 @@ def test_wilcoxon_pairs_by_seed_and_prompt():
     worse = _items([0.30] * 10)
     assert wilcoxon_p(worse, parent) < 0.01
     assert wilcoxon_p(parent, parent) == 1.0
-    assert wilcoxon_p(_items([0.3] * 10, seed=1), parent) is None   # no overlapping keys
+    assert wilcoxon_p(_items([0.3] * 4), _items([0.1] * 4)) is None   # too few sentences
+
+
+def test_sentences_not_clips_are_the_unit():
+    # 10 sentences x 3 seeds = 30 clips, but only 10 independent observations
+    parent = sum((_items([0.1] * 10, seed=s) for s in range(3)), [])
+    cur = sum((_items([0.1 + 0.01 * (i % 2) for i in range(10)], seed=s) for s in range(3)), [])
+    m, lo, hi, n = clustered_ci(cur, parent, "cer_capped")
+    assert n == 10 and abs(m - 0.005) < 1e-9 and lo <= m <= hi
 
 
 def test_gate_proposals():
@@ -98,19 +106,38 @@ def test_gate_proposals():
     # 20% faster but runs are 30% noisy -> no-benefit
     d, why = propose({"rtf": 0.08, "rtf_spread": 0.30}, parent, _items([0.1] * 10), parent_items, g)
     assert d == "no-benefit" and "noise" in why
-    # DNSMOS drop beyond threshold but on noisy, tiny samples -> not a rejection
+    # CER worse on average but the CI upper bound is inside the margin -> non-inferior, accepted
+    near = _items([0.1 + 0.002 * (i % 3) for i in range(10)], sha=[f"n{i}" for i in range(10)])
+    d, why = propose({"rtf": 0.08}, parent, near, parent_items, g)
+    assert d == "accepted" and "non-inferior" in why
+    # noisy CER: no significant degradation, but the CI is too wide to show non-inferiority
+    noisy = _items([0.1 + (0.2 if i % 2 else -0.05) for i in range(10)], sha=[f"q{i}" for i in range(10)])
+    d, why = propose({"rtf": 0.08}, parent, noisy, parent_items, g)
+    assert d == "rejected" and "non-inferiority not established" in why
     g2 = GateConfig(min_speedup=1.03, max_dnsmos_drop=0.05)
-    # mean drop 0.06, but from one outlier clip: not a consistent shift
+    # one outlier sentence drags the DNSMOS CI below the margin -> not established
     spread = [2.8, 3.8] * 5
     par = [dict(r, dnsmos_ovrl=v) for r, v in zip(_items([0.1] * 10), spread)]
     cur = [dict(r, dnsmos_ovrl=v - (0.6 if i == 0 else 0.0), audio_sha1=f"z{i}") for i, (r, v) in
            enumerate(zip(_items([0.1] * 10), spread))]
     d, why = propose({"rtf": 0.08}, {"rtf": 0.1}, cur, par, g2)
-    assert d == "accepted" and "not significant" in why
+    assert d == "rejected" and "dnsmos_ovrl non-inferiority not established" in why
+    # small, consistent DNSMOS change within the margin -> accepted
+    cur3 = [dict(r, dnsmos_ovrl=v - 0.01, audio_sha1=f"z{i}") for i, (r, v) in
+            enumerate(zip(_items([0.1] * 10), spread))]
+    assert propose({"rtf": 0.08}, {"rtf": 0.1}, cur3, par, g2)[0] == "accepted"
     # clear, consistent DNSMOS drop -> rejected
     cur2 = [dict(r, dnsmos_ovrl=2.5 + 0.01 * i, audio_sha1=f"w{i}") for i, r in enumerate(_items([0.1] * 10))]
     par2 = [dict(r, dnsmos_ovrl=3.3 + 0.01 * i) for i, r in enumerate(_items([0.1] * 10))]
     assert propose({"rtf": 0.08}, {"rtf": 0.1}, cur2, par2, g2)[0] == "rejected"
+    # RTF looks 25% faster, but the output is 25% longer: same wall time -> no-benefit
+    long_par = [dict(r, audio_s=8.0, wall_s=2.0) for r in _items([0.1] * 10)]
+    long_cur = [dict(r, audio_s=10.0, wall_s=2.0, audio_sha1=f"l{i}") for i, r in enumerate(_items([0.1] * 10))]
+    d, why = propose({"rtf": 0.2}, {"rtf": 0.25}, long_cur, long_par, g)
+    assert d == "rejected" and "length equivalence not established" in why
+    same_len = [dict(r, audio_s=8.0 + 0.01 * (i % 2), wall_s=1.6, audio_sha1=f"m{i}") for i, r in enumerate(_items([0.1] * 10))]
+    d, why = propose({"rtf": 0.2}, {"rtf": 0.25}, same_len, long_par, g)
+    assert d == "accepted" and "audio length" in why
     # no parent -> baseline
     assert propose({"rtf": 0.1}, None, [], [], g)[0] == "baseline"
 

@@ -229,7 +229,11 @@ def parse_args(argv=None):
     ap.add_argument("--gate-alpha", type=float, default=0.05)
     ap.add_argument("--min-speedup", type=float, default=1.03)
     ap.add_argument("--max-dnsmos-drop", type=float, default=0.05,
-                    help="reject if mean DNSMOS OVRL drops more than this vs parent (paired)")
+                    help="non-inferiority margin: reject unless the 95%% CI of the per-sentence "
+                         "DNSMOS OVRL change stays above −this")
+    ap.add_argument("--cer-margin", type=float, default=0.02,
+                    help="non-inferiority margin: reject unless the 95%% CI upper bound of the "
+                         "per-sentence capped-CER change stays below +this")
     ap.add_argument("--max-spk-drop", type=float, default=None)
     ap.add_argument("--decision", default=None, choices=sorted(ledger.DECISIONS - {""}),
                     help="override the gate's proposed decision")
@@ -362,7 +366,7 @@ def main(argv=None):
             quality["wilcoxon_p"] = wilcoxon_p(items, parent_items)
         print(f"[bench] quality: CER(capped) {quality['cer_capped']:.4f}"
               + (f", DNSMOS {quality['dnsmos_ovrl']:.3f}" if "dnsmos_ovrl" in quality else "")
-              + (f", Wilcoxon p vs parent {quality['wilcoxon_p']}" if parent_items else ""))
+              + (f", per-sentence Wilcoxon p vs parent {quality['wilcoxon_p']}" if parent_items else ""))
 
     busy_after = busy_processes()
     contention = still_busy + [b for b in busy_after if b["comm"] not in {x["comm"] for x in still_busy}]
@@ -373,7 +377,8 @@ def main(argv=None):
                "contention": contention, "telemetry": telemetry,
                "precision": precision, "gen_kwargs": gen_kwargs, "levers": [l.name for l in lever_objs],
                "n_prompts": len(prompts), "seeds": seeds, "model_eval_mode": True}
-    gate = GateConfig(args.gate_alpha, args.min_speedup, args.max_dnsmos_drop, args.max_spk_drop)
+    gate = GateConfig(args.gate_alpha, args.min_speedup, args.max_dnsmos_drop, args.max_spk_drop,
+                      args.cer_margin)
     decision, reason = propose(summary, parent_summary, items, parent_items, gate)
     if args.decision:
         reason = f"manual override ({decision} proposed: {reason})"

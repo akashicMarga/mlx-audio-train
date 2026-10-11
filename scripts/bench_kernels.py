@@ -13,6 +13,9 @@ Answers, on this machine:
                 everything that isn't a matmul (norms, RoPE, attention, sampling,
                 glue) — an upper bound on what a fused kernel could recover.
 
+  4. batch      q8 projection and attention cost vs batch size G = 1…16, to look for
+                a dispatch-path switch (matvec → matmul) in batched decode.
+
 Each section runs independently; a failure in one is reported and the rest continue.
 Writes bench_runs/kernels/report.json and prints a summary.
 
@@ -153,12 +156,57 @@ def section_frame(args):
                     "outputs live; treat non_matmul_ms as a lower bound on removable overhead"}
 
 
+# ── 4. batch: does a q8 matmul's cost jump between batch sizes? ──────────────
+def section_batch(quick):
+    """Time each Talker / code-predictor projection shape at batch G (one token per
+    row, as in batched decode). If MLX switches quantized-matmul paths (matvec →
+    matmul) at some G, the per-call time steps up there instead of growing smoothly.
+    Also times attention over a cached context of 100 and 400 keys at each G."""
+    shapes = [("q_proj", 1024, 2048), ("k/v_proj", 1024, 1024), ("o_proj", 2048, 1024),
+              ("gate/up", 1024, 3072), ("down", 3072, 1024)]
+    gs = [1, 2, 4] if quick else [1, 2, 3, 4, 5, 6, 8, 12, 16]
+    chain_len = 10 if quick else 30
+    res = {"matmul": [], "attention": []}
+    for name, in_f, out_f in shapes:
+        lin = nn.Linear(in_f, out_f, bias=False)
+        lin.weight = (mx.random.normal((out_f, in_f)) * 0.02).astype(mx.bfloat16)
+        q8 = nn.QuantizedLinear.from_linear(lin, group_size=64, bits=8)
+        mx.eval(q8.parameters())
+        for g in gs:
+            x0 = mx.random.normal((g, 1, in_f)).astype(mx.bfloat16)
+            pad = max(0, in_f - out_f)
+
+            def chain(x, layer=q8, pad=pad):
+                for _ in range(chain_len):
+                    y = layer(x)
+                    x = mx.pad(y, [(0, 0), (0, 0), (0, pad)]) if pad else y[..., :in_f]
+                return x
+            f = mx.compile(chain)
+            t = timeit(lambda: f(x0), iters=10 if quick else 20) / chain_len
+            res["matmul"].append({"proj": name, "in": in_f, "out": out_f, "G": g, "us_per_call": 1e6 * t})
+    for ctx in (100, 400):
+        for g in gs:
+            q = mx.random.normal((g, 16, 1, 128)).astype(mx.bfloat16)
+            k = mx.random.normal((g, 8, ctx, 128)).astype(mx.bfloat16)
+            v = mx.random.normal((g, 8, ctx, 128)).astype(mx.bfloat16)
+            mx.eval(q, k, v)
+
+            def attn(q):
+                for _ in range(chain_len):
+                    q = mx.fast.scaled_dot_product_attention(q, k, v, scale=128 ** -0.5)
+                return q
+            f = mx.compile(attn)
+            t = timeit(lambda: f(q), iters=10 if quick else 20) / chain_len
+            res["attention"].append({"ctx": ctx, "G": g, "us_per_call": 1e6 * t})
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/qwen3_tts_hindi_grpo.yaml")
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--quick", action="store_true", help="tiny sizes, for checking the script runs")
-    ap.add_argument("--sections", default="dispatch,qmv,frame")
+    ap.add_argument("--sections", default="dispatch,qmv,frame,batch")
     args = ap.parse_args()
 
     from bench.env import snapshot
@@ -179,13 +227,21 @@ def main():
                 r = section_frame(args)
                 print(f"  matmuls only {r['matmul_only_ms']:.2f} ms · real compiled frame {r['real_frame_ms']:.2f} ms · "
                       f"non-matmul {r['non_matmul_ms']:.2f} ms ({100 * r['non_matmul_share']:.0f}%)")
+            elif name == "batch":
+                r = section_batch(args.quick)
+                for row in r["matmul"]:
+                    print(f"  {row['proj']:9s} G={row['G']:<3d} {row['us_per_call']:7.1f} µs")
+                for row in r["attention"]:
+                    print(f"  sdpa ctx={row['ctx']:<4d} G={row['G']:<3d} {row['us_per_call']:7.1f} µs")
             report[name] = r
         except Exception as e:  # noqa: BLE001
             report[name] = {"error": repr(e), "trace": traceback.format_exc()}
             print(f"  FAILED: {e!r}")
     out = REPO_ROOT / "bench_runs" / "kernels"
     out.mkdir(parents=True, exist_ok=True)
-    (out / ("report_quick.json" if args.quick else "report.json")).write_text(json.dumps(report, indent=2))
+    # a partial run (--sections) gets its own file so it never overwrites the full report
+    stem = "report" if args.sections == ap.get_default("sections") else "report_" + args.sections.replace(",", "_")
+    (out / (stem + ("_quick" if args.quick else "") + ".json")).write_text(json.dumps(report, indent=2))
     print(f"→ {out}")
 
 
