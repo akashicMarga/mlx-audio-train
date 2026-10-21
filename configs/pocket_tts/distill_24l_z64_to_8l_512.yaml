@@ -1,0 +1,38 @@
+# EXPERIMENTAL narrow student (18m-style backbone: 8 layers, d_model 512, z_dim 64).
+# Needs a teacher with z_dim 64 first, folded from the public one:
+#
+#   python scripts/pocket_tts_fold_bottleneck.py \
+#     --config configs/pocket_tts/models/english_2026-09_24l.yaml \
+#     --weights hf://kyutai/pocket-tts/languages/english_2026-09_24l/model.safetensors@983151f13aaeab1b13c1e5e3c2c383d49a9edf3f \
+#     --data data/pocket_latents/train/manifest.jsonl --z-dim 64 --out checkpoints/pocket-teacher-24l-z64
+#
+# and only proceed if the folded teacher still sounds right / keeps its WER.
+# The sampler head stays the teacher's (dim 512, depth 6, LSD), so the full model is
+# ~37M, not 18M: Kyutai's 18m also distils the head (head_distill) and uses a smaller
+# Mimi decoder, both not ported here.
+
+teacher:
+  config: checkpoints/pocket-teacher-24l-z64/config.yaml
+  weights: checkpoints/pocket-teacher-24l-z64/model.safetensors
+  dtype: bfloat16
+
+student:
+  config: checkpoints/pocket-teacher-24l-z64/config.yaml
+  overrides:
+    flow_lm.transformer.num_layers: 8
+    flow_lm.transformer.d_model: 512
+    flow_lm.transformer.num_heads: 8      # head width 64, same as the teacher's
+    flow_lm.lookup_table.dim: 512
+
+distill:
+  cfg_coef: 2.0
+
+data:
+  train: data/pocket_latents/train/manifest.jsonl
+  valid: data/pocket_latents/valid/manifest.jsonl
+
+train:
+  batch_size: 16
+  grad_accum: 4
+  max_steps: 200000
+  run_dir: checkpoints/pocket-distill-8l-512

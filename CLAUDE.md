@@ -40,6 +40,12 @@ python scripts/watch_training.py --log checkpoints/qwen3-hindi/train_log.jsonl
 
 # Demo UI
 python scripts/demo.py --adapter checkpoints/qwen3-speaker/custom_voice_model
+
+# Pocket TTS distillation (24-layer teacher -> 6-layer student, see docs/pocket_tts_distillation.md)
+python scripts/pocket_tts_distill.py --smoke-test
+python scripts/pocket_tts_precompute_latents.py --input data/train.jsonl --out-dir data/pocket_latents/train \
+  --config configs/pocket_tts/models/english_2026-09_24l.yaml
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml
 ```
 
 ## Architecture
@@ -53,6 +59,7 @@ data/base_dataset.py      # JSONL dataset loader, TTSSample, BatchIterator
 data/audio_utils.py       # Audio I/O, resampling, loudness norm, silence trimming
 data/processors/qwen3_tts.py  # Qwen3-TTS tokenization: audio→codec_ids, text→text_ids
 data/processors/csm.py        # CSM/Sesame processor
+models/pocket_tts/            # Pocket TTS FlowLM in MLX + teacher->student distillation (distill.py, shrink.py)
 ```
 
 ### Data Flow

@@ -1,0 +1,35 @@
+# Slimmer 6-layer student that the PUBLIC teacher can still distil into: the
+# residual width stays 1024 (the frozen heads read d_model, the teacher has no
+# z_dim), but attention uses 4 kv heads (GQA), the FFN is halved and the text
+# table is rank 128. Backbone ~40M vs 75M -> roughly 1.8x faster per frame.
+# Seeded from the teacher: strongest heads / FFN units, truncated-SVD text table.
+
+teacher:
+  config: configs/pocket_tts/models/english_2026-09_24l.yaml
+  weights: hf://kyutai/pocket-tts/languages/english_2026-09_24l/model.safetensors@983151f13aaeab1b13c1e5e3c2c383d49a9edf3f
+  dtype: bfloat16
+
+student:
+  config: configs/pocket_tts/models/english_2026-09_24l.yaml
+  overrides:
+    flow_lm.transformer.num_layers: 6
+    flow_lm.transformer.num_kv_heads: 4
+    flow_lm.transformer.dim_feedforward: 2048
+    flow_lm.lookup_table.rank: 128
+
+distill:
+  cfg_coef: 2.0
+
+data:
+  train: data/pocket_latents/train/manifest.jsonl
+  valid: data/pocket_latents/valid/manifest.jsonl
+
+optim:
+  lr: 4.0e-4
+  warmup_steps: 1000
+
+train:
+  batch_size: 16
+  grad_accum: 4
+  max_steps: 200000
+  run_dir: checkpoints/pocket-distill-6l-slim
