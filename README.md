@@ -287,6 +287,37 @@ These models are trainable via `scripts/train.py` with a YAML config:
 
 ---
 
+### Distillation — Pocket TTS (`models/pocket_tts/`)
+
+MLX port of Kyutai's Pocket TTS teacher→student distillation: a frozen 24-layer teacher
+(public `english_2026-09_24l`, 302M backbone) is distilled into a 6-layer student (the
+~100M Pocket TTS layout) or a slimmer GQA variant, with classifier-free guidance baked
+in. Checkpoints are exported in the official layout and run with `pocket-tts generate`.
+Parity with the official PyTorch code is covered by `tests/test_pocket_tts.py`.
+Feasibility, compute estimates and the step-by-step plan are in
+[docs/pocket_tts_distillation.md](docs/pocket_tts_distillation.md).
+
+```bash
+python scripts/pocket_tts_distill.py --smoke-test                       # no downloads
+python scripts/pocket_tts_precompute_latents.py --input data/train.jsonl \
+    --out-dir data/pocket_latents/train --config configs/pocket_tts/models/english_2026-09_24l.yaml
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml --benchmark 10
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml
+```
+
+Fine-tuning with the LSD objective is ported too (`scripts/pocket_tts_finetune.py`). It
+covers a new-language teacher from the English 24-layer model with a fresh tokenizer, new
+voices, or training from scratch. `configs/pocket_tts/hindi/` holds the Hindi experiments:
+smaller students from the public Saryps Labs 6-layer Hindi model, a Hindi 24-layer
+teacher, and students distilled from it.
+
+RL post-training uses GRPO (`scripts/pocket_tts_grpo.py`) in place of Kyutai's REFL. It
+shares its reward stack with the Qwen3-TTS GRPO (Whisper CER/WER, UTMOS, DNSMOS,
+speaker similarity, length guards). A small Gaussian step around the sampler head gives
+the continuous-latent policy a tractable likelihood.
+
+---
+
 ### Inference-only Models
 
 These live under `models/` and have their own scripts. They are not trained via `scripts/train.py`.

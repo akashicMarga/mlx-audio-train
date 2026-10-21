@@ -1,0 +1,48 @@
+# Pocket TTS depth distillation (official recipe, training/configs/depth_distill.yaml):
+# public 24-layer English teacher (302M backbone) -> 6-layer student (75M backbone,
+# the released ~100M Pocket TTS layout), classifier-free guidance (cfg 2) baked in.
+#
+#   python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml --benchmark 10
+#   python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml
+#
+# Kyutai's numbers (8xH100, 31.7k h): student WER 0.76% / sim 0.921 / UTMOS 4.35 vs teacher
+# 0.82% / 0.929 / 4.33. WER reaches parity by ~50k steps; similarity and UTMOS climb to ~150k.
+
+teacher:
+  config: configs/pocket_tts/models/english_2026-09_24l.yaml
+  # Voice-cloning weights are gated on the Hub (accept the terms on kyutai/pocket-tts).
+  # hf://kyutai/pocket-tts-without-voice-cloning/... works too: then no voice prompt is used.
+  weights: hf://kyutai/pocket-tts/languages/english_2026-09_24l/model.safetensors@983151f13aaeab1b13c1e5e3c2c383d49a9edf3f
+  dtype: bfloat16          # frozen; bf16 halves its cost (targets are cast to fp32)
+
+student:
+  config: configs/pocket_tts/models/english_2026-09_24l.yaml
+  overrides:
+    flow_lm.transformer.num_layers: 6
+  # init_from: hf://kyutai/pocket-tts/languages/english_2026-09_2/model.safetensors  # optional warm start
+
+distill:
+  cfg_coef: 2.0            # 1.0 = pure depth distillation (teacher runs once per step)
+
+data:
+  train: data/pocket_latents/train/manifest.jsonl
+  valid: data/pocket_latents/valid/manifest.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0
+
+optim:
+  lr: 4.0e-4               # screened {1,2,4}e-4 upstream: 4e-4 best
+  schedule: cosine
+  warmup_steps: 1000
+  weight_decay: 0.1
+  max_norm: 1.0
+
+train:
+  batch_size: 16           # micro-batch; 16 x accum 4 = 64 rows, the upstream batch
+  grad_accum: 4
+  max_steps: 200000        # WER parity ~50k; quality keeps rising to ~150k
+  ema_decay: 0.9999
+  log_freq: 50
+  valid_freq: 2500
+  ckpt_freq: 2500
+  run_dir: checkpoints/pocket-distill-6l

@@ -1,0 +1,44 @@
+# Experiment H1c — Hindi slim 6-layer student (GQA 4 kv heads, FFN 2048, rank-128 text table; ~51M flow LM vs 110M) from the public Saryps Labs 6-layer Hindi model
+# (saryps-labs/pocket-tts-hindi, CC-BY-4.0: credit them when you share derivatives).
+#
+# The teacher is itself a distilled student: guidance is already baked in and its
+# null (unconditioned) branch was never trained, so cfg_coef MUST be 1.0 (pure depth
+# distillation, one teacher pass per step). Seeded from the teacher's strongest heads / FFN units.
+#
+#   python scripts/pocket_tts_distill.py --config configs/pocket_tts/hindi/distill_saryps6l_to_6l_slim.yaml --benchmark 10
+#   python scripts/pocket_tts_distill.py --config configs/pocket_tts/hindi/distill_saryps6l_to_6l_slim.yaml
+
+teacher:
+  config: hf://saryps-labs/pocket-tts-hindi/config.yaml@dbaa326069d20bfbdaeb625613736773741a24ea
+  weights: config          # = the config's weights_path (BF16 release)
+  dtype: bfloat16
+
+student:
+  config: hf://saryps-labs/pocket-tts-hindi/config.yaml@dbaa326069d20bfbdaeb625613736773741a24ea
+  overrides:
+    flow_lm.transformer.num_layers: 6
+    flow_lm.transformer.num_kv_heads: 4
+    flow_lm.transformer.dim_feedforward: 2048
+    flow_lm.lookup_table.rank: 128
+
+distill:
+  cfg_coef: 1.0
+
+data:
+  # scripts/pocket_tts_precompute_latents.py --config <the Saryps config above> on your
+  # Hindi JSONL ({"audio", "text", "ref_audio"}; IndicVoices / Kathbath work well).
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  valid: data/pocket_latents/hindi_valid/manifest.jsonl
+  normalize_text: hindi    # digits -> Hindi words before tokenizing
+  final_punct_dropout: 0.0 # the teacher was trained essentially without punctuation
+
+optim:
+  lr: 4.0e-4
+  warmup_steps: 1000
+
+train:
+  batch_size: 32
+  grad_accum: 2            # 64 rows per step
+  max_steps: 100000
+  ema_decay: 0.9999
+  run_dir: checkpoints/pocket-hindi-6l-slim

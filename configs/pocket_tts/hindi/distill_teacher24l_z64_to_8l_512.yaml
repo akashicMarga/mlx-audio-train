@@ -1,0 +1,38 @@
+# Experiment H4c (EXPERIMENTAL) — narrow 8-layer d512 student (~37M flow LM) from a z_dim-64 fold of
+# the Hindi teacher. First:
+#   python scripts/pocket_tts_fold_bottleneck.py --config <teacher ckpt>/config.yaml \
+#     --weights <teacher ckpt>/model.safetensors --data data/pocket_latents/hindi_train/manifest.jsonl \
+#     --z-dim 64 --out checkpoints/pocket-hindi-teacher-24l-z64
+# and listen to / score the folded teacher before distilling from it.
+
+teacher:
+  config: checkpoints/pocket-hindi-teacher-24l-z64/config.yaml
+  weights: config
+  dtype: bfloat16
+
+student:
+  config: checkpoints/pocket-hindi-teacher-24l-z64/config.yaml
+  overrides:
+    flow_lm.transformer.num_layers: 8
+    flow_lm.transformer.d_model: 512
+    flow_lm.transformer.num_heads: 8
+    flow_lm.lookup_table.dim: 512
+
+distill:
+  cfg_coef: 2.0
+
+data:
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  valid: data/pocket_latents/hindi_valid/manifest.jsonl
+  tokenizer_path: data/hindi_tokenizer.model
+  normalize_text: hindi
+
+optim:
+  lr: 4.0e-4
+  warmup_steps: 1000
+
+train:
+  batch_size: 32
+  grad_accum: 2
+  max_steps: 200000          # WER parity ~50k; similarity / UTMOS keep improving to ~150k
+  run_dir: checkpoints/pocket-hindi-8l-512

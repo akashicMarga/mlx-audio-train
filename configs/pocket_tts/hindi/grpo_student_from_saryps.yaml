@@ -1,0 +1,82 @@
+# Experiment H5b — GRPO on a Hindi student distilled from Saryps (H1a/b/c), as Kyutai's `_refl`
+# models are RL-tuned students. The distillation loss against the Saryps teacher stays on
+# as an anchor on real rows (Kyutai's REFL does the same), next to the KL.
+#
+#   pip install mlx-whisper utmos-pytorch transformers torch pocket-tts
+#   python scripts/pocket_tts_grpo.py --config configs/pocket_tts/hindi/grpo_student_from_saryps.yaml
+#
+# Start values come from the Qwen3-TTS Hindi GRPO sweeps (docs/grpo_post_training.md):
+# group 4, adv_norm std (none hit a late KL cliff), tanh-shaped CER, MOS weight 0.3.
+# sigma / lr / kl_beta are NEW for a continuous policy: sweep sigma {0.05, 0.1, 0.2} x
+# lr {5e-7, 1e-6, 2e-6} for ~100 steps before a long run.
+
+model:
+  config: checkpoints/pocket-hindi-4l/step_0100000/config.yaml   # your H1 student
+  weights: config
+  freeze_head: true          # the sampler head stays; backbone (+ EOS head) learn
+  train_eos_head: true
+
+grpo:
+  group_size: 4
+  prompts_per_step: 4        # 16 rollouts per step
+  temp: 0.3                  # head noise, as at inference
+  sigma: 0.1                 # exploration std around the head output (inference: 0)
+  max_sec: 20.0
+  eos_threshold: -1.0
+  train_eos: true            # stochastic stop -> learns to end on time (no-EOS failures)
+  kl_beta: 0.02              # closed-form Gaussian KL is in units of 1/(2 sigma^2)
+  pg_norm: token
+  adv_norm: std
+  skip_zero_variance: true
+  rewards:
+    intelligibility:
+      weight: 1.0
+      asr_model: mlx-community/whisper-large-v3-turbo
+      language: hi
+      metric: cer            # CER for Devanagari; WER is logged too
+      reward_shape: tanh
+      reward_k: 3
+    utmos:                   # the quality metric Kyutai's REFL optimises (English-trained: relative)
+      weight: 0.3
+    wavlm_speaker_similarity: # guard: keep the cloned voice
+      weight: 0.2
+    length_penalty:
+      weight: 0.5
+      no_eos_penalty: 1.0
+      silence_penalty: 0.5
+      speaking_rate_min_cps: 8.0   # anti over-enunciation floor (Hindi)
+    # naturalness:           # DNSMOS, as in the Qwen GRPO (pip install speechmos onnxruntime)
+    #   weight: 0.2
+
+anchor:
+  type: distill
+  weight: 0.1
+  batch_size: 8
+  cfg_coef: 1.0              # the Saryps teacher is a distilled model: no guidance
+  teacher:
+    config: hf://saryps-labs/pocket-tts-hindi/config.yaml@dbaa326069d20bfbdaeb625613736773741a24ea
+    weights: config
+    dtype: bfloat16
+
+data:
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  eval: data/pocket_latents/hindi_valid/manifest.jsonl
+  normalize_text: hindi
+  skip_unscorable: true      # prompts with digits / symbols are not rolled out
+  max_prompt_sec: 15.0
+
+eval:
+  num_prompts: 16
+  every: 25
+  seeds: [0]
+
+optim:
+  lr: 1.0e-6
+  warmup_steps: 10
+  schedule: constant
+  weight_decay: 0.0
+
+train:
+  max_steps: 400
+  ckpt_freq: 50
+  run_dir: checkpoints/pocket-hindi-4l-grpo
