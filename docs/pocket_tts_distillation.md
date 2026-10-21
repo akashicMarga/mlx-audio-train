@@ -44,6 +44,9 @@ Kyutai's result (8×H100): the distilled 6-layer student matches or beats its te
 | `models/pocket_tts/train_utils.py` | shared loop: AdamW + warmup/cosine, grad accumulation, clipping, EMA, checkpoints, resume, validation, benchmark |
 | `models/pocket_tts/data.py` | latent dataset: word-boundary prompt cuts (official recipe), `ref_audio` prompts or a same-clip fallback; length-bucketed batches |
 | `models/pocket_tts/text.py` | text normalisation applied identically to tokenizer fitting, training and sampling; `hindi`: digits / ₹ / % → Hindi words (lakh / crore) |
+| `models/pocket_tts/grpo.py` | **GRPO for a continuous-latent policy**: batched rollouts recording every draw, Gaussian + stop log-probs, closed-form KL to a frozen snapshot, shared `Prompts` / `Scorer` / held-out eval |
+| `scripts/pocket_tts_grpo.py` | GRPO trainer: rewards from `train/grpo/rewards.py` (same stack as the Qwen3-TTS GRPO), optional distill / LSD anchor, fixed-prompt eval, `--smoke-test` |
+| `scripts/pocket_tts_grpo_heldout_eval.py` | paired held-out comparison of checkpoints (CER/WER, UTMOS, DNSMOS, speaker sim, no-EOS rate) with Wilcoxon p-values |
 | `models/pocket_tts/codec.py` | official PyTorch Mimi: encode audio → latents, decode latents → audio |
 | `models/pocket_tts/weights.py` | load released `model.safetensors` (local or `hf://`, also community configs); export checkpoints in the official layout plus `config.yaml` and tokenizer |
 | `scripts/pocket_tts_precompute_latents.py` | audio → Mimi latents (once) |
@@ -52,9 +55,9 @@ Kyutai's result (8×H100): the distilled 6-layer student matches or beats its te
 | `scripts/pocket_tts_train_tokenizer.py` | SentencePiece tokenizer for a new language, with the released tokenizers' spec |
 | `scripts/pocket_tts_sample.py` | generate with any checkpoint at any guidance (teachers want cfg ≈ 2; `pocket-tts generate` has no guidance option) |
 | `scripts/pocket_tts_fold_bottleneck.py` | experimental: add `z_dim` to a teacher so narrow students become possible |
-| `configs/pocket_tts/*.yaml` | English: 24→6 (official), 24→6 slim, 24(z64)→8L-512 (experimental) |
+| `configs/pocket_tts/*.yaml` | English: 24→6 (official), 24→6 slim, 24(z64)→8L-512 (experimental), GRPO on the 6-layer student |
 | `configs/pocket_tts/hindi/*.yaml` | Hindi experiments H1–H4, see below |
-| `tests/test_pocket_tts.py` | 22 tests, including parity against the official PyTorch code |
+| `tests/test_pocket_tts.py` | 29 tests, including parity against the official PyTorch code |
 
 ## Verification done (Linux CPU container, MLX 0.32.4, torch 2.14)
 
@@ -241,6 +244,9 @@ public.
 | H3 | **Hindi 24-layer teacher** from the English 24-layer (new tokenizer, fresh text table) | `train_tokenizer` + `finetune` · `teacher_24l_from_english.yaml` | ~10–21 h to 15k steps (WER plateau); days for acoustic polish |
 | H4a/b | your H3 teacher → 6-layer / slim 4-layer students (**cfg 2**) | `distill` · `distill_teacher24l_to_{6l,4l_slim}.yaml` | ~1–2 days to 50k (≈3× less with `--cache-teacher`) |
 | H4c | H3 teacher folded to z_dim 64 → 8-layer d512 student (experimental) | `fold_bottleneck` + `distill` · `distill_teacher24l_z64_to_8l_512.yaml` | ~0.5–1 day to 50k |
+| H5a | **GRPO on the public Saryps 6-layer model** (CER + UTMOS, speaker / length guards, KL anchor) | `grpo` · `grpo_saryps6l.yaml` | ~1–3 min/step → 400 steps overnight (Whisper-bound, as in the Qwen GRPO) |
+| H5b | GRPO on an H1 student, distillation loss to Saryps as anchor | `grpo` · `grpo_student_from_saryps.yaml` | same |
+| H5c | GRPO on an H4 student, distillation loss to your 24-layer teacher as anchor | `grpo` · `grpo_student_from_teacher24l.yaml` | a little more (anchor teacher) |
 
 \* From FLOP counts per batch-64 step at an *assumed* 5–10 TFLOP/s sustained MLX
 throughput. Run `--benchmark 10` on any config for the real number.
@@ -270,5 +276,62 @@ codec. Distillation configs point their teacher at a step directory. Edit the pa
 the checkpoint you chose, and score it before distilling (sample at cfg 2).
 
 Not ported: head distillation (smaller 192-d drifting / pointwise heads), the
-small-model Mimi decoder, REFL reward fine-tuning, the drifting objective, and Muon.
+small-model Mimi decoder, the drifting objective, and Muon. Kyutai's REFL is replaced by
+GRPO (next section).
 Together these are what take Kyutai's English models down to 18M / 7M / 2M.
+
+## RL post-training: GRPO for a continuous-latent model (H5)
+
+Kyutai's `_refl` models get their extra WER/UTMOS from **REFL**: the reward is
+backpropagated through the sampler head, the Mimi decoder and the scorers (UTMOS and a
+character-level CTC ASR). That requires every scorer to be differentiable and ported to
+MLX, and an English CTC model would be useless for Hindi. Instead this repo reuses the
+**Qwen3-TTS GRPO** (`docs/grpo_post_training.md`). Its rewards need no gradients
+(Whisper CER, DNSMOS, length guards), and it is already validated on Hindi: CER −25 to
+−30% vs SFT, with no reward hacking.
+
+Pocket TTS has no token log-probabilities: its head maps noise to a latent
+deterministically. Following Flow-GRPO, the rollout adds a small Gaussian step around
+the head output, which gives every frame a tractable likelihood:
+
+```
+eps ~ N(0, temp)            mu_t = head(z_t, eps)            x_t = mu_t + sigma * xi
+log pi(x_t)    = -||x_t - mu_t||^2 / (2 sigma^2)
+stop_t         ~ Bernoulli(sigmoid((eos_logit_t - threshold) / eos_temp))   (train_eos)
+KL(pi||pi_ref) = ||mu_t - mu_ref_t||^2 / (2 sigma^2) + Bernoulli KL of the stop decisions
+loss = -A * sum_t log pi  +  kl_beta * KL  [+ anchor_weight * distill/LSD loss on real rows]
+```
+
+At inference σ = 0 and the stop is the usual threshold, so the model is unchanged.
+Because the stop decision is part of the policy, GRPO can also fix generations that never
+end (Saryps: 1 in 100), which REFL cannot (its stop is not differentiable).
+
+What is reused from the Qwen GRPO, and what is new:
+
+| | |
+|---|---|
+| reused as is | `train/grpo/rewards.py`: tanh-shaped Whisper CER/WER, DNSMOS, length / no-stop / silence / speaking-rate guards, `group_advantages`; group-of-G sampling; zero-variance group skipping; `pg_norm` token/sequence; frozen-snapshot KL reference; anchor term; fixed-prompt in-loop eval; held-out paired Wilcoxon comparison |
+| added to `rewards.py` | `utmos` (UTMOS22, the metric Kyutai reports and optimises) and `wavlm_speaker_similarity` (WavLM-SV, Kyutai's speaker metric; model-agnostic). Both are available to the Qwen GRPO too. |
+| new for Pocket | Gaussian + stop log-probs, closed-form KL, batched KV-cache rollouts, prompts with digits skipped *before* normalisation (Whisper may write "25" for "पच्चीस") |
+
+Verified here: teacher-forced means reproduce the rollout (`parity` < 1e-4, so updates
+are strictly on-policy). KL is exactly 0 at the start. A positive advantage raises that
+rollout's likelihood. The shared reward stack scores Pocket rollouts. The smoke run moves
+a known-optimum reward from −0.52 to −0.07. A 2-step full-size run (6-layer d1024 with the
+distillation anchor) completes and exports a checkpoint. This also caught the BF16 Saryps
+weights: they are now cast to float32 for training.
+
+Start values come from the Qwen Hindi sweeps: group 4, `adv_norm: std` (`none` hit a
+late KL cliff), tanh CER (k 3), MOS-type weight 0.3, `skip_zero_variance`. **New
+knobs to sweep first** (~100 steps each, judged with the held-out script): `sigma`
+{0.05, 0.1, 0.2} × `lr` {5e-7, 1e-6, 2e-6}. `kl_beta` 0.02 is in units of
+1/(2σ²); keep KL bounded while `eval_cer` falls and `eval_utmos` holds.
+
+```bash
+pip install mlx-whisper utmos-pytorch transformers torch pocket-tts   # rewards + codec
+python scripts/pocket_tts_grpo.py --config configs/pocket_tts/hindi/grpo_saryps6l.yaml
+python scripts/pocket_tts_grpo_heldout_eval.py --grpo-config configs/pocket_tts/hindi/grpo_saryps6l.yaml \
+    --data data/pocket_latents/hindi_valid/manifest.jsonl --num-prompts 100 --seeds 0 1 \
+    --checkpoints hf://saryps-labs/pocket-tts-hindi/config.yaml@dbaa326069d20bfbdaeb625613736773741a24ea \
+                  checkpoints/pocket-hindi-saryps6l-grpo/step_0000400/config.yaml
+```

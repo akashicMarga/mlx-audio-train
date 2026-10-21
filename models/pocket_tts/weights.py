@@ -52,8 +52,9 @@ def build_flow_lm(config_path: str, overrides: dict | None = None,
             # *-without-voice-cloning releases ship no voice projection: run text-only.
             model.pop("speaker_proj_weight")
         model.load_weights(list(state.items()), strict=True)
-    if dtype != mx.float32:
-        model.set_dtype(dtype)
+    # Always cast: releases may ship BF16 (e.g. saryps-labs/pocket-tts-hindi), and a model
+    # that trains must be float32 (small updates vanish in bf16).
+    model.set_dtype(dtype)
     model.freeze_buffers()
     return model, raw
 

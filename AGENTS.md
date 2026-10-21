@@ -52,6 +52,10 @@ python scripts/pocket_tts_finetune.py --smoke-test
 python scripts/pocket_tts_train_tokenizer.py --out data/hindi_tokenizer --normalize-text hindi data/hindi/train.jsonl
 python scripts/pocket_tts_finetune.py --config configs/pocket_tts/hindi/teacher_24l_from_english.yaml
 python scripts/pocket_tts_sample.py --config <ckpt>/config.yaml --cfg 2 --text "..." --out out.wav
+
+# Pocket TTS GRPO (rewards shared with the Qwen3-TTS GRPO in train/grpo/rewards.py)
+python scripts/pocket_tts_grpo.py --smoke-test
+python scripts/pocket_tts_grpo.py --config configs/pocket_tts/hindi/grpo_saryps6l.yaml
 ```
 
 ## Architecture
@@ -65,7 +69,7 @@ data/base_dataset.py      # JSONL dataset loader, TTSSample, BatchIterator
 data/audio_utils.py       # Audio I/O, resampling, loudness norm, silence trimming
 data/processors/qwen3_tts.py  # Qwen3-TTS tokenization: audio→codec_ids, text→text_ids
 data/processors/csm.py        # CSM/Sesame processor
-models/pocket_tts/            # Pocket TTS FlowLM in MLX: distillation (distill.py, shrink.py), LSD fine-tuning (objectives.py, finetune.py)
+models/pocket_tts/            # Pocket TTS FlowLM in MLX: distillation (distill.py, shrink.py), LSD fine-tuning (objectives.py, finetune.py), GRPO (grpo.py)
 ```
 
 ### Data Flow

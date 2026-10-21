@@ -121,6 +121,8 @@ class RewardContext:
     max_new_tokens: Optional[int]           = None
     model:          object                  = None
     ref_mel:        Optional[mx.array]       = None
+    ref_audios:     Optional[List[np.ndarray]] = None   # per-rollout reference voice (wav)
+    ref_sample_rate: Optional[int]           = None
 
 
 def _invoke(name: str, ctx: RewardContext, spec: dict) -> Dict[str, List[float]]:
@@ -452,6 +454,87 @@ def naturalness_reward(
     return {"reward": rewards, "mos": mos}
 
 
+_UTMOS = None
+
+
+def _get_utmos():
+    """Lazy-load UTMOS22 (`pip install utmos-pytorch`, the scorer Kyutai's REFL uses)."""
+    global _UTMOS
+    if _UTMOS is None:
+        try:
+            import torch
+            from utmos_pytorch import UTMOSScoreTorch
+        except ImportError as e:
+            raise ImportError(f"utmos reward needs `pip install utmos-pytorch torch` ({e})") from e
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        _UTMOS = (UTMOSScoreTorch(device=device).model.eval(), torch, device)
+    return _UTMOS
+
+
+@register_reward("utmos", default_weight=0.0)
+def utmos_reward(ctx: RewardContext) -> Dict[str, List[float]]:
+    """r_utmos = (UTMOS − 1) / 4 ∈ [0, 1] (UTMOS22 strong, MOS scale ~[1, 5]).
+
+    The quality metric Kyutai reports and rewards (REFL); used here as a plain
+    non-differentiable reward. English-trained like DNSMOS: a RELATIVE proxy for
+    Hindi. Degenerate rollouts score 0. Returns {"reward", "utmos"}."""
+    model, torch, device = _get_utmos()
+    rewards, scores = [], []
+    for audio in ctx.audios:
+        wav = _to_whisper_audio(audio, ctx.sample_rate)   # 16 kHz
+        if wav.shape[0] < WHISPER_SR // 4 or not np.all(np.isfinite(wav)):
+            rewards.append(0.0); scores.append(1.0); continue
+        with torch.no_grad():
+            x = torch.from_numpy(wav).to(device)[None, None]
+            one = torch.ones(1, dtype=torch.int, device=device)
+            mos = float(model(x, domains=0 * one, judge_id=288 * one).mean() * 2 + 3)
+        rewards.append(min(1.0, max(0.0, (mos - 1.0) / 4.0)))
+        scores.append(mos)
+    return {"reward": rewards, "utmos": scores}
+
+
+_WAVLM_SV = None
+
+
+def _get_wavlm_sv(model_id: str):
+    global _WAVLM_SV
+    if _WAVLM_SV is None or _WAVLM_SV[0] != model_id:
+        import torch
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+
+        _WAVLM_SV = (model_id, AutoFeatureExtractor.from_pretrained(model_id),
+                     WavLMForXVector.from_pretrained(model_id).eval(), torch)
+    return _WAVLM_SV[1:]
+
+
+@register_reward("wavlm_speaker_similarity", default_weight=0.0)
+def wavlm_speaker_similarity_reward(
+    ctx: RewardContext, *, model_id: str = "microsoft/wavlm-base-plus-sv",
+) -> Dict[str, List[float]]:
+    """r = cosine(WavLM-SV(audio), WavLM-SV(reference voice)) — the speaker-similarity
+    metric Kyutai reports. Model-agnostic (reads ctx.ref_audios, one wav per rollout),
+    unlike `speaker_similarity`, which needs Qwen3-TTS's speaker encoder."""
+    if ctx.ref_audios is None:
+        raise RuntimeError("wavlm_speaker_similarity needs ctx.ref_audios")
+    fe, model, torch = _get_wavlm_sv(model_id)
+    ref_sr = ctx.ref_sample_rate or ctx.sample_rate
+    cache: Dict[int, object] = {}
+    rewards = []
+    for audio, ref in zip(ctx.audios, ctx.ref_audios):
+        wav = _to_whisper_audio(audio, ctx.sample_rate)
+        if ref is None or wav.shape[0] < WHISPER_SR // 4 or not np.all(np.isfinite(wav)):
+            rewards.append(-1.0); continue
+        with torch.no_grad():
+            if id(ref) not in cache:
+                r16 = _to_whisper_audio(ref, ref_sr)
+                emb = model(**fe(r16, sampling_rate=WHISPER_SR, return_tensors="pt")).embeddings
+                cache[id(ref)] = torch.nn.functional.normalize(emb, dim=-1)
+            emb = model(**fe(wav, sampling_rate=WHISPER_SR, return_tensors="pt")).embeddings
+            sim = float((torch.nn.functional.normalize(emb, dim=-1) * cache[id(ref)]).sum())
+        rewards.append(sim if np.isfinite(sim) else -1.0)
+    return {"reward": rewards, "spk_sim": rewards}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Orchestration + advantages
 # ──────────────────────────────────────────────────────────────────────────────
@@ -466,6 +549,8 @@ def combine_rewards(
     sample_rate: int,
     model=None,
     ref_mel: Optional[mx.array] = None,
+    ref_audios: Optional[List[np.ndarray]] = None,
+    ref_sample_rate: Optional[int] = None,
 ) -> Dict[str, object]:
     """Run every reward listed (with weight != 0) in `cfg.rewards`, return the
     weighted per-rollout total + a metrics dict.
@@ -479,7 +564,7 @@ def combine_rewards(
     ctx = RewardContext(
         audios=audios, texts=texts, sample_rate=sample_rate,
         gen_lengths=gen_lengths, max_new_tokens=max_new_tokens,
-        model=model, ref_mel=ref_mel,
+        model=model, ref_mel=ref_mel, ref_audios=ref_audios, ref_sample_rate=ref_sample_rate,
     )
     n = len(audios)
     total = np.zeros(n, dtype=np.float32)

@@ -529,3 +529,102 @@ def test_teacher_cache_matches_live_teacher(tmp_path):
     a = distill_loss(student, nb, batch["target"]).item()
     b = distill_loss(student, nb, live).item()
     assert abs(a - b) < 1e-2 * max(abs(b), 1e-6)
+
+
+# ── GRPO (continuous-latent policy) ───────────────────────────────────────────
+
+def _grpo_setup(train_eos=True, sigma=0.2, G=3, eos_threshold=0.0):
+    from models.pocket_tts.grpo import RolloutConfig, snapshot
+
+    mx.random.seed(0)
+    np.random.seed(0)
+    model = FlowLM(flowlm_args_from_raw(tiny_raw(z_dim=16)))
+    randomize(model, std=0.15)
+    model.freeze_buffers()
+    rc = RolloutConfig(group_size=G, sigma=sigma, max_frames=14, min_frames=3, train_eos=train_eos,
+                       eos_threshold=eos_threshold)
+    tokens = np.array([3, 9, 4, 7])
+    voice = mx.random.normal((5, 8))
+    return model, snapshot(model), rc, tokens, voice
+
+
+def test_grpo_teacher_forced_matches_rollout():
+    """On-policy correctness: the teacher-forced pass reproduces every rollout mean."""
+    from models.pocket_tts.grpo import make_group_batch, rollout_group, grpo_loss
+
+    model, ref, rc, tokens, voice = _grpo_setup()
+    roll = rollout_group(model, tokens, voice, rc)
+    assert roll["x"].shape[0] == 3 and (roll["lengths"] >= rc.min_frames).all()
+    batch = make_group_batch(model, ref, roll, tokens, voice, np.array([1.0, -0.5, -0.5]), rc)
+    loss, mets = grpo_loss(model, batch, rc, kl_beta=0.1)
+    assert mets["parity"].item() < 1e-4
+    assert mets["kl"].item() < 1e-8          # policy == reference at the start
+    dec = np.array(batch["decision"])
+    for b, n in enumerate(roll["lengths"]):
+        stopped = n < rc.max_frames
+        assert dec[b].sum() == (n - rc.min_frames + (1 if stopped else 0))
+        if stopped:
+            assert np.array(batch["stop_label"])[b, n] and dec[b, n]
+
+
+def test_grpo_gradient_follows_advantage():
+    """One step on the PG term raises the log-likelihood of the advantaged rollout."""
+    import mlx.optimizers as optim
+
+    from models.pocket_tts.grpo import make_group_batch, rollout_group, grpo_loss
+
+    model, ref, rc, tokens, voice = _grpo_setup(train_eos=False, G=2)
+    roll = rollout_group(model, tokens, voice, rc)
+    batch = make_group_batch(model, ref, roll, tokens, voice, np.array([1.0, -1.0]), rc)
+
+    def rollout_logp(m):
+        neg = {"advantages": mx.array([1.0, 0.0])}
+        lp_pos = -grpo_loss(m, {**batch, **neg}, rc, kl_beta=0.0)[1]["pg"].item()
+        neg = {"advantages": mx.array([0.0, 1.0])}
+        lp_neg = -grpo_loss(m, {**batch, **neg}, rc, kl_beta=0.0)[1]["pg"].item()
+        return lp_pos, lp_neg
+
+    before = rollout_logp(model)
+    opt = optim.SGD(learning_rate=1e-4)
+    _, grads = nn.value_and_grad(model, lambda m: grpo_loss(m, batch, rc, kl_beta=0.0)[0])(model)
+    opt.update(model, grads)
+    after = rollout_logp(model)
+    assert after[0] - before[0] > after[1] - before[1]
+
+
+def test_grpo_rewards_plumbing():
+    """The shared Qwen GRPO reward stack scores Pocket rollouts (length guard, advantages)."""
+    from train.grpo.rewards import RewardConfig, combine_rewards, group_advantages
+
+    from models.pocket_tts.grpo import rollout_group
+
+    model, _, rc, tokens, voice = _grpo_setup(eos_threshold=1e9)   # never stops
+    roll = rollout_group(model, tokens, voice, rc)
+    assert roll["hit_cap"].all()
+    audios = [mx.random.normal((int(n) * 1920,)) * 0.1 for n in roll["lengths"]]
+    cfg = RewardConfig(rewards={"length_penalty": {"weight": 0.5}})
+    out = combine_rewards(audios, ["नमस्ते"] * 3, roll["lengths"].tolist(), rc.max_frames, cfg,
+                          sample_rate=24000)
+    np.testing.assert_allclose(out["info"]["r_length_penalty"], [-1.0] * 3)
+    adv = group_advantages(np.array([0.1, 0.5, 0.9]), 3)
+    assert abs(adv.mean()) < 1e-6 and adv[2] > adv[0]
+
+
+@pytest.mark.parametrize("path", sorted(str(p) for p in (REPO_ROOT / "configs/pocket_tts").rglob("grpo_*.yaml")))
+def test_grpo_configs_are_valid(path):
+    """Every GRPO config uses known keys and registered rewards (typos fail here, not on the Mac)."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from pocket_tts_grpo import DEFAULTS
+    from train.grpo.rewards import registered_rewards
+
+    cfg = yaml.safe_load(open(path))
+    for section, values in cfg.items():
+        assert section in DEFAULTS, f"unknown section {section!r}"
+        if section in ("grpo", "anchor", "data", "eval", "optim", "train", "model") and isinstance(values, dict):
+            extra = set(values) - set(DEFAULTS[section]) - {"rewards", "teacher", "config", "weights",
+                                                            "overrides", "train", "valid", "eval",
+                                                            "tokenizer_path"}
+            assert not extra, f"{section}: unknown keys {extra}"
+    for name in cfg["grpo"]["rewards"]:
+        assert name in registered_rewards(), name
+    assert cfg["anchor"]["type"] in ("none", "distill", "lsd") if "anchor" in cfg else True

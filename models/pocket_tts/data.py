@@ -115,6 +115,11 @@ class LatentDataset:
 
     def sample(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(target latents [T, C], text tokens, voice prompt latents [Tv, C])."""
+        target, text, prompt = self.sample_text(index)
+        return target, self._tokens(text), prompt
+
+    def sample_text(self, index: int) -> tuple[np.ndarray, str, np.ndarray]:
+        """(target latents [T, C], target text (untokenized), voice prompt latents [Tv, C])."""
         entry = self.entries[index]
         lat = self._load(entry["latents"])
         duration = len(lat) / FRAME_RATE
@@ -129,14 +134,14 @@ class LatentDataset:
                 end_f = min(end_f, int(np.ceil((max(ends) + TRAIL_SEC) * FRAME_RATE)))
             target = lat[cut_f:end_f][: self.max_frames]
             text = " ".join(w["word"] for w in words[i:])
-            return target, self._tokens(text), self._trim_prompt(lat[:cut_f])
+            return target, text, self._trim_prompt(lat[:cut_f])
         text = entry["text"]
         target = lat[: self.max_frames]
         if entry.get("voice_latents") is not None:
-            return target, self._tokens(text), self._trim_prompt(self._load(entry["voice_latents"]))
+            return target, text, self._trim_prompt(self._load(entry["voice_latents"]))
         win = self.max_voice_frames or int(3 * FRAME_RATE)
         start = self.rng.randint(0, max(0, len(lat) - win))
-        return target, self._tokens(text), self._trim_prompt(lat[start:start + win])
+        return target, text, self._trim_prompt(lat[start:start + win])
 
 
 def collate(samples: list[tuple]) -> dict:

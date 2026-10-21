@@ -1,0 +1,81 @@
+# Experiment English GRPO (the counterpart of Kyutai's `_refl` models): RL on the 6-layer student
+# from distill_24l_to_6l.yaml, anchored by the distillation loss to the public 24-layer
+# teacher. WER via Whisper (English), UTMOS for quality.
+#
+#   pip install mlx-whisper utmos-pytorch transformers torch pocket-tts
+#   python scripts/pocket_tts_grpo.py --config configs/pocket_tts/grpo_english_6l.yaml
+#
+# Start values come from the Qwen3-TTS Hindi GRPO sweeps (docs/grpo_post_training.md):
+# group 4, adv_norm std (none hit a late KL cliff), tanh-shaped CER, MOS weight 0.3.
+# sigma / lr / kl_beta are NEW for a continuous policy: sweep sigma {0.05, 0.1, 0.2} x
+# lr {5e-7, 1e-6, 2e-6} for ~100 steps before a long run.
+
+model:
+  config: checkpoints/pocket-distill-6l/step_0100000/config.yaml   # or the released english_2026-09_2 model
+  weights: config
+  freeze_head: true          # the sampler head stays; backbone (+ EOS head) learn
+  train_eos_head: true
+
+grpo:
+  group_size: 4
+  prompts_per_step: 4        # 16 rollouts per step
+  temp: 0.3                  # head noise, as at inference
+  sigma: 0.1                 # exploration std around the head output (inference: 0)
+  max_sec: 20.0
+  eos_threshold: -1.0
+  train_eos: true            # stochastic stop -> learns to end on time (no-EOS failures)
+  kl_beta: 0.02              # closed-form Gaussian KL is in units of 1/(2 sigma^2)
+  pg_norm: token
+  adv_norm: std
+  skip_zero_variance: true
+  rewards:
+    intelligibility:
+      weight: 1.0
+      asr_model: mlx-community/whisper-large-v3-turbo
+      language: en
+      metric: wer            # English: WER (CER is logged too)
+      reward_shape: tanh
+      reward_k: 3
+    utmos:                   # the quality metric Kyutai's REFL optimises (English-trained: relative)
+      weight: 0.3
+    wavlm_speaker_similarity: # guard: keep the cloned voice
+      weight: 0.2
+    length_penalty:
+      weight: 0.5
+      no_eos_penalty: 1.0
+      silence_penalty: 0.5
+      speaking_rate_min_cps: 0.0   # off; set ~10 if rollouts slow down
+    # naturalness:           # DNSMOS, as in the Qwen GRPO (pip install speechmos onnxruntime)
+    #   weight: 0.2
+
+anchor:
+  type: distill
+  weight: 0.1
+  batch_size: 4
+  cfg_coef: 2.0              # same guidance the student was distilled with
+  teacher:
+    config: configs/pocket_tts/models/english_2026-09_24l.yaml
+    weights: hf://kyutai/pocket-tts/languages/english_2026-09_24l/model.safetensors@983151f13aaeab1b13c1e5e3c2c383d49a9edf3f
+    dtype: bfloat16
+
+data:
+  train: data/pocket_latents/train/manifest.jsonl
+  eval: data/pocket_latents/valid/manifest.jsonl
+  skip_unscorable: true      # prompts with digits / symbols are not rolled out
+  max_prompt_sec: 15.0
+
+eval:
+  num_prompts: 16
+  every: 25
+  seeds: [0]
+
+optim:
+  lr: 1.0e-6
+  warmup_steps: 10
+  schedule: constant
+  weight_decay: 0.0
+
+train:
+  max_steps: 400
+  ckpt_freq: 50
+  run_dir: checkpoints/pocket-english-6l-grpo

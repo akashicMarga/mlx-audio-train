@@ -109,6 +109,7 @@ def build_finetune(cfg: dict) -> tuple[Trainable, dict]:
         model.speaker_proj_weight = _trunc_normal(model.speaker_proj_weight.shape,
                                                   1 / math.sqrt(args.voice_dim))
         dit_init(model.flow_net)
+    model.set_dtype(mx.float32)  # BF16 releases load as BF16; train in float32
     model.freeze_buffers()
     if m.get("freeze_head"):
         model.flow_net.freeze()

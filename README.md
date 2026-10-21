@@ -311,6 +311,11 @@ voices, or training from scratch. `configs/pocket_tts/hindi/` holds the Hindi ex
 smaller students from the public Saryps Labs 6-layer Hindi model, a Hindi 24-layer
 teacher, and students distilled from it.
 
+RL post-training uses GRPO (`scripts/pocket_tts_grpo.py`) in place of Kyutai's REFL. It
+shares its reward stack with the Qwen3-TTS GRPO (Whisper CER/WER, UTMOS, DNSMOS,
+speaker similarity, length guards). A small Gaussian step around the sampler head gives
+the continuous-latent policy a tractable likelihood.
+
 ---
 
 ### Inference-only Models
