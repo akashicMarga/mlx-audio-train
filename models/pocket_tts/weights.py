@@ -8,25 +8,16 @@ Training checkpoints written here keep that layout, so they run unchanged with
 
 from __future__ import annotations
 
+import copy
+import shutil
 from pathlib import Path
 
 import mlx.core as mx
 import yaml
 from mlx.utils import tree_flatten
 
-from models.pocket_tts.config import flowlm_args_from_raw, load_raw_config
+from models.pocket_tts.config import flowlm_args_from_raw, load_raw_config, resolve_path  # noqa: F401
 from models.pocket_tts.model import FlowLM
-
-
-def resolve_path(path: str) -> str:
-    """Local path for a pocket-tts style reference: local file or hf://repo/file[@rev]."""
-    if not path.startswith("hf://"):
-        return path
-    from huggingface_hub import hf_hub_download
-
-    spec, _, revision = path.removeprefix("hf://").partition("@")
-    owner, repo, *rest = spec.split("/")
-    return hf_hub_download(f"{owner}/{repo}", "/".join(rest), revision=revision or None)
 
 
 def load_flow_lm_state(path: str) -> dict[str, mx.array]:
@@ -44,11 +35,17 @@ def model_state(model: FlowLM) -> dict[str, mx.array]:
     return dict(tree_flatten(model.parameters()))
 
 
+def weights_from(spec: str | None, raw: dict) -> str | None:
+    """`weights: config` in a YAML means the model config's own weights_path."""
+    return raw.get("weights_path") if spec == "config" else spec
+
+
 def build_flow_lm(config_path: str, overrides: dict | None = None,
                   weights: str | None = None, dtype=mx.float32) -> tuple[FlowLM, dict]:
     """(FlowLM, raw config). With `weights`, loads them strictly (voice projection optional)."""
     raw = load_raw_config(config_path, overrides)
     model = FlowLM(flowlm_args_from_raw(raw))
+    weights = weights_from(weights, raw)
     if weights:
         state = load_flow_lm_state(weights)
         if "speaker_proj_weight" not in state:
@@ -77,8 +74,16 @@ def export_pocket_tts(model: FlowLM, raw_config: dict, mimi_source: str, out_dir
     weights_file = out_dir / "model.safetensors"
     mx.save_safetensors(str(weights_file), tensors)
 
-    cfg = dict(raw_config)
+    cfg = copy.deepcopy(raw_config)
     cfg["weights_path"] = str(weights_file.resolve())
+    # Ship a local tokenizer with the checkpoint so the config works from anywhere.
+    lut = cfg["flow_lm"]["lookup_table"]
+    tok = Path(str(lut["tokenizer_path"]))
+    if "://" not in str(tok) and tok.is_file():
+        dst = out_dir / f"tokenizer{tok.suffix}"
+        if tok.resolve() != dst.resolve():
+            shutil.copyfile(tok, dst)
+        lut["tokenizer_path"] = str(dst.resolve())
     cfg.pop("weights_path_without_voice_cloning", None)
     with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)

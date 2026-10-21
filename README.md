@@ -305,6 +305,12 @@ python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_
 python scripts/pocket_tts_distill.py --config configs/pocket_tts/distill_24l_to_6l.yaml
 ```
 
+Fine-tuning with the LSD objective is ported too (`scripts/pocket_tts_finetune.py`). It
+covers a new-language teacher from the English 24-layer model with a fresh tokenizer, new
+voices, or training from scratch. `configs/pocket_tts/hindi/` holds the Hindi experiments:
+smaller students from the public Saryps Labs 6-layer Hindi model, a Hindi 24-layer
+teacher, and students distilled from it.
+
 ---
 
 ### Inference-only Models

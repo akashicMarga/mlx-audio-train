@@ -1,0 +1,34 @@
+# Experiment H4b — Hindi 24-layer teacher (H3) -> slim 4-layer student: GQA (4 kv heads),
+# FFN 2048, rank-128 text table (~35M flow LM). Same d_model, so the frozen heads fit.
+
+teacher:
+  config: checkpoints/pocket-hindi-teacher-24l/step_0050000/config.yaml   # pick your best checkpoint
+  weights: config
+  dtype: bfloat16
+
+student:
+  config: checkpoints/pocket-hindi-teacher-24l/step_0050000/config.yaml
+  overrides:
+    flow_lm.transformer.num_layers: 4
+    flow_lm.transformer.num_kv_heads: 4
+    flow_lm.transformer.dim_feedforward: 2048
+    flow_lm.lookup_table.rank: 128
+
+distill:
+  cfg_coef: 2.0
+
+data:
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  valid: data/pocket_latents/hindi_valid/manifest.jsonl
+  tokenizer_path: data/hindi_tokenizer.model
+  normalize_text: hindi
+
+optim:
+  lr: 4.0e-4
+  warmup_steps: 1000
+
+train:
+  batch_size: 32
+  grad_accum: 2
+  max_steps: 200000          # WER parity ~50k; similarity / UTMOS keep improving to ~150k
+  run_dir: checkpoints/pocket-hindi-4l-slim

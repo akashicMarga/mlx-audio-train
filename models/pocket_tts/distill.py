@@ -29,7 +29,7 @@ from mlx.utils import tree_flatten
 from models.pocket_tts.config import flowlm_args_from_raw, load_raw_config
 from models.pocket_tts.model import FlowLM
 from models.pocket_tts.shrink import seed_student, shrink_width
-from models.pocket_tts.weights import build_flow_lm, load_flow_lm_state, model_state
+from models.pocket_tts.weights import build_flow_lm, load_flow_lm_state, model_state, weights_from
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ def build_student(teacher: FlowLM, student_config: str, student_overrides: dict 
     dst = shapes_of(student)
     seeded, kept = seed_student(to_numpy(model_state(teacher)), dst, args.head_dim)
     if init_from:
+        init_from = weights_from(init_from, raw)
         src = {k: v for k, v in to_numpy(load_flow_lm_state(init_from)).items()
                if not k.startswith(FlowLM.HEAD_PREFIXES)}
         seeded.update(shrink_width(src, dst, args.head_dim))
@@ -92,7 +93,8 @@ def build_distillation(cfg: dict):
     """(teacher, student, student raw config, kept layers) from the YAML sections."""
     t, s = cfg["teacher"], cfg["student"]
     dtype = getattr(mx, t.get("dtype", "float32"))
-    teacher, _ = build_flow_lm(t["config"], t.get("overrides"), t["weights"], dtype=dtype)
+    teacher, t_raw = build_flow_lm(t["config"], t.get("overrides"), t["weights"], dtype=dtype)
+    t["weights"] = weights_from(t["weights"], t_raw)  # also the Mimi source of exports
     teacher.freeze()
     student, raw, kept = build_student(teacher, s["config"], s.get("overrides"), s.get("init_from"))
     return teacher, student, raw, kept

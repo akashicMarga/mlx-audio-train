@@ -85,7 +85,7 @@ class LatentDataset:
 
     def _tokens(self, text: str) -> np.ndarray:
         if self.final_punct_dropout > 0 and self.rng.random() < self.final_punct_dropout:
-            text = re.sub(r"\.\s*$", "", text) or text
+            text = re.sub(r"[.।]\s*$", "", text) or text  # also the Devanagari danda
         return np.array(self.tokenize(text), dtype=np.int32)
 
     def _trim_prompt(self, prompt: np.ndarray) -> np.ndarray:
@@ -139,7 +139,8 @@ class LatentDataset:
         return target, self._tokens(text), self._trim_prompt(lat[start:start + win])
 
 
-def collate(samples: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict:
+def collate(samples: list[tuple]) -> dict:
+    """(latents, tokens, voice[, teacher target]) rows -> padded batch."""
     B = len(samples)
     C = samples[0][0].shape[1]
     # +1 frame so every row also gets its EOS position (first padded frame) in the loss.
@@ -149,12 +150,12 @@ def collate(samples: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict:
     voice = np.zeros((B, Tv, samples[0][2].shape[1] if len(samples[0][2]) else C), dtype=np.float32)
     mask = np.zeros((B, T), dtype=bool)
     voice_lens = np.zeros(B, dtype=np.int64)
-    for b, (lat, _, pr) in enumerate(samples):
+    for b, (lat, _, pr, *_rest) in enumerate(samples):
         latents[b, : len(lat)] = lat
         mask[b, : len(lat)] = True
         voice[b, : len(pr)] = pr
         voice_lens[b] = len(pr)
-    return {
+    out = {
         "latents": mx.array(latents),          # raw; normalized by the caller
         "mask": mx.array(mask),
         "text_tokens": [s[1] for s in samples],
@@ -162,9 +163,15 @@ def collate(samples: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict:
         "voice_lens": voice_lens,
         "frames": int(mask.sum()),
     }
+    if len(samples[0]) > 3:  # cached teacher targets [T_i + 1, z] (see teacher_cache.py)
+        target = np.zeros((B, T, samples[0][3].shape[1]), dtype=np.float32)
+        for b, s in enumerate(samples):
+            target[b, : len(s[3])] = s[3]
+        out["target"] = mx.array(target)
+    return out
 
 
-def batches(ds: LatentDataset, batch_size: int, bucket_batches: int = 5,
+def batches(ds, batch_size: int, bucket_batches: int = 5,
             shuffle: bool = True, seed: int = 0) -> Iterator[dict]:
     """Endless length-bucketed batches: pools of bucket_batches*batch_size samples are
     sorted by length so rows in a batch have similar lengths (less padding)."""

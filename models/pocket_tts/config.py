@@ -73,9 +73,39 @@ def apply_overrides(raw: dict, overrides: dict[str, Any] | None) -> dict:
     return raw
 
 
+def resolve_path(path: str) -> str:
+    """Local path for a pocket-tts style reference: local file or hf://owner/repo/file[@rev]."""
+    path = str(path)
+    if not path.startswith("hf://"):
+        return path
+    from huggingface_hub import hf_hub_download
+
+    spec, _, revision = path.removeprefix("hf://").partition("@")
+    owner, repo, *rest = spec.split("/")
+    return hf_hub_download(f"{owner}/{repo}", "/".join(rest), revision=revision or None)
+
+
 def load_raw_config(path: str | Path, overrides: dict[str, Any] | None = None) -> dict:
+    """A pocket-tts YAML config (local or hf://), with dotted overrides applied.
+
+    Relative weights/tokenizer paths inside an hf:// config are made hf:// paths of the
+    same repo (community configs often say `tokenizer_path: tokenizer.model`)."""
+    raw = _read_yaml(resolve_path(path))
+    if str(path).startswith("hf://"):
+        spec, _, rev = str(path).removeprefix("hf://").partition("@")
+        repo = "/".join(spec.split("/")[:2])
+        fix = lambda v: v if not v or "://" in v or v.startswith("/") else f"hf://{repo}/{v}" + (f"@{rev}" if rev else "")  # noqa: E731
+        for key in ("weights_path", "weights_path_without_voice_cloning"):
+            if isinstance(raw.get(key), str):
+                raw[key] = fix(raw[key])
+        lut = raw["flow_lm"]["lookup_table"]
+        lut["tokenizer_path"] = fix(lut["tokenizer_path"])
+    return apply_overrides(raw, overrides)
+
+
+def _read_yaml(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
-        return apply_overrides(yaml.safe_load(f), overrides)
+        return yaml.safe_load(f)
 
 
 def flowlm_args_from_raw(raw: dict) -> FlowLMArgs:

@@ -1,0 +1,39 @@
+# Experiment H2 — adapt the Saryps 6-layer Hindi model to your own voices / domain
+# (same tokenizer, so the text table carries over).
+#
+# Caveat: this model is a distilled student (guidance baked in, no trained null branch).
+# A flow-loss fine-tune pulls it back toward unguided samples, so watch WER/UTMOS against
+# the base model. freeze_head keeps the latent geometry its backbone was distilled
+# against; dropout stays 0 because it is never sampled with a null branch. For the best
+# result use H3 (a 24-layer Hindi teacher) and re-distil instead.
+#
+#   python scripts/pocket_tts_finetune.py --config configs/pocket_tts/hindi/finetune_saryps6l.yaml
+
+model:
+  config: hf://saryps-labs/pocket-tts-hindi/config.yaml@dbaa326069d20bfbdaeb625613736773741a24ea
+  weights: config
+  freeze_head: true
+
+loss:
+  flow_batch_multiplier: 4
+  eos_loss_weight: 0.1
+  text_dropout: 0.0
+  voice_dropout: 0.0
+
+data:
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  valid: data/pocket_latents/hindi_valid/manifest.jsonl
+  normalize_text: hindi
+  final_punct_dropout: 0.0
+
+optim:
+  lr: 2.0e-5               # a tenth of the scratch rate (official finetune.yaml)
+  schedule: constant
+  warmup_steps: 500
+
+train:
+  batch_size: 32
+  grad_accum: 2
+  max_steps: 10000
+  ema_decay: 0.999
+  run_dir: checkpoints/pocket-hindi-6l-ft

@@ -35,16 +35,26 @@ Kyutai's result (8×H100): the distilled 6-layer student matches or beats its te
 
 | file | |
 |---|---|
-| `models/pocket_tts/model.py` | MLX FlowLM, with weight names identical to the PyTorch state dict. Covers z_dim, attn_dim, GQA, dim_feedforward, low-rank LUT, and lsd / flow_matching / drifting / pointwise heads. KV-cache sampling. |
+| `models/pocket_tts/model.py` | MLX FlowLM, with weight names identical to the PyTorch state dict. Covers z_dim, attn_dim, GQA, dim_feedforward, low-rank LUT, and lsd / flow_matching / drifting / pointwise heads. KV-cache sampling with optional guidance. |
 | `models/pocket_tts/shrink.py` | numpy port of `shrink_checkpoint.py` (depth + width seeding; PCA cut not ported) |
 | `models/pocket_tts/distill.py` | student builder (seeding, frozen heads, z-width / head-width checks), CFG teacher target, masked MSE; experimental `fold_z_bottleneck` |
+| `models/pocket_tts/objectives.py` | **fine-tuning objective**: LSD flow loss (jvp self-distillation term, learned uncertainty weighting), EOS loss, CFG dropout, `flow_batch_multiplier`, latent-stats EMA |
+| `models/pocket_tts/finetune.py` | fine-tune builder: same-language, new-language (`reset_text_embedding`), from scratch; `freeze_head` |
+| `models/pocket_tts/teacher_cache.py` | precomputed teacher targets: run the teacher once, then train the student only (~3× faster steps) |
+| `models/pocket_tts/train_utils.py` | shared loop: AdamW + warmup/cosine, grad accumulation, clipping, EMA, checkpoints, resume, validation, benchmark |
 | `models/pocket_tts/data.py` | latent dataset: word-boundary prompt cuts (official recipe), `ref_audio` prompts or a same-clip fallback; length-bucketed batches |
-| `models/pocket_tts/weights.py` | load released `model.safetensors`; export checkpoints in the official layout plus `config.yaml` |
-| `scripts/pocket_tts_precompute_latents.py` | audio → Mimi latents, using the official PyTorch codec (once) |
-| `scripts/pocket_tts_distill.py` | training loop (grad accumulation, clipping, EMA, resume, validation, `--smoke-test`, `--benchmark`) |
-| `scripts/pocket_tts_fold_bottleneck.py` | experimental: add `z_dim` to a public teacher so narrow students become possible |
-| `configs/pocket_tts/*.yaml` | 24→6 (official), 24→6 slim (GQA / half FFN), 24(z64)→8L-512 (experimental) |
-| `tests/test_pocket_tts.py` | 14 tests, including parity against the official PyTorch code |
+| `models/pocket_tts/text.py` | text normalisation applied identically to tokenizer fitting, training and sampling; `hindi`: digits / ₹ / % → Hindi words (lakh / crore) |
+| `models/pocket_tts/codec.py` | official PyTorch Mimi: encode audio → latents, decode latents → audio |
+| `models/pocket_tts/weights.py` | load released `model.safetensors` (local or `hf://`, also community configs); export checkpoints in the official layout plus `config.yaml` and tokenizer |
+| `scripts/pocket_tts_precompute_latents.py` | audio → Mimi latents (once) |
+| `scripts/pocket_tts_distill.py` | distillation (`--smoke-test`, `--benchmark`, `--cache-teacher`, resume) |
+| `scripts/pocket_tts_finetune.py` | fine-tuning / new-language teacher / from scratch (`--smoke-test`, `--benchmark`, resume) |
+| `scripts/pocket_tts_train_tokenizer.py` | SentencePiece tokenizer for a new language, with the released tokenizers' spec |
+| `scripts/pocket_tts_sample.py` | generate with any checkpoint at any guidance (teachers want cfg ≈ 2; `pocket-tts generate` has no guidance option) |
+| `scripts/pocket_tts_fold_bottleneck.py` | experimental: add `z_dim` to a teacher so narrow students become possible |
+| `configs/pocket_tts/*.yaml` | English: 24→6 (official), 24→6 slim, 24(z64)→8L-512 (experimental) |
+| `configs/pocket_tts/hindi/*.yaml` | Hindi experiments H1–H4, see below |
+| `tests/test_pocket_tts.py` | 22 tests, including parity against the official PyTorch code |
 
 ## Verification done (Linux CPU container, MLX 0.32.4, torch 2.14)
 
@@ -78,6 +88,22 @@ Kyutai's result (8×H100): the distilled 6-layer student matches or beats its te
 cannot reach huggingface.co, and MLX's Linux CPU backend is ~45× slower than numpy at
 matmul, so no meaningful timing was possible. That includes a real 24→6 run, audio
 quality / WER, and Apple-GPU speed. Those are steps 1–3 below.
+
+Added with the fine-tuning port (same container):
+
+* **LSD loss and its gradients match the official PyTorch `LSD`** for both stop-gradient
+  modes, given fixed times / noise and a non-trivial uncertainty net. Loss agrees to 2e-4.
+  Gradients agree for the head parameters, `w_s_t` and the conditioning `z`. This caught a
+  real bug: the `minimal` target must also cut the gradient to `z`.
+* EOS loss matches the reference formula. `reset_text_embedding` re-initialises only the
+  text table, and `freeze_head` leaves the head untrainable.
+* Fine-tune smoke run from scratch: loss 2.40 → 1.02 in 150 steps.
+* Cached teacher targets reproduce the live teacher's targets (fp16) and the same loss.
+* Sampling script: tiny model plus a random-weight Mimi → 2 s of 24 kHz audio, with cfg 2
+  and a voice prompt.
+* All Hindi configs build at full size from a stand-in with the Saryps layout (random
+  weights). Flow LM sizes: teacher 89.4M → 4-layer 64.3M, 3-layer 51.7M, slim 6-layer
+  51.4M. The fine-tune config leaves 79.7M trainable with the head frozen.
 
 ## Feasibility
 
@@ -191,3 +217,59 @@ comes next if you want the true 7m / 2m sizes.
 
 **Step 7 — new language (research).** Fine-tune the 24-layer teacher for the language,
 then repeat steps 3–5.
+
+## Hindi experiments (`configs/pocket_tts/hindi/`)
+
+Pocket TTS reads raw text through a 4,000-piece SentencePiece table, not phonemes.
+That suits Devanagari, whose spelling is close to pronunciation. The weak spots are
+schwa deletion, numbers and abbreviations, and English words. `normalize_text: hindi`
+spells out digits, ₹ and %. Use the same setting when fitting the tokenizer, training
+and sampling.
+
+Public Hindi starting points (CC-BY-4.0, credit the authors):
+[saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi), a
+6-layer model distilled from a 24-layer Hindi teacher trained on 932 h of IndicVoices +
+Kathbath (WER 23.3% / CER 11.5% on held-out speakers, real audio 26.7% / 13.9%).
+Also [Thanushttk/pocket-tts-multilingual](https://huggingface.co/Thanushttk/pocket-tts-multilingual),
+6 layers, Hindi plus 5 other Indian languages and English. No 24-layer Hindi teacher is
+public.
+
+| id | experiment | script / config | time on an M5 Pro (estimate*) |
+|---|---|---|---|
+| H1a/b/c | Saryps 6-layer → 4-layer / 3-layer / slim 6-layer students (**cfg 1**: the teacher is already distilled) | `distill` · `distill_saryps6l_to_{4l,3l,6l_slim}.yaml` | ~7–15 h to 50k steps |
+| H2 | adapt Saryps 6-layer to your voices / domain (head frozen, no dropout) | `finetune` · `finetune_saryps6l.yaml` | ~3–7 h for 10–15k steps |
+| H3 | **Hindi 24-layer teacher** from the English 24-layer (new tokenizer, fresh text table) | `train_tokenizer` + `finetune` · `teacher_24l_from_english.yaml` | ~10–21 h to 15k steps (WER plateau); days for acoustic polish |
+| H3′ | Hindi 24-layer teacher from scratch (the Saryps recipe, 400k steps) | `finetune` · `teacher_24l_scratch.yaml` | weeks (multi-machine territory) |
+| H4a/b | your H3 teacher → 6-layer / slim 4-layer students (**cfg 2**) | `distill` · `distill_teacher24l_to_{6l,4l_slim}.yaml` | ~1–2 days to 50k (≈3× less with `--cache-teacher`) |
+| H4c | H3 teacher folded to z_dim 64 → 8-layer d512 student (experimental) | `fold_bottleneck` + `distill` · `distill_teacher24l_z64_to_8l_512.yaml` | ~0.5–1 day to 50k |
+
+\* From FLOP counts per batch-64 step at an *assumed* 5–10 TFLOP/s sustained MLX
+throughput. Run `--benchmark 10` on any config for the real number.
+
+```bash
+# data (once): your Hindi JSONL {"audio", "text", "ref_audio"} -> latents
+python scripts/pocket_tts_precompute_latents.py --input data/hindi/train.jsonl \
+    --out-dir data/pocket_latents/hindi_train --config configs/pocket_tts/models/english_2026-09_24l.yaml
+python scripts/pocket_tts_precompute_latents.py --input data/hindi/valid.jsonl \
+    --out-dir data/pocket_latents/hindi_valid --config configs/pocket_tts/models/english_2026-09_24l.yaml
+
+# H1: smaller students from the public Hindi model
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/hindi/distill_saryps6l_to_4l.yaml
+
+# H3 -> H4: your own Hindi teacher, then students
+python scripts/pocket_tts_train_tokenizer.py --out data/hindi_tokenizer --normalize-text hindi data/hindi/train.jsonl
+python scripts/pocket_tts_finetune.py --config configs/pocket_tts/hindi/teacher_24l_from_english.yaml
+python scripts/pocket_tts_sample.py --config checkpoints/pocket-hindi-teacher-24l/step_0015000/config.yaml \
+    --cfg 2 --voice voice.wav --text "आज मौसम बहुत अच्छा है" --normalize-text hindi --out teacher.wav
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/hindi/distill_teacher24l_to_6l.yaml \
+    --cache-teacher data/pocket_teacher_cache/hi24l          # optional, then set data.teacher_cache
+python scripts/pocket_tts_distill.py --config configs/pocket_tts/hindi/distill_teacher24l_to_6l.yaml
+```
+
+The latents are the same for every experiment: all these models share Kyutai's Mimi
+codec. Distillation configs point their teacher at a step directory. Edit the path to
+the checkpoint you chose, and score it before distilling (sample at cfg 2).
+
+Not ported: head distillation (smaller 192-d drifting / pointwise heads), the
+small-model Mimi decoder, REFL reward fine-tuning, the drifting objective, and Muon.
+Together these are what take Kyutai's English models down to 18M / 7M / 2M.

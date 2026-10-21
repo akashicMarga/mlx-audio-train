@@ -145,6 +145,17 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+def silu(x):
+    # Not nn.silu: that one is mx.compile'd, and the LSD loss backpropagates through a
+    # jvp of this head, which MLX cannot do through compiled primitives.
+    return x * mx.sigmoid(x)
+
+
+class SiLU(nn.Module):
+    def __call__(self, x):
+        return silu(x)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -175,7 +186,7 @@ class LayerNorm(nn.Module):
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden: int, freq_size: int = 256, max_period: int = 10000):
         super().__init__()
-        self.mlp = [nn.Linear(freq_size, hidden), nn.SiLU(), nn.Linear(hidden, hidden), RMSNorm(hidden)]
+        self.mlp = [nn.Linear(freq_size, hidden), SiLU(), nn.Linear(hidden, hidden), RMSNorm(hidden)]
         half = freq_size // 2
         self.freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
 
@@ -191,13 +202,13 @@ class ResBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
         self.in_ln = LayerNorm(channels, eps=1e-6)
-        self.mlp = [nn.Linear(channels, channels), nn.SiLU(), nn.Linear(channels, channels)]
-        self.adaLN_modulation = [nn.SiLU(), nn.Linear(channels, 3 * channels)]
+        self.mlp = [nn.Linear(channels, channels), SiLU(), nn.Linear(channels, channels)]
+        self.adaLN_modulation = [SiLU(), nn.Linear(channels, 3 * channels)]
 
     def __call__(self, x, y):
-        shift, scale, gate = mx.split(self.adaLN_modulation[1](nn.silu(y)), 3, axis=-1)
+        shift, scale, gate = mx.split(self.adaLN_modulation[1](silu(y)), 3, axis=-1)
         h = modulate(self.in_ln(x), shift, scale)
-        h = self.mlp[2](nn.silu(self.mlp[0](h)))
+        h = self.mlp[2](silu(self.mlp[0](h)))
         return x + gate * h
 
 
@@ -206,10 +217,10 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = LayerNorm(channels, eps=1e-6, affine=False)
         self.linear = nn.Linear(channels, out_channels)
-        self.adaLN_modulation = [nn.SiLU(), nn.Linear(channels, 2 * channels)]
+        self.adaLN_modulation = [SiLU(), nn.Linear(channels, 2 * channels)]
 
     def __call__(self, x, c):
-        shift, scale = mx.split(self.adaLN_modulation[1](nn.silu(c)), 2, axis=-1)
+        shift, scale = mx.split(self.adaLN_modulation[1](silu(c)), 2, axis=-1)
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
 

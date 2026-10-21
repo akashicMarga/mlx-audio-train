@@ -31,38 +31,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-SAMPLE_RATE = 24000
-
-
-def load_wav(path: Path, start: float = 0.0, duration: float | None = None) -> np.ndarray:
-    import soundfile as sf
-    from scipy.signal import resample_poly
-
-    sr = sf.info(str(path)).samplerate
-    frames = -1 if duration is None else int(round(duration * sr))
-    wav, sr = sf.read(str(path), start=int(round(start * sr)), frames=frames,
-                      dtype="float32", always_2d=True)
-    wav = wav.mean(axis=1)  # mono, no loudness normalisation (matches the official loader)
-    if sr != SAMPLE_RATE:
-        g = np.gcd(sr, SAMPLE_RATE)
-        wav = resample_poly(wav, SAMPLE_RATE // g, sr // g).astype(np.float32)
-    return wav
-
-
-def build_mimi(config_path: str, device: str):
-    import safetensors.torch
-    import torch
-    from pocket_tts.models.mimi import build_mimi as _build
-    from pocket_tts.utils.config import load_config
-    from pocket_tts.utils.utils import download_if_necessary
-
-    config = load_config(config_path)
-    mimi = _build(config.mimi)
-    weights = getattr(config.mimi, "weights_path", None) or config.weights_path
-    state = safetensors.torch.load_file(str(download_if_necessary(str(weights))))
-    mimi.load_state_dict({k.removeprefix("mimi."): v for k, v in state.items()
-                          if k.startswith("mimi.")}, strict=True)
-    return mimi.eval().to(device), torch
+from models.pocket_tts.codec import SAMPLE_RATE, Mimi, best_device, load_wav  # noqa: E402
 
 
 def main():
@@ -79,9 +48,7 @@ def main():
 
     import torch
 
-    device = args.device or ("mps" if torch.backends.mps.is_available() else
-                             "cuda" if torch.cuda.is_available() else "cpu")
-    mimi, torch = build_mimi(args.config, device)
+    mimi = Mimi(args.config, args.device or best_device())
     in_path = Path(args.input)
     root = Path(args.audio_root) if args.audio_root else in_path.parent
     out_dir = Path(args.out_dir)
@@ -97,9 +64,8 @@ def main():
         wav = load_wav(root / rel, start, duration)
         if len(wav) / SAMPLE_RATE > args.max_sec or len(wav) < SAMPLE_RATE // 2:
             return None
-        lat = mimi.encode_to_latent(torch.from_numpy(wav)[None, None].to(device))[0]
         name = f"latents/{len(encoded):07d}.npy"
-        np.save(out_dir / name, lat.float().cpu().numpy().astype(np.float16))
+        np.save(out_dir / name, mimi.encode(wav).astype(np.float16))
         encoded[key] = name
         return name
 

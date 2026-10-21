@@ -1,0 +1,47 @@
+# Experiment H3 — a 24-layer Hindi TEACHER, fine-tuned from Kyutai's public English
+# 24-layer model (official finetune_language.yaml: on 976 h of Czech this hit 12% WER
+# at 10k steps where a scratch run was still at 46%; WER plateaus by ~15k steps, the
+# rest is acoustic quality).
+#
+# 1. fit a Hindi tokenizer (n_bins stays 4000):
+#      python scripts/pocket_tts_train_tokenizer.py --out data/hindi_tokenizer --normalize-text hindi data/hindi/train.jsonl
+# 2. precompute latents with the English 24l config (same Mimi codec):
+#      python scripts/pocket_tts_precompute_latents.py --input data/hindi/train.jsonl \
+#        --out-dir data/pocket_latents/hindi_train --config configs/pocket_tts/models/english_2026-09_24l.yaml
+# 3. python scripts/pocket_tts_finetune.py --config configs/pocket_tts/hindi/teacher_24l_from_english.yaml
+# 4. distil: distill_teacher24l_to_6l.yaml / _to_4l_slim.yaml (cfg 2 bakes guidance in)
+
+model:
+  config: configs/pocket_tts/models/english_2026-09_24l.yaml
+  overrides:
+    flow_lm.lookup_table.tokenizer: sentencepiece
+    flow_lm.lookup_table.tokenizer_path: data/hindi_tokenizer.model
+  weights: hf://kyutai/pocket-tts/languages/english_2026-09_24l/model.safetensors@983151f13aaeab1b13c1e5e3c2c383d49a9edf3f
+  reset_text_embedding: true   # the Hindi tokenizer is not the one these weights know
+  freeze_head: false
+
+loss:
+  flow_batch_multiplier: 4     # 1 never completes the quality transition upstream
+  eos_loss_weight: 0.1
+  text_dropout: 0.2            # CFG dropout: a teacher is sampled guided
+  voice_dropout: 0.2
+
+stats_ema_steps: 1000
+
+data:
+  train: data/pocket_latents/hindi_train/manifest.jsonl
+  valid: data/pocket_latents/hindi_valid/manifest.jsonl
+  tokenizer_path: data/hindi_tokenizer.model
+  normalize_text: hindi
+
+optim:
+  lr: 2.0e-4                   # keep: the text table starts random, the backbone must move with it
+  schedule: constant
+  warmup_steps: 1000
+
+train:
+  batch_size: 16               # 16 x 4 = 64 rows: effective batch >= 64 matters upstream
+  grad_accum: 4
+  max_steps: 100000            # stop early once WER is flat (~15k) if time is short
+  ema_decay: 0.999
+  run_dir: checkpoints/pocket-hindi-teacher-24l

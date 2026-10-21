@@ -352,3 +352,180 @@ def test_export_loads_into_pytorch(tmp_path):
     ref = torch_flow_lm(raw)
     ref.load_state_dict({k.removeprefix("flow_lm."): v for k, v in state.items()
                          if k.startswith("flow_lm.")}, strict=True)
+
+
+# ── Fine-tuning objective (LSD) ───────────────────────────────────────────────
+
+@needs_ref
+@pytest.mark.parametrize("stopgrad", ["minimal", "classic"])
+def test_lsd_loss_and_grads_match_pytorch(stopgrad):
+    from training.modules.samplers import LSD as TorchLSD
+
+    from models.pocket_tts.objectives import LSD
+
+    raw = tiny_raw(z_dim=16)
+    ref = torch_flow_lm(raw)
+    model = mlx_from_torch(raw, ref)
+    t_lsd = TorchLSD(stopgrad_type=stopgrad, distill_prob=1.0)
+    m_lsd = LSD(stopgrad_type=stopgrad, distill_prob=1.0)
+    torch.manual_seed(1)
+    with torch.no_grad():  # non-trivial uncertainty weighting
+        for p in t_lsd.w_s_t.parameters():
+            p.copy_(torch.randn_like(p) * 0.3)
+    m_lsd.w_s_t.load_weights([(f"layers.{int(k.split('.')[0]) // 2}.{k.split('.')[1]}",
+                               mx.array(v.detach().numpy())) for k, v in t_lsd.w_s_t.state_dict().items()])
+
+    N = 7
+    rng = np.random.default_rng(3)
+    z = rng.normal(size=(N, 16)).astype(np.float32)
+    e = rng.normal(size=(N, 8)).astype(np.float32)
+    x = rng.normal(size=(N, 8)).astype(np.float32)
+    t_d = rng.uniform(0.05, 0.95, size=(N, 1)).astype(np.float32)
+    st = np.sort(rng.uniform(0.05, 0.95, size=(N, 2)), axis=1).astype(np.float32)
+
+    # Torch: fixed draws.
+    draws = iter([torch.from_numpy(t_d)])
+    t_lsd.sample_t = lambda _x: next(draws)
+    t_lsd.sample_s_t = lambda _x: (torch.from_numpy(st[:, :1]), torch.from_numpy(st[:, 1:]))
+    t_lsd.train()
+    zt = torch.from_numpy(z).requires_grad_(True)
+    from functools import partial as fpartial
+    loss_t, _, _ = t_lsd.loss(fpartial(ref.flow_net, zt), torch.from_numpy(e), torch.from_numpy(x))
+    loss_t.sum().backward()
+
+    class Both(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head, self.obj = model.flow_net, m_lsd
+
+    both = Both()
+
+    def f(mod, z_):
+        loss, _ = mod.obj.loss(mod.head, z_, mx.array(e), mx.array(x), t_diag=mx.array(t_d),
+                               s_t=(mx.array(st[:, :1]), mx.array(st[:, 1:])), skip=False)
+        return loss.sum(), loss
+
+    (total, loss_m), grads = nn.value_and_grad(both, lambda m_: f(m_, mx.array(z)))(both)
+    np.testing.assert_allclose(np.array(loss_m), loss_t.detach().numpy(), rtol=2e-4, atol=2e-4)
+    g = dict(__import__("mlx.utils").utils.tree_flatten(grads))
+    for name in ("cond_embed.weight", "res_blocks.0.mlp.0.weight", "time_embed.1.mlp.0.weight",
+                 "final_layer.linear.weight"):
+        ref_g = dict(ref.flow_net.named_parameters())[name].grad.numpy()
+        np.testing.assert_allclose(np.array(g[f"head.{name}"]), ref_g, rtol=2e-3, atol=2e-4, err_msg=name)
+    ref_w = t_lsd.w_s_t[0].weight.grad.numpy()
+    np.testing.assert_allclose(np.array(g["obj.w_s_t.layers.0.weight"]), ref_w, rtol=2e-3, atol=2e-4)
+    g_z = mx.grad(lambda z_: f(both, z_)[0])(mx.array(z))
+    np.testing.assert_allclose(np.array(g_z), zt.grad.numpy(), rtol=2e-3, atol=2e-4)
+
+
+def test_eos_loss_matches_reference_formula():
+    from models.pocket_tts.objectives import eos_loss
+
+    model = FlowLM(flowlm_args_from_raw(tiny_raw(z_dim=16)))
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(2, 6, 16)).astype(np.float32)
+    mask = np.array([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=bool)
+    got = eos_loss(model, mx.array(z), mx.array(mask)).item()
+    logits = np.array(model.out_eos(mx.array(z)))[..., 0]
+    is_eos = ~mask
+    is_eos[:, 0] = False
+    sp = lambda v: np.log1p(np.exp(v))  # noqa: E731
+    per = np.where(is_eos, sp(-logits), sp(logits))
+    sm = np.concatenate([mask[:, :1], mask[:, :-1]], axis=1)
+    np.testing.assert_allclose(got, (per * sm).sum() / sm.sum(), rtol=1e-5)
+
+
+def test_finetune_reset_text_embedding_and_freeze_head(tmp_path):
+    from mlx.utils import tree_flatten
+
+    from models.pocket_tts.finetune import build_finetune
+
+    raw = tiny_raw(z_dim=16)
+    src = FlowLM(flowlm_args_from_raw(raw))
+    randomize(src)
+    weights = tmp_path / "src.safetensors"
+    mx.save_safetensors(str(weights), {f"flow_lm.{k}": v for k, v in model_state(src).items()})
+    cfg_path = tmp_path / "m.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw))
+    tr, _ = build_finetune({"model": {"config": str(cfg_path), "weights": str(weights),
+                                      "reset_text_embedding": True, "freeze_head": True}})
+    new, old = model_state(tr.flow_lm), model_state(src)
+    assert not np.allclose(np.array(new["conditioner.embed.weight"]), np.array(old["conditioner.embed.weight"]))
+    for k in ("transformer.layers.0.linear1.weight", "flow_net.cond_embed.weight", "bos_emb"):
+        np.testing.assert_array_equal(np.array(new[k]), np.array(old[k]))
+    trainable = {k for k, _ in tree_flatten(tr.trainable_parameters())}
+    assert not any(k.startswith("flow_lm.flow_net.") for k in trainable)
+    assert "flow_lm.conditioner.embed.weight" in trainable and "objective.w_s_t.layers.0.weight" in trainable
+
+
+def test_hindi_normalizer():
+    from models.pocket_tts.text import hindi_number, normalize_hindi
+
+    assert hindi_number(25) == "पच्चीस"
+    assert hindi_number(150000) == "एक लाख पचास हज़ार"
+    assert hindi_number(1999) == "एक हज़ार नौ सौ निन्यानबे"
+    assert hindi_number(32500000) == "तीन करोड़ पच्चीस लाख"
+    assert normalize_hindi("कल २५ लोग आए") == "कल पच्चीस लोग आए"
+    assert normalize_hindi("₹1,50,000 खर्च") == "एक लाख पचास हज़ार रुपये खर्च"
+    assert normalize_hindi("20% छूट") == "बीस प्रतिशत छूट"
+    assert normalize_hindi("3.5 किलो") == "तीन दशमलव पाँच किलो"
+
+
+def test_hf_config_relative_paths(monkeypatch, tmp_path):
+    from models.pocket_tts import config as C
+
+    raw = tiny_raw()
+    raw["weights_path"] = "model.safetensors"
+    raw["flow_lm"]["lookup_table"]["tokenizer_path"] = "tokenizer.model"
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr(C, "resolve_path", lambda path: str(p))
+    out = C.load_raw_config("hf://someone/repo/config.yaml@abc")
+    assert out["weights_path"] == "hf://someone/repo/model.safetensors@abc"
+    assert out["flow_lm"]["lookup_table"]["tokenizer_path"] == "hf://someone/repo/tokenizer.model@abc"
+
+
+def test_tokenizer_script(tmp_path):
+    import subprocess
+
+    pytest.importorskip("sentencepiece")
+    rows = [{"text": f"आज {i} लोग बाज़ार गए और फल खरीदे"} for i in range(200)]
+    data = tmp_path / "t.jsonl"
+    data.write_text("\n".join(__import__("json").dumps(r, ensure_ascii=False) for r in rows))
+    out = tmp_path / "tok"
+    subprocess.run([sys.executable, str(REPO_ROOT / "scripts/pocket_tts_train_tokenizer.py"), str(data),
+                    "--out", str(out), "--vocab-size", "320", "--normalize-text", "hindi"],
+                   check=True, capture_output=True)
+    from models.pocket_tts.data import load_tokenizer
+
+    ids = load_tokenizer(str(out) + ".model")("आज पच्चीस लोग")
+    assert ids and max(ids) < 320  # byte fallback alone reserves 256 pieces
+
+
+def test_teacher_cache_matches_live_teacher(tmp_path):
+    from models.pocket_tts.data import LatentDataset, collate
+    from models.pocket_tts.teacher_cache import CachedDataset, write_cache
+    from models.pocket_tts.train_utils import normalize, synthetic_manifest
+
+    teacher = FlowLM(flowlm_args_from_raw(tiny_raw(layers=3, z_dim=16)))
+    randomize(teacher, std=0.1)
+    teacher.freeze()
+    rows = [{**r, "latents": r["latents"][:, :8]} for r in synthetic_manifest(10)]
+    ds = LatentDataset(rows, lambda s: [len(s) % 50, 3], final_punct_dropout=0.0)
+    n = write_cache(teacher, ds, tmp_path / "cache", cfg_coef=2.0, batch_size=4)
+    assert n == 8  # two full batches of 4 (the last partial batch is dropped)
+    cached = CachedDataset(tmp_path / "cache", expect_cfg_coef=2.0)
+    with pytest.raises(ValueError, match="cfg_coef"):
+        CachedDataset(tmp_path / "cache", expect_cfg_coef=1.0)
+
+    rows3 = [cached.sample(i) for i in range(3)]
+    batch = collate(rows3)
+    live = teacher_target(teacher, normalize(batch, teacher), 2.0)
+    m = np.array(__import__("models.pocket_tts.distill", fromlist=["x"]).shifted_mask(batch["mask"])) > 0
+    # fp16 storage; compare on the frames the loss uses.
+    np.testing.assert_allclose(np.array(batch["target"])[m], np.array(live)[m], rtol=2e-2, atol=2e-2)
+    student = FlowLM(teacher.args)
+    nb = normalize(batch, teacher)
+    a = distill_loss(student, nb, batch["target"]).item()
+    b = distill_loss(student, nb, live).item()
+    assert abs(a - b) < 1e-2 * max(abs(b), 1e-6)
