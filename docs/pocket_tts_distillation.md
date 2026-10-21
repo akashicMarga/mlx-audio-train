@@ -239,7 +239,6 @@ public.
 | H1a/b/c | Saryps 6-layer → 4-layer / 3-layer / slim 6-layer students (**cfg 1**: the teacher is already distilled) | `distill` · `distill_saryps6l_to_{4l,3l,6l_slim}.yaml` | ~7–15 h to 50k steps |
 | H2 | adapt Saryps 6-layer to your voices / domain (head frozen, no dropout) | `finetune` · `finetune_saryps6l.yaml` | ~3–7 h for 10–15k steps |
 | H3 | **Hindi 24-layer teacher** from the English 24-layer (new tokenizer, fresh text table) | `train_tokenizer` + `finetune` · `teacher_24l_from_english.yaml` | ~10–21 h to 15k steps (WER plateau); days for acoustic polish |
-| H3′ | Hindi 24-layer teacher from scratch (the Saryps recipe, 400k steps) | `finetune` · `teacher_24l_scratch.yaml` | weeks (multi-machine territory) |
 | H4a/b | your H3 teacher → 6-layer / slim 4-layer students (**cfg 2**) | `distill` · `distill_teacher24l_to_{6l,4l_slim}.yaml` | ~1–2 days to 50k (≈3× less with `--cache-teacher`) |
 | H4c | H3 teacher folded to z_dim 64 → 8-layer d512 student (experimental) | `fold_bottleneck` + `distill` · `distill_teacher24l_z64_to_8l_512.yaml` | ~0.5–1 day to 50k |
 
